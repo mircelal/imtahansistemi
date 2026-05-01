@@ -1,19 +1,19 @@
-# Annex DB sxemi → mövcud modellər
+# Annex DB Schema → Existing Models
 
-İstinad Annex (templates, answer_keys, sessions, students) ilə bu repodakı uyğunluq.
+Mapping between the reference Annex schema (templates, answer_keys, sessions, students) and the models in this repository.
 
-## Xəritə
+## Map
 
-| Annex | Mövcud / qeyd |
-|--------|----------------|
+| Annex | Existing / Notes |
+|-------|------------------|
 | `templates.config_json` | `AnswerSheetTemplate.template_config`, `sheet_uuid`, `pdf_path` |
-| `answer_keys (template_id, variant, answers_json)` | İmtahan səviyyəsində `AnswerKey` + şablonda `sheet_answer_key` (JSON daxilində) — variantlar üçün ayrıca cədvəl genişləndirilə bilər |
-| `sessions` | `Exam`, `ScanSession` (skan sessiyaları) |
-| `students` | `ScanResult` və ya gələcək `Participant` — CSV qiymətləndirmə üçün `POST /api/answer-sheets/tools/grade-mcq-csv` müvəqqəti cədvəlsiz hesablayıcıdır |
+| `answer_keys (template_id, variant, answers_json)` | Exam-level `AnswerKey` + `sheet_answer_key` inside the template (as JSON) — a separate table for variants can be added as an extension |
+| `sessions` | `Exam`, `ScanSession` (scan sessions) |
+| `students` | `ScanResult` or a future `Participant` — `POST /api/answer-sheets/tools/grade-mcq-csv` is a temporary table-less calculator for CSV grading |
 
-## Minimal genişləndirmə ideyaları
+## Minimal Extension Ideas
 
-- `answer_keys` üçün: `exam_id`, `variant_code`, `answers_json` cədvəli əlavə etmək.  
-- Toplu nəticə saxlama: `graded_rows` və ya mövcud hesabat cədvəllərinə yazmaq.
+- For `answer_keys`: add a table with `exam_id`, `variant_code`, `answers_json`.
+- Bulk result storage: write to `graded_rows` or the existing report tables.
 
-Bu sənəd strategiya üçündür; miqrasiya faylları ayrıca taskdır.
+This document is for strategy purposes; migration files are a separate task.

@@ -1,21 +1,21 @@
-# OMR sektoru: qısa qiymətləndirmə
+# OMR Sector: Brief Assessment
 
-**Məqsəd:** Dövlət / DİM tipli standart şablonun tam hazır “açıq paket” tapılmaması halında praktik yollar.
+**Goal:** Practical options when a fully ready "open package" for a standard state / national exam-style template cannot be found.
 
-## Variantlar
+## Options
 
-1. **OMRChecker + öz JSON şablon** (cari yanaşma)  
-   - **Üstünlük:** Kod bazasına inteqrasiya, lisenziya sadə.  
-   - **Mənfi:** Rəsmi DİM piksel uyğunluğu zəmanəti yoxdur; şablon sizin ölçülərinizlə sinxron olmalıdır.
+1. **OMRChecker + custom JSON template** (current approach)
+   - **Pro:** Integrated into the codebase, simple license.
+   - **Con:** No guarantee of exact pixel-level match to official exam standards; template must be kept in sync with your own measurements.
 
-2. **Ticari skaner ekosistemləri** (Remark, Scantron, yerli provayder)  
-   - **Üstünlük:** Dəstək, sertifikatlaşdırılmış vərəqlər.  
-   - **Mənfi:** Lisenziya, vendor lock-in, API inteqrasiya müqaviləsi.
+2. **Commercial scanner ecosystems** (Remark, Scantron, local vendor)
+   - **Pro:** Support, certified answer sheets.
+   - **Con:** Licensing costs, vendor lock-in, API integration contract required.
 
-3. **Öz DİM-yaxın şablon**  
-   - **Üstünlük:** Vizual və hüquqi nəzarət.  
-   - **Mənfi:** Rəsmi texniki spesifikasiya olmadan “uyğunluq” müştəri ilə təsdiqlənməlidir.
+3. **Custom exam-standard-compliant template**
+   - **Pro:** Visual and legal control.
+   - **Con:** Without official technical specifications, "compliance" must be confirmed with the client.
 
-## Tövsiyə
+## Recommendation
 
-1–2 həftəlik spike: bir açıq mənbə OMR generator nümunəsi + lisenziya yoxlanışı + OMRChecker koordinat importu. Nəticə əsasında ya (1) saxlanılır, ya (2) üçün tender texniki təsvir hazırlanır.
+A 1–2 week spike: one open-source OMR generator sample + license check + OMRChecker coordinate import. Based on the outcome, either (1) keep the current approach, or prepare a tender technical specification for option (2).

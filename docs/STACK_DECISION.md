@@ -1,23 +1,23 @@
-# Stack qərarı: OMR cavab kartı
+# Stack Decision: OMR Answer Sheet
 
-**Tarix:** 2026-04 · **Layihə:** imtahansistemi
+**Date:** 2026-04 · **Project:** imtahansistemi
 
-## Qərar
+## Decision
 
-**Mövcud stack üzərində genişləndirmə** saxlanılır: **FastAPI** (backend), **PostgreSQL**, **ReportLab** (PDF), **OMRChecker** (ayrıca xidmət), **Vite + React + TypeScript** (frontend).
+**Extending over the existing stack** is retained: **FastAPI** (backend), **PostgreSQL**, **ReportLab** (PDF), **OMRChecker** (separate service), **Vite + React + TypeScript** (frontend).
 
-Yaşıl sahə **Node + Express + react-pdf** monorepo variantı **rədd edildi** (migrasiya riski, iki paralel backend, PDF/OMR ikiqat dəstək).
+The greenfield **Node + Express + react-pdf** monorepo option was **rejected** (migration risk, two parallel backends, doubled PDF/OMR support burden).
 
-## Əsaslar
+## Rationale
 
-| Sahə | Seçim |
+| Area | Choice |
 |------|--------|
 | PDF | ReportLab + Unicode (DejaVu/Arial) TTFont |
-| Şablon | `template_config` JSON + saxlanmış `omr_template` |
-| Önizləmə | `POST /api/answer-sheets/preview` (PNG, 1-ci səhifə) |
-| Çoxsəhifə | İdentifikasiya + suallar ayrılmısı: `two_page_pdf` + OMR yalnız MCQ səhifəsi |
+| Template | `template_config` JSON + stored `omr_template` |
+| Preview | `POST /api/answer-sheets/preview` (PNG, first page) |
+| Multi-page | Identity + questions separated: `two_page_pdf` + OMR on MCQ page only |
 
-## Sonrakı işlər
+## Next Steps
 
-- OMR iki səhifə skanı ehtiyacı yaranarsa, işçi/processor hər iki səhifəni birləşdirən axına genişləndirilməlidir.
-- Annex API adları Express ilə 1:1 deyil; funksional ekvivalent FastAPI routerlərində saxlanılır.
+- If OMR two-page scanning is required, the worker/processor should be extended to a pipeline that merges both pages.
+- Annex API names are not 1:1 with Express; functional equivalents are kept in FastAPI routers.
