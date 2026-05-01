@@ -1,0 +1,54 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply min-h-screen bg-[#f5f5f7] antialiased text-[#1d1d1f];
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+}
+
+@media print {
+  body {
+    background: #fff !important;
+    color: #0f172a;
+  }
+  .app-main {
+    max-width: none !important;
+    width: 100% !important;
+    padding: 0 !important;
+  }
+}
+
+/* Köhnə `.card` istifadələri üçün (styles.css silindikdən sonra boş qalmışdı) */
+@layer components {
+  .card {
+    @apply rounded-xl border border-slate-200 bg-white p-4 shadow-sm;
+  }
+
+  /* Sidebar: incə, Apple-oxşar scroll zolağı */
+  .sidebar-nav-scroll {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  }
+  .sidebar-nav-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+  .sidebar-nav-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .sidebar-nav-scroll::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+  }
+}
+
+/* TipTap məzmun sahəsi */
+.ProseMirror {
+  outline: none;
+}
+.ProseMirror table td,
+.ProseMirror table th {
+  vertical-align: top;
+}

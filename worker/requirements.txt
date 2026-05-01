@@ -1,0 +1,7 @@
+celery[redis]==5.5.2
+redis==5.2.1
+httpx==0.28.1
+minio==7.2.15
+sqlalchemy==2.0.40
+psycopg2-binary==2.9.10
+openpyxl==3.1.5

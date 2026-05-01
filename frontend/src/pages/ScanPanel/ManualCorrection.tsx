@@ -1,0 +1,535 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../../api/client";
+import { getAnswerKey, getExam } from "../../api/exams";
+import type { ScanResult } from "../../api/scans";
+import { getScanReading, getScanResult, listScanResults, saveScanCorrection } from "../../api/scans";
+
+type Props = {
+  examId: number | null;
+  sessionId: number | null;
+  resultId: number | null;
+  onSelectResult: (id: number | null) => void;
+};
+
+/** MCQ cavabları: yalnız Qn/qn açarları (şəxsiyyət id_* müstəqildir). */
+function extractMcqAnswers(detected: Record<string, unknown>): Record<number, string> {
+  const acc: Record<number, string> = {};
+  for (const [k, v] of Object.entries(detected)) {
+    if (k.startsWith("__")) continue;
+    const m = /^q?(\d+)$/i.exec(k);
+    if (!m) continue;
+    const n = Number(m[1]);
+    const raw = v == null ? "" : String(v).trim().toUpperCase();
+    const letter = raw && /^[A-E]$/.test(raw[0]) ? raw[0] : "";
+    acc[n] = letter;
+  }
+  return acc;
+}
+
+/** Skan yüklənmə sırası üzrə növbəti / əvvəlki gözləyən kart (minlərlə kart üçün axın). */
+function findNextPendingId(rows: ScanResult[], currentId: number | null): number | null {
+  if (!rows.length) return null;
+  const sorted = [...rows].sort((a, b) => a.id - b.id);
+  const pendingIds = new Set(
+    rows.filter((r) => r.status === "manual_review" || r.status === "error").map((r) => r.id)
+  );
+  if (!pendingIds.size) return null;
+  if (currentId == null) return [...pendingIds].sort((a, b) => a - b)[0];
+  const ix = sorted.findIndex((r) => r.id === currentId);
+  const start = ix < 0 ? 0 : ix + 1;
+  for (let i = start; i < sorted.length; i++) {
+    if (pendingIds.has(sorted[i].id)) return sorted[i].id;
+  }
+  return null;
+}
+
+function findPrevPendingId(rows: ScanResult[], currentId: number | null): number | null {
+  if (!rows.length || currentId == null) return null;
+  const sorted = [...rows].sort((a, b) => a.id - b.id);
+  const pendingIds = new Set(
+    rows.filter((r) => r.status === "manual_review" || r.status === "error").map((r) => r.id)
+  );
+  const ix = sorted.findIndex((r) => r.id === currentId);
+  for (let i = ix - 1; i >= 0; i--) {
+    if (pendingIds.has(sorted[i].id)) return sorted[i].id;
+  }
+  return null;
+}
+
+export default function ManualCorrection({ examId, sessionId, resultId, onSelectResult }: Props) {
+  const queryClient = useQueryClient();
+  const [draft, setDraft] = useState<Record<number, string>>({});
+  const [omrSnapshot, setOmrSnapshot] = useState<Record<number, string>>({});
+  const [zoomPct, setZoomPct] = useState(100);
+  const [imgUrl, setImgUrl] = useState<string | null>(null);
+  const [imgErr, setImgErr] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const resultQ = useQuery({
+    queryKey: ["scan-result", resultId],
+    queryFn: () => getScanResult(resultId!),
+    enabled: resultId != null
+  });
+
+  const readingQ = useQuery({
+    queryKey: ["scan-reading", resultId],
+    queryFn: () => getScanReading(resultId!),
+    enabled: resultId != null
+  });
+
+  const sessionResultsQ = useQuery({
+    queryKey: ["scan-results", sessionId],
+    queryFn: () => listScanResults(sessionId!),
+    enabled: sessionId != null
+  });
+
+  const examQ = useQuery({
+    queryKey: ["exam", examId],
+    queryFn: () => getExam(examId!),
+    enabled: examId != null && resultId != null
+  });
+
+  const keyQ = useQuery({
+    queryKey: ["answer-key", examId],
+    queryFn: () => getAnswerKey(examId!),
+    enabled: examId != null && resultId != null
+  });
+
+  const snapshotKey = resultQ.data
+    ? JSON.stringify(resultQ.data.detected_answers ?? {})
+    : "";
+
+  useEffect(() => {
+    if (!resultQ.data) return;
+    const det = (resultQ.data.detected_answers ?? {}) as Record<string, unknown>;
+    const m = extractMcqAnswers(det);
+    setOmrSnapshot({ ...m });
+    setDraft({ ...m });
+    setMsg(null);
+    setErr(null);
+  }, [resultQ.data?.id, snapshotKey]);
+
+  useEffect(() => {
+    if (resultId == null) {
+      setImgUrl(null);
+      setImgErr(null);
+      return;
+    }
+    let cancelled = false;
+    setImgErr(null);
+    setImgUrl(null);
+    (async () => {
+      try {
+        const { data } = await api.get<Blob>(`/api/scans/results/${resultId}/image`, { responseType: "blob" });
+        if (cancelled) return;
+        const url = URL.createObjectURL(data);
+        setImgUrl(url);
+      } catch {
+        if (!cancelled) setImgErr("Şəkil yüklənmədi (ZIP və ya fayl yolu). Kartın PDF çıxışından təkrar skan edin.");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [resultId]);
+
+  useEffect(() => {
+    return () => {
+      if (imgUrl) URL.revokeObjectURL(imgUrl);
+    };
+  }, [imgUrl]);
+
+  const questionNumbers = useMemo(() => {
+    const fromKey = (keyQ.data ?? []).map((k) => k.question_number);
+    if (fromKey.length) return [...new Set(fromKey)].sort((a, b) => a - b);
+    const fromDet = Object.keys(draft)
+      .map(Number)
+      .filter(Number.isFinite);
+    return [...new Set(fromDet)].sort((a, b) => a - b);
+  }, [keyQ.data, draft]);
+
+  const keyByQ = useMemo(
+    () => new Map((keyQ.data ?? []).map((k) => [k.question_number, k.correct_answer])),
+    [keyQ.data]
+  );
+
+  const optCount = Math.min(5, Math.max(2, examQ.data?.options_per_question ?? 5));
+  const optionLetters = useMemo(() => Array.from({ length: optCount }, (_, i) => String.fromCharCode(65 + i)), [optCount]);
+
+  const pendingRows = useMemo(
+    () =>
+      (sessionResultsQ.data ?? []).filter((r) => r.status === "manual_review" || r.status === "error"),
+    [sessionResultsQ.data]
+  );
+
+  const nextPendingId = useMemo(
+    () => findNextPendingId(sessionResultsQ.data ?? [], resultId),
+    [sessionResultsQ.data, resultId]
+  );
+  const prevPendingId = useMemo(
+    () => findPrevPendingId(sessionResultsQ.data ?? [], resultId),
+    [sessionResultsQ.data, resultId]
+  );
+
+  const confirmLeave = () => !dirty || window.confirm("Saxlanmamış dəyişikliklər var. Keçid etmək istəyirsiniz?");
+
+  const dirty = useMemo(() => {
+    for (const n of questionNumbers) {
+      const a = (draft[n] ?? "").trim();
+      const b = (omrSnapshot[n] ?? "").trim();
+      if (a !== b) return true;
+    }
+    return false;
+  }, [draft, omrSnapshot, questionNumbers]);
+
+  const save = useCallback(async () => {
+    if (resultId == null) return;
+    setErr(null);
+    setMsg(null);
+    setSaving(true);
+    try {
+      const payload: Record<string, string> = {};
+      for (const n of questionNumbers) {
+        const v = (draft[n] ?? "").trim().toUpperCase();
+        payload[`Q${n}`] = /^[A-E]$/.test(v) ? v : "";
+      }
+      const updated = await saveScanCorrection(resultId, payload);
+      queryClient.setQueryData(["scan-result", resultId], updated);
+      await queryClient.invalidateQueries({ queryKey: ["scan-results", sessionId] });
+      await queryClient.invalidateQueries({ queryKey: ["scan-reading", resultId] });
+      setMsg("Yekun cavablar saxlanıldı; bal yenidən hesablandı.");
+    } catch {
+      setErr("Saxlanılmadı — şəbəkə və ya icazəni yoxlayın.");
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, questionNumbers, queryClient, resultId, sessionId]);
+
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  useEffect(() => {
+    if (resultId == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key !== "s") return;
+      e.preventDefault();
+      void saveRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [resultId]);
+
+  const resetDraft = () => {
+    setDraft({ ...omrSnapshot });
+    setMsg(null);
+    setErr(null);
+  };
+
+  if (resultId == null) {
+    return (
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h3 className="text-lg font-semibold text-slate-900">Əl ilə yoxlama (DİM standartı)</h3>
+        <p className="mt-1 text-sm text-slate-500">Skan nəticəsi seçildikdən sonra kart şəkli və cavab cədvəli burada açılır.</p>
+      </div>
+    );
+  }
+
+  const r = resultQ.data;
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white shadow-sm ring-1 ring-slate-100">
+      <div className="border-b border-slate-200 bg-gradient-to-r from-slate-50 to-white px-4 py-3 sm:px-5">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 className="text-lg font-semibold text-slate-900">Əl ilə yoxlama · kart №{resultId}</h3>
+            <p className="mt-0.5 text-xs text-slate-600">
+              Elektron skan üzərindən OMR oxunuşunu təsdiqləyin və ya düzəldin. Yekun cavablar rəsmi qiymətləndirmə üçün əsas götürülür.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            {r && (
+              <>
+                <span className="rounded-md bg-white px-2.5 py-1 font-medium tabular-nums text-slate-800 shadow-sm ring-1 ring-slate-200">
+                  Bal: {r.score != null ? r.score.toFixed(2) : "—"} / {r.max_score != null ? r.max_score.toFixed(2) : "—"}
+                </span>
+                <span
+                  className={`rounded-md px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${
+                    r.status === "ok"
+                      ? "bg-emerald-100 text-emerald-900"
+                      : r.status === "manual_review"
+                        ? "bg-amber-100 text-amber-900"
+                        : "bg-red-100 text-red-900"
+                  }`}
+                >
+                  {r.status === "ok"
+                    ? "Təsdiqlənib"
+                    : r.status === "manual_review"
+                      ? "Əl yoxlaması"
+                      : r.status === "error"
+                        ? "Xəta"
+                        : r.status}
+                </span>
+              </>
+            )}
+            {sessionId != null && (
+              <span className="rounded-md bg-indigo-50 px-2 py-1 text-xs font-medium text-indigo-900">
+                Gözləyən kart: {pendingRows.length}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="grid gap-0 xl:grid-cols-[minmax(280px,1fr)_minmax(360px,520px)]">
+        {/* Sol: elektron skan */}
+        <div className="border-b border-slate-200 p-4 sm:p-5 xl:border-b-0 xl:border-r">
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Elektron surət (skan)</p>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                className="rounded border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-50"
+                onClick={() => setZoomPct((z) => Math.max(40, z - 15))}
+              >
+                −
+              </button>
+              <span className="min-w-[3rem] text-center text-xs tabular-nums text-slate-600">{zoomPct}%</span>
+              <button
+                type="button"
+                className="rounded border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-50"
+                onClick={() => setZoomPct((z) => Math.min(200, z + 15))}
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className="ml-1 rounded border border-slate-300 bg-white px-2 py-1 text-xs hover:bg-slate-50"
+                onClick={() => setZoomPct(100)}
+              >
+                100%
+              </button>
+            </div>
+          </div>
+          <div className="max-h-[min(78vh,820px)] overflow-auto rounded-lg border border-slate-300 bg-[#f4f4f5] shadow-inner">
+            {imgUrl && (
+              <img
+                src={imgUrl}
+                alt="Skan olunmuş cavab kartı"
+                className="block h-auto min-w-full"
+                style={{ width: `${zoomPct}%` }}
+              />
+            )}
+            {!imgUrl && !imgErr && resultQ.isLoading && (
+              <div className="flex h-48 items-center justify-center text-sm text-slate-500">Şəkil yüklənir…</div>
+            )}
+            {imgErr && (
+              <div className="p-4 text-sm text-amber-900">{imgErr}</div>
+            )}
+          </div>
+          {r?.error_message ? (
+            <p className="mt-2 rounded-md bg-red-50 p-2 text-xs text-red-800">{r.error_message}</p>
+          ) : null}
+          <p className="mt-2 break-all text-[11px] text-slate-400">{r?.image_path}</p>
+        </div>
+
+        {/* Sağ: DİM tipli cədvəl */}
+        <div className="flex flex-col p-4 sm:p-5">
+          {readingQ.data && (
+            <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50/80 p-3 text-sm">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Kanonik oxunuş (şablon xəritəsi)</p>
+              <dl className="mt-2 grid gap-1 text-xs text-slate-700 sm:grid-cols-2">
+                <div>
+                  <dt className="text-slate-500">Sheet UUID</dt>
+                  <dd className="font-mono break-all">{readingQ.data.sheet_uuid ?? "—"}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">QR</dt>
+                  <dd className="break-all">
+                    {(readingQ.data.qr?.qr_raw as string | undefined) ?? "—"}
+                    {readingQ.data.qr?.ticket != null && (
+                      <span className="ml-1 text-indigo-800">· bilet: {String(readingQ.data.qr.ticket)}</span>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+              {readingQ.data.template_hints && Object.keys(readingQ.data.template_hints).length > 0 && (
+                <p className="mt-2 text-[11px] text-slate-500">
+                  Şablon:{" "}
+                  {Object.entries(readingQ.data.template_hints)
+                    .map(([k, v]) => `${k}=${String(v)}`)
+                    .join(", ")}
+                </p>
+              )}
+              <div className="mt-3">
+                <p className="text-xs font-semibold text-slate-700">Şəxsiyyət (id_*)</p>
+                {Object.keys(readingQ.data.identity).length === 0 ? (
+                  <p className="mt-1 text-xs text-slate-500">Bu kartda kodlanmış şəxsiyyət sütunu yoxdur.</p>
+                ) : (
+                  <div className="mt-1 max-h-40 overflow-auto rounded border border-slate-200 bg-white">
+                    <table className="w-full border-collapse text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-200 bg-slate-100 text-slate-700">
+                          <th className="px-2 py-1">Sahə</th>
+                          <th className="px-2 py-1">OMR</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Object.entries(readingQ.data.identity)
+                          .sort(([a], [b]) => a.localeCompare(b))
+                          .map(([key, val]) => (
+                            <tr key={key} className="border-b border-slate-100">
+                              <td className="px-2 py-1 text-slate-600">
+                                <span className="font-medium text-slate-800">
+                                  {readingQ.data.field_labels[key] ?? key}
+                                </span>
+                                <code className="ml-1 text-[10px] text-slate-400">{key}</code>
+                              </td>
+                              <td className="px-2 py-1 font-mono text-slate-900">{val || "—"}</td>
+                            </tr>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          {readingQ.isError && (
+            <p className="mb-3 text-xs text-amber-800">Kanonik oxunuş API yüklənmədi — yalnız xam nəticə mövcuddur.</p>
+          )}
+
+          <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Yekun cavablar (MCQ)</p>
+          <p className="mt-1 text-xs text-slate-500">
+            Sütunlar: avtomatik oxunuş · təsdiq/düzəliş · cavab açarı · müqayisə. Variantlar {optionLetters.join("–")}.
+          </p>
+
+          {resultQ.isLoading && <p className="mt-4 text-sm text-slate-500">Nəticə yüklənir…</p>}
+          {resultQ.isError && <p className="mt-4 text-sm text-red-600">Nəticə oxuna bilmədi.</p>}
+
+          {questionNumbers.length > 0 && (
+            <div className="mt-3 flex max-h-[min(70vh,720px)] flex-col overflow-hidden rounded-lg border border-slate-300 bg-white shadow-sm">
+              <div className="overflow-auto">
+                <table className="w-full min-w-[340px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="sticky top-0 z-10 border-b border-slate-300 bg-slate-100 text-xs font-semibold uppercase tracking-wide text-slate-800">
+                      <th className="whitespace-nowrap border-r border-slate-200 px-2 py-2">№</th>
+                      <th className="border-r border-slate-200 px-2 py-2">OMR</th>
+                      <th className="border-r border-slate-200 px-2 py-2">Yekun</th>
+                      <th className="border-r border-slate-200 px-2 py-2">Açar</th>
+                      <th className="px-2 py-2">Nəticə</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {questionNumbers.map((n) => {
+                      const omrV = omrSnapshot[n] ?? "";
+                      const fin = draft[n] ?? "";
+                      const keyA = keyByQ.get(n);
+                      const keyStr = keyA != null ? String(keyA).trim().toUpperCase() : "";
+                      let verdict: "ok" | "wrong" | "blank" | "na" = "na";
+                      if (keyStr) {
+                        if (!fin) verdict = "blank";
+                        else if (fin.toUpperCase() === keyStr.slice(0, 1)) verdict = "ok";
+                        else verdict = "wrong";
+                      }
+                      const changed = omrV !== fin;
+                      return (
+                        <tr
+                          key={n}
+                          className={`border-b border-slate-200 ${changed ? "bg-amber-50/50" : n % 2 === 1 ? "bg-slate-50/60" : ""}`}
+                        >
+                          <td className="border-r border-slate-200 px-2 py-1.5 font-mono text-xs font-semibold text-slate-900">
+                            {n}
+                          </td>
+                          <td className="border-r border-slate-200 px-2 py-1.5 font-mono text-slate-700">{omrV || "—"}</td>
+                          <td className="border-r border-slate-200 px-1 py-1">
+                            <div className="flex flex-wrap gap-0.5">
+                              {optionLetters.map((L) => (
+                                <button
+                                  key={L}
+                                  type="button"
+                                  className={`min-h-[1.75rem] min-w-[1.75rem] rounded border text-xs font-bold transition ${
+                                    fin === L
+                                      ? "border-indigo-700 bg-indigo-600 text-white shadow-sm"
+                                      : "border-slate-300 bg-white text-slate-800 hover:border-indigo-400"
+                                  }`}
+                                  onClick={() => setDraft((d) => ({ ...d, [n]: L }))}
+                                >
+                                  {L}
+                                </button>
+                              ))}
+                              <button
+                                type="button"
+                                className={`rounded border px-2 py-1 text-[10px] font-semibold uppercase ${
+                                  !fin ? "border-slate-700 bg-slate-700 text-white" : "border-slate-300 bg-white text-slate-600"
+                                }`}
+                                onClick={() => setDraft((d) => ({ ...d, [n]: "" }))}
+                              >
+                                Boş
+                              </button>
+                            </div>
+                          </td>
+                          <td className="border-r border-slate-200 px-2 py-1.5 font-mono text-slate-600">{keyStr || "—"}</td>
+                          <td className="px-2 py-1.5">
+                            {verdict === "na" && <span className="text-slate-400">—</span>}
+                            {verdict === "ok" && <span className="font-semibold text-emerald-700">Düzgün</span>}
+                            {verdict === "wrong" && <span className="font-semibold text-red-700">Səhv</span>}
+                            {verdict === "blank" && <span className="font-medium text-slate-500">Boş</span>}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-slate-100 pt-4">
+            <button
+              type="button"
+              disabled={saving}
+              className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"
+              onClick={() => save()}
+            >
+              {saving ? "Saxlanır…" : "Yekunu saxla / təsdiqlə"}
+            </button>
+            <span className="text-[11px] text-slate-400">Ctrl+S</span>
+            <button
+              type="button"
+              disabled={!dirty || saving}
+              className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-800 hover:bg-slate-50 disabled:opacity-40"
+              onClick={resetDraft}
+            >
+              OMR-a qaytar
+            </button>
+            {sessionId != null && (
+              <>
+                <button
+                  type="button"
+                  disabled={prevPendingId == null}
+                  className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900 hover:bg-indigo-100 disabled:opacity-40"
+                  onClick={() => prevPendingId != null && confirmLeave() && onSelectResult(prevPendingId)}
+                >
+                  ← Əvvəlki gözləyən
+                </button>
+                <button
+                  type="button"
+                  disabled={nextPendingId == null}
+                  className="rounded-md border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-900 hover:bg-indigo-100 disabled:opacity-40"
+                  onClick={() => nextPendingId != null && confirmLeave() && onSelectResult(nextPendingId)}
+                >
+                  Növbəti gözləyən →
+                </button>
+              </>
+            )}
+          </div>
+          {dirty && <p className="mt-2 text-xs text-amber-800">Dəyişikliklər saxlanmayıb.</p>}
+          {msg && <p className="mt-2 text-sm text-emerald-700">{msg}</p>}
+          {err && <p className="mt-2 text-sm text-red-600">{err}</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
