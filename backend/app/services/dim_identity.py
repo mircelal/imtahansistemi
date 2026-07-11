@@ -24,11 +24,14 @@ from app.services.dim_sheet_layout import (
     identity_zone_top_mm,
     letter_row_bubble_center_mm,
     letter_row_first_bubble_x_mm,
+    mcq_grid_content_bottom_mm,
     mm_to_px,
+    page_dimensions_mm,
     vertical_letters_block_height_mm,
     vertical_letters_handwrite_square_side_mm,
     vertical_letters_row_pitch_mm,
 )
+from app.services.sheet_layout_spec import MIN_FREE_FORM_MCQ_RESERVE_MM
 
 # Process magenta (DİM tipli yüksək doyma çəhrayı)
 C_DIM_MAGENTA = (0.75, 0.0, 0.45)  # RGB
@@ -52,7 +55,7 @@ def default_identity_fields(cfg: dict[str, Any]) -> list[dict[str, Any]]:
             "kind": "mcq_groups",
             "groups": [
                 {"id": "grp", "label": "Qrup", "options": ["1", "2", "3", "4", "5"]},
-                {"id": "var", "label": "Variant", "options": ["A", "B"]},
+                {"id": "var", "label": "Variant", "options": ["A", "B", "C", "D"]},
                 {"id": "sec", "label": "Bölmə", "options": ["Az", "RU", "GÜ"]},
             ],
         },
@@ -75,15 +78,105 @@ def resolve_identity_fields(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 def digit_group_row_chunks(field: dict[str, Any]) -> list[list[dict[str, Any]]]:
     """
     Default: bütün rəqəm qrupları bir üfüqi sətirdə (A4 üçün).
-    `"layout": "two_rows"` — klassik DIM: iş ayrı sətirdə, məktəb+sinif altında.
+    `"layout": "two_rows"` — ilk qrup ayrı sətirdə, qalanları növbəti sətirdə (≥2 qrup).
     """
     groups = list(field.get("groups") or [])
-    if field.get("layout") == "two_rows" and len(groups) >= 3:
+    if field.get("layout") == "two_rows" and len(groups) >= 2:
         return [groups[:1], groups[1:]]
     return [groups]
 
 
+def digits_field_outer_width_mm(cnt: int, met: dict[str, Any], label: str = "") -> float:
+    """
+    «digits» bloku üfüqi örtük (mm) — `pdf_generator` magenta zolağı ilə eyni.
+    Audit / kanvas bu dəyəri istifadə etməlidir ki, UI ilə publish gate üst-üstə düşsün.
+    """
+    dd = float(met["digit_d"])
+    dcol = float(met["digit_col_gap"])
+    pitch = dcol + dd
+    n = max(1, int(cnt))
+    bubble_span = 3.0 + n * pitch + 2.0
+    t = str(label or "").strip()
+    header_w = max(14.0, 4.0 + len(t) * 1.65) if t else 14.0
+    return max(bubble_span, header_w)
+
+
 _IDENTITY_FIELD_HEADER_MM = 4.8
+
+# Şaquli hərf blokunun alt boşluğu — audit kəsişməsində nəzərə alınmır (PDF vizualı)
+VERTICAL_LETTERS_TAIL_MM = 5.5
+
+# digit_groups hər sətir: «vertical_letters» / «digits» kimi əvvəl maqenta başlıq zolağı,
+# sonra boşluq, sonra 0–9 sütunları (PDF + OMR + _field_height_mm eyni).
+DIGIT_GROUP_ROW_HEADER_MM = 4.8
+# Başlıq altı — `vertical_letters` ilə eyni (0.8 mm), sonra (opsional) əl yazısı kvadratı,
+# sonra balon zolaqları.
+DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM = 0.8
+DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM = 0.5
+
+
+def digit_group_show_handwrite_box(field: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    """Rəqəm qrupunda üst əl yazısı kvadratı opsionaldır (default OFF).
+
+    Sahə-səviyyəli `handwrite_box` və ya cfg-də `identity_digit_handwrite_box` True olanda
+    `vertical_letters` ilə eyni şəkildə hər sütun üzərində kvadrat çəkilir. Default-da
+    yalnız maqenta başlıq + 0–9 baloncuqları (DİM nümunəsinə uyğun, sahəni qısa saxlayır).
+    """
+    raw = field.get("handwrite_box")
+    if raw is None:
+        raw = cfg.get("identity_digit_handwrite_box", False)
+    return bool(raw)
+
+
+def digit_group_handwrite_square_side_mm(met: dict[str, float]) -> float:
+    """digit_groups: hər rəqəm sütunu üçün üst kvadrat — şaquli hərf sahəsi ilə eyni düstur."""
+    dd = float(met["digit_d"])
+    pitch = float(met["digit_col_gap"]) + dd
+    return float(vertical_letters_handwrite_square_side_mm(dd, max(dd + 0.12, pitch), None))
+
+
+def digit_group_row_stack_height_mm(cfg: dict[str, Any], field: dict[str, Any] | None = None) -> float:
+    """Bir digit_groups sətirinin ümumi hündürlüyü (sətirarası gap daxil deyil).
+
+    `field` verilibsə və `handwrite_box` aktivdirsə, üst kvadrat ölçüsü əlavə edilir.
+    """
+    met = identity_draw_metrics(cfg)
+    ch = digit_col_height_mm_from_metrics(met)
+    h = DIGIT_GROUP_ROW_HEADER_MM + DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM
+    if field is not None and digit_group_show_handwrite_box(field, cfg):
+        h += digit_group_handwrite_square_side_mm(met) + DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM
+    return h + ch
+def mcq_single_block_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
+    met = identity_draw_metrics(cfg)
+    ld, lhg = float(met["letter_d"]), float(met["letter_hgap"])
+    opts = list(f.get("options") or ["A", "B"])
+    n = max(1, len(opts))
+    bubble_span = 4.0 + (n - 1) * lhg + ld
+    label = str(f.get("label", "")).strip()
+    header_w = max(14.0, 4.0 + len(label) * 1.65)
+    return max(bubble_span, header_w)
+
+
+def mcq_single_block_height_mm(cfg: dict[str, Any]) -> float:
+    met = identity_draw_metrics(cfg)
+    ld = float(met["letter_d"])
+    return _IDENTITY_FIELD_HEADER_MM + 1.0 + 1.5 + ld + 3.5
+
+
+def mcq_groups_row_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
+    """Üfüqi bir sətirdə `mcq_groups` — `pdf_generator` ilə eyni x_addımı (mm, sahənin solundan)."""
+    groups = list(f.get("groups") or [])
+    if not groups:
+        return 88.0
+    met = identity_draw_metrics(cfg)
+    gap_mm = float(met["letter_hgap"])
+    x_mm = 2.0
+    for g in groups:
+        opts = list(g.get("options") or ["A", "B"])
+        n = max(1, len(opts))
+        bx_mm = x_mm + 14.0
+        x_mm = bx_mm + max(6.5, float(n) * gap_mm + 2.0)
+    return max(88.0, x_mm + 6.0)
 
 
 def _field_height_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
@@ -93,13 +186,15 @@ def _field_height_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
     if kind == "digit_groups":
         rows = digit_group_row_chunks(f)
         compact = bool(f.get("compact")) or bool(cfg.get("identity_digit_compact"))
+        stack = digit_group_row_stack_height_mm(cfg, f)
         h = 0.0
         for i, _row in enumerate(rows):
             gap_after = 4.0 if compact else (5.0 if i == 0 else 6.0)
-            h += ch + gap_after
-        return h + _IDENTITY_FIELD_HEADER_MM
+            h += stack + gap_after
+        return h
     if kind == "mcq_groups":
-        return 14.0 + _IDENTITY_FIELD_HEADER_MM
+        # frontend estimateBlockHeightMm: 18 + FIELD_HEADER_BAR_MM
+        return 18.0 + _IDENTITY_FIELD_HEADER_MM
     if kind == "horizontal_letters":
         rows = int(f.get("rows", 8))
         return horizontal_letter_block_height_mm(f, rows, met, cfg)
@@ -108,13 +203,171 @@ def _field_height_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
     if kind == "digits":
         return 4.8 + 1.5 + ch + 4.0
     if kind == "mcq":
-        opts = list(f.get("options") or ["A", "B", "C", "D"])
-        n = max(1, len(opts))
-        return _IDENTITY_FIELD_HEADER_MM + 3.2 + n * 2.15
+        return mcq_single_block_height_mm(cfg)
     if kind == "note":
         lines = int(f.get("lines", 1))
         return _IDENTITY_FIELD_HEADER_MM + 5.0 * max(1, lines)
     return 6.0
+
+
+def _field_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
+    """Üfüqi örtük (mm) — frontend estimateBlockWidthMm ilə sinxron."""
+    kind = f.get("kind")
+    met = identity_draw_metrics(cfg)
+    pitch = met["digit_col_gap"] + met["digit_d"]
+    ld, lhg = met["letter_d"], met["letter_hgap"]
+    if kind == "digit_groups":
+        rows = digit_group_row_chunks(f)
+        compact = bool(f.get("compact")) or bool(cfg.get("identity_digit_compact"))
+        group_tail = 3.5 if compact else 10.0
+        max_w = 12.0
+        for row_groups in rows:
+            if not row_groups:
+                continue
+            x = 2.0
+            for g in row_groups:
+                cnt = int(g.get("count", 1))
+                x += 2.0 + cnt * pitch + 1.0 + group_tail
+            max_w = max(max_w, x)
+        return float(max_w)
+    if kind == "horizontal_letters":
+        n_letters = int(f.get("letters_count", 32))
+        n_letters = max(1, min(32, n_letters))
+        if f.get("row_layout") == "handwrite_coding":
+            hw_w = float(f.get("handwrite_w_mm", cfg.get("identity_handwrite_w_mm", 13.0)))
+            lx0 = 11.0 + hw_w + 2.0 + ld / 2.0
+            return lx0 + (n_letters - 1) * lhg + ld + 6.0
+        lx0 = 11.0 + ld / 2.0
+        return lx0 + (n_letters - 1) * lhg + ld + 6.0
+    if kind == "mcq_groups":
+        return mcq_groups_row_width_mm(f, cfg)
+    if kind == "vertical_letters":
+        ncol = int(f.get("columns", 8))
+        col_pitch = float(f.get("col_pitch_mm", max(ld + 0.12, lhg)))
+        return 2.0 + ncol * col_pitch + 1.0
+    if kind == "digits":
+        cnt = int(f.get("count", 6))
+        return digits_field_outer_width_mm(cnt, met, str(f.get("label") or ""))
+    if kind == "mcq":
+        return mcq_single_block_width_mm(f, cfg)
+    if kind == "note":
+        return 175.0
+    return 80.0
+
+
+def _audit_box_tag(f: dict[str, Any], fallback: str) -> str:
+    raw_id = str(f.get("id") or "").strip()
+    if raw_id:
+        return raw_id
+    raw_label = str(f.get("label") or "").strip()
+    if raw_label:
+        return raw_label
+    return fallback
+
+
+def identity_field_audit_boxes(
+    f: dict[str, Any],
+    cfg: dict[str, Any],
+    *,
+    left_min: float,
+    default_y: float,
+) -> list[dict[str, Any]]:
+    """
+    PDF/OMR ilə uyğun sıx audit düzbucaqları.
+    `digit_groups` / `mcq_groups` bütöv blok əvəzinə qrup/sətir üzrə bölünür —
+    yalançı «kəsişir» xəbərdarlıqları azalır.
+    """
+    kind = str(f.get("kind") or "")
+    met = identity_draw_metrics(cfg)
+    pitch = float(met["digit_col_gap"]) + float(met["digit_d"])
+    dd = float(met["digit_d"])
+    ld, lhg = float(met["letter_d"]), float(met["letter_hgap"])
+    x0 = float(f.get("x_mm", left_min))
+    y0 = float(f.get("y_mm", default_y))
+    out: list[dict[str, Any]] = []
+
+    def _push(x: float, y: float, w: float, h: float, *, tag: str, label: str) -> None:
+        if w <= 0.05 or h <= 0.05:
+            return
+        out.append({"x": x, "y": y, "w": w, "h": h, "tag": tag, "kind": kind, "label": label})
+
+    if kind == "digit_groups":
+        rows = digit_group_row_chunks(f)
+        compact = bool(f.get("compact")) or bool(cfg.get("identity_digit_compact"))
+        group_tail = 3.5 if compact else 10.0
+        row_gap0, row_gap1 = (4.0, 4.0) if compact else (5.0, 6.0)
+        stack_h = digit_group_row_stack_height_mm(cfg, f)
+        y_row = y0
+        for row_i, row_groups in enumerate(rows):
+            if not row_groups:
+                continue
+            x_run = x0 + 2.0
+            for g in row_groups:
+                gid = str(g.get("id", "d"))
+                label = str(g.get("label") or gid)
+                cnt = int(g.get("count", 1))
+                # PDF `group_w_mm` — yalnız balon sütunu; maqenta başlıq eni audit kəsişməsinə daxil edilmir
+                bubble_w = 2.0 + cnt * pitch + 1.0
+                _push(x_run, y_row, bubble_w, stack_h, tag=gid, label=label)
+                x_run += bubble_w + group_tail
+            y_row += stack_h + (row_gap0 if row_i == 0 else row_gap1)
+        return out
+
+    if kind == "mcq_groups":
+        y_meta = y0 + 6.0
+        block_h = mcq_single_block_height_mm(cfg)
+        x_run = x0 + 2.0
+        for g in f.get("groups") or []:
+            gid = str(g.get("id", "mcq"))
+            label = str(g.get("label") or gid)
+            opts = list(g.get("options") or ["A", "B"])
+            n = max(1, len(opts))
+            gap = float(lhg)
+            # PDF: x_cursor += 2.45 + len(opts) * gap + 16.0
+            gw = max(6.5, 2.45 + n * gap + 2.0)
+            _push(x_run, y0, gw, block_h, tag=gid, label=label)
+            x_run += 2.45 + n * gap + 16.0
+        return out
+
+    w = _field_width_mm(f, cfg)
+    h = _field_height_mm(f, cfg)
+    tag = _audit_box_tag(f, kind or "?")
+    label = str(f.get("label") or tag)
+    if kind == "vertical_letters":
+        h = max(4.0, h - VERTICAL_LETTERS_TAIL_MM)
+    _push(x0, y0, w, h, tag=tag, label=label)
+    return out
+
+
+def identity_field_display_name(box: dict[str, Any]) -> str:
+    """Audit mesajları üçün oxunaqlı ad."""
+    label = str(box.get("label") or "").strip()
+    tag = str(box.get("tag") or "").strip()
+    kind = str(box.get("kind") or "").strip()
+    if label and label.lower() not in (tag.lower(), kind.lower()):
+        return label
+    names = {
+        "ad": "Ad",
+        "sn": "Soyad",
+        "fn": "Ata adı",
+        "student_code": "Şagird kodu",
+        "sch": "Məktəb",
+        "cl": "Sinif",
+        "grp": "Qrup",
+        "var": "Variant",
+        "sec": "Bölmə",
+        "digit_groups": "Rəqəm qrupları",
+        "mcq_groups": "Seçim qrupları",
+        "vertical_letters": "Şaquli hərflər",
+        "horizontal_letters": "Üfüqi hərflər",
+        "digits": "Rəqəm sahəsi",
+        "mcq": "Seçim",
+    }
+    if tag in names:
+        return names[tag]
+    if kind in names:
+        return names[kind]
+    return tag or kind or "sahə"
 
 
 def identity_height_mm_from_fields(cfg: dict[str, Any]) -> float:
@@ -141,6 +394,12 @@ def identity_height_mm_from_fields(cfg: dict[str, Any]) -> float:
             cap = mcq_top - sep
             if cap > zone_top + 12.0:
                 effective_bottom = min(effective_bottom, cap)
+        else:
+            _, ph_mm = page_dimensions_mm(cfg)
+            gb = mcq_grid_content_bottom_mm(ph_mm)
+            eff_cap = gb - float(MIN_FREE_FORM_MCQ_RESERVE_MM)
+            if eff_cap > zone_top + 12.0:
+                effective_bottom = min(effective_bottom, eff_cap)
         return max(L_BASE.get("student_h", 14.0), effective_bottom - zone_top + code_extra + 2.0)
 
     h = 3.0 + 7.0  # təlimat
@@ -182,22 +441,25 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
             y = float(f.get("y_mm", zone_top + 3.0 + 7.0))
 
         if kind == "digit_groups":
-            groups = list(f.get("groups") or [])
             rows = digit_group_row_chunks(f)
             compact = bool(f.get("compact")) or bool(cfg.get("identity_digit_compact"))
-            label_w = 13.0 if compact else 26.0
             group_tail = 3.5 if compact else 10.0
             row_gap0, row_gap1 = (4.0, 4.0) if compact else (5.0, 6.0)
             y_row = y
+            show_hw = digit_group_show_handwrite_box(f, cfg)
+            sq = digit_group_handwrite_square_side_mm(met) if show_hw else 0.0
+            hw_block_mm = (sq + DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM) if show_hw else 0.0
+            stack_h = DIGIT_GROUP_ROW_HEADER_MM + DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM + hw_block_mm + ch
             for row_i, row_groups in enumerate(rows):
                 if not row_groups:
                     continue
-                y_digits = y_row
+                y_digits = y_row + DIGIT_GROUP_ROW_HEADER_MM + DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM + hw_block_mm
                 x_cursor = field_left_mm + 2.0
                 for g in row_groups:
                     gid = str(g.get("id", "d"))
                     cnt = int(g.get("count", 1))
-                    col0_cx = x_cursor + label_w + dd / 2.0
+                    group_w_mm = 2.0 + cnt * pitch + 1.0
+                    col0_cx = x_cursor + 2.0 + pitch / 2.0
                     cy0 = y_digits + dd / 2.0
                     wlabels = [f"id_{gid}{j + 1}" for j in range(cnt)]
                     ox_mm, oy_mm = _center_to_origin_tl(col0_cx, cy0, dd)
@@ -209,9 +471,9 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
                         "labelsGap": mm_to_px(pitch),
                     }
                     out_cols.extend(wlabels)
-                    x_cursor = col0_cx + cnt * pitch + group_tail
+                    x_cursor += group_w_mm + group_tail
                     fb_i += 1
-                y_row += ch + (row_gap0 if row_i == 0 else row_gap1)
+                y_row += stack_h + (row_gap0 if row_i == 0 else row_gap1)
             if not layout_ff:
                 y = y_row
 
@@ -225,22 +487,23 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
                 n = max(2, min(5, len(opts)))
                 gap = 8.5 if len(opts) <= 5 else 7.0
                 ox_mm, oy_mm = _center_to_origin_tl(x_cursor + 2.45, y_meta, 4.9)
-                if len(opts) <= 5 and gid == "grp":
-                    field_blocks[f"MCQ_{gid}_{fb_i}"] = {
-                        "fieldType": f"QTYPE_MCQ{n}",
-                        "fieldLabels": [lab],
-                        "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
-                        "bubblesGap": mm_to_px(gap),
-                        "labelsGap": mm_to_px(0),
-                    }
+                std4 = list("ABCD")
+                std5 = list("ABCDE")
+                blk: dict[str, Any] = {
+                    "fieldLabels": [lab],
+                    "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
+                    "bubblesGap": mm_to_px(gap if gid == "grp" else gap + 0.5),
+                    "labelsGap": mm_to_px(0),
+                }
+                if n in (4, 5) and opts in (std4, std5):
+                    blk["fieldType"] = f"QTYPE_MCQ{n}"
+                elif n in (4, 5):
+                    blk["fieldType"] = f"QTYPE_MCQ{n}"
+                    blk["bubbleValues"] = opts
                 else:
-                    field_blocks[f"MCQ_{gid}_{fb_i}"] = {
-                        "fieldLabels": [lab],
-                        "bubbleValues": opts,
-                        "bubblesGap": mm_to_px(gap + 0.5),
-                        "labelsGap": mm_to_px(0),
-                        "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
-                    }
+                    blk["bubbleValues"] = opts
+                    blk["direction"] = "horizontal"
+                field_blocks[f"MCQ_{gid}_{fb_i}"] = blk
                 out_cols.append(lab)
                 x_cursor += 2.45 + len(opts) * gap + 16.0
                 fb_i += 1
@@ -302,7 +565,7 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
         elif kind == "digits":
             cnt = int(f.get("count", 6))
             gid = str(f.get("id", "num"))
-            y_digits = y + 4.0 + 1.5
+            y_digits = y + _IDENTITY_FIELD_HEADER_MM + 1.5
             col0_cx = field_left_mm + 2.0 + dd / 2.0
             cy0 = y_digits + dd / 2.0
             wlabels = [f"id_{gid}{j + 1}" for j in range(cnt)]
@@ -324,13 +587,27 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
             opts = [str(x) for x in (f.get("options") or ["A", "B", "C", "D"])]
             y_meta = y + 6.0
             ox_mm, oy_mm = _center_to_origin_tl(field_left_mm + 12.0 + 2.45, y_meta, 4.9)
-            field_blocks[f"MCQ1_{gid}_{fb_i}"] = {
+            opts = [str(x) for x in (f.get("options") or ["A", "B", "C", "D"])]
+            y_meta = y + 6.0
+            ox_mm, oy_mm = _center_to_origin_tl(field_left_mm + 12.0 + 2.45, y_meta, 4.9)
+            n = max(2, min(5, len(opts)))
+            std4 = list("ABCD")
+            std5 = list("ABCDE")
+            blk: dict[str, Any] = {
                 "fieldLabels": [f"id_{gid}"],
-                "bubbleValues": opts,
                 "bubblesGap": mm_to_px(9.0),
                 "labelsGap": mm_to_px(0),
                 "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
             }
+            if n in (4, 5) and opts in (std4, std5):
+                blk["fieldType"] = f"QTYPE_MCQ{n}"
+            elif n in (4, 5):
+                blk["fieldType"] = f"QTYPE_MCQ{n}"
+                blk["bubbleValues"] = opts
+            else:
+                blk["bubbleValues"] = opts
+                blk["direction"] = "horizontal"
+            field_blocks[f"MCQ1_{gid}_{fb_i}"] = blk
             out_cols.append(f"id_{gid}")
             fb_i += 1
             if not layout_ff:

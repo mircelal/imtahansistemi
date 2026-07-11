@@ -28,15 +28,47 @@ def _read_qr(image_bytes: bytes) -> str | None:
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
         return None
-    detector = cv2.QRCodeDetector()
-    data, _, _ = detector.detectAndDecode(img)
-    if data and data.strip():
-        return data.strip()
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-    data, _, _ = detector.detectAndDecode(enhanced)
-    return data.strip() if data and data.strip() else None
+
+    def _try_decode(bgr: np.ndarray) -> str | None:
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(bgr)
+        if data and str(data).strip():
+            return str(data).strip()
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        data, _, _ = detector.detectAndDecode(enhanced)
+        if data and str(data).strip():
+            return str(data).strip()
+        # Aşağı kontrast (ekran görüntüsü / telefon foto)
+        _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        data, _, _ = detector.detectAndDecode(thresh)
+        return str(data).strip() if data and str(data).strip() else None
+
+    def _scan_frame(bgr: np.ndarray) -> str | None:
+        hit = _try_decode(bgr)
+        if hit:
+            return hit
+        h, w = bgr.shape[:2]
+        # Cavab kartında QR adətən aşağı sağ küncdədir
+        for y0, x0 in ((0.72, 0.45), (0.78, 0.5), (0.82, 0.55), (0.85, 0.6)):
+            crop = bgr[int(h * y0) :, int(w * x0) :]
+            if crop.size == 0:
+                continue
+            hit = _try_decode(crop)
+            if hit:
+                return hit
+        return None
+
+    for scale in (1.0, 1.5, 2.0, 2.5, 3.0):
+        if scale == 1.0:
+            frame = img
+        else:
+            frame = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        hit = _scan_frame(frame)
+        if hit:
+            return hit
+    return None
 
 
 def _parse_qr(qr_data: str | None) -> tuple[str | None, int | None]:
@@ -60,6 +92,18 @@ def preprocess_image(image_bytes: bytes) -> np.ndarray:
     return cv2.equalizeHist(gray)
 
 
+def _sanitize_field_block(block: dict[str, Any]) -> dict[str, Any]:
+    """OMRChecker fieldBlock: fieldType və ya bubbleValues+direction tələb edir."""
+    blk = dict(block)
+    if "fieldType" not in blk and "bubbleValues" in blk and "direction" not in blk:
+        n = len(blk.get("bubbleValues") or [])
+        if n in (4, 5):
+            blk["fieldType"] = f"QTYPE_MCQ{n}"
+        else:
+            blk["direction"] = "horizontal"
+    return blk
+
+
 def _sanitize_template_for_omr(tpl: dict[str, Any]) -> dict[str, Any]:
     """OMRChecker yalnız tanıdığı açar sözləri saxlayır."""
     drop = {
@@ -69,8 +113,14 @@ def _sanitize_template_for_omr(tpl: dict[str, Any]) -> dict[str, Any]:
         "omr_two_page_stitched",
         "identity_fieldBlocks",
         "identity_outputColumns",
+        "bubbleValues",
+        "options",
     }
-    return {k: v for k, v in tpl.items() if k not in drop}
+    out = {k: v for k, v in tpl.items() if k not in drop}
+    raw_blocks = out.get("fieldBlocks")
+    if isinstance(raw_blocks, dict):
+        out["fieldBlocks"] = {k: _sanitize_field_block(v) for k, v in raw_blocks.items()}
+    return out
 
 
 def _count_question_columns(output_columns: list[str]) -> int:
@@ -83,6 +133,8 @@ def _heuristic_fallback(
     detail: str,
     sheet_uuid: str | None = None,
     exam_id_from_qr: int | None = None,
+    *,
+    as_error: bool = False,
 ) -> dict[str, Any]:
     try:
         preprocess_image(image_bytes)
@@ -102,10 +154,12 @@ def _heuristic_fallback(
     for i in range(1, q_columns + 1):
         answers[f"Q{i}"] = ""
         answers[f"q{i}"] = ""
+    status = "error" if as_error else "manual_review"
+    confidence = 0.0 if as_error else 0.35
     return {
         "answers": answers,
-        "confidence": 0.35,
-        "status": "manual_review",
+        "confidence": confidence,
+        "status": status,
         "multi_marked": 0,
         "blank_ratio": 1.0,
         "detail": detail,
@@ -124,15 +178,22 @@ def _resolve_template(template_config: dict[str, Any]) -> dict[str, Any]:
     return _sanitize_template_for_omr(omr)
 
 
-def _parse_results_row(row: list[Any], output_columns: list[str]) -> dict[str, str]:
+def _parse_results_dataframe(df: pd.DataFrame, output_columns: list[str]) -> dict[str, str]:
+    """OMRChecker CSV — birinci sətir başlıqdır; son data sətirindən oxu."""
     answers: dict[str, str] = {}
-    for i, col in enumerate(output_columns):
-        raw = row[4 + i] if len(row) > 4 + i else ""
+    if df.empty:
+        return answers
+    row = df.iloc[-1]
+    for col in output_columns:
+        key = str(col).strip()
+        if key not in df.columns:
+            raw = ""
+        else:
+            raw = row[key]
         if raw is None or (isinstance(raw, float) and np.isnan(raw)) or str(raw).strip() == "":
             val = ""
         else:
             val = str(raw).strip()
-        key = str(col).strip()
         answers[key] = val
         m = re.match(r"^q(\d+)$", key, re.I)
         if m:
@@ -140,19 +201,49 @@ def _parse_results_row(row: list[Any], output_columns: list[str]) -> dict[str, s
     return answers
 
 
+def _csv_has_data_rows(path: Path) -> bool:
+    try:
+        df = pd.read_csv(path)
+    except Exception:  # noqa: BLE001
+        return False
+    return not df.empty
+
+
+def _alignment_failed_row(df: pd.DataFrame) -> bool:
+    if df.empty or "output_path" not in df.columns:
+        return False
+    op = str(df.iloc[-1].get("output_path") or "")
+    return "ErrorFiles" in op or "MultiMarked" in op
+
+
+def _answers_look_like_header_spill(answers: dict[str, str], output_columns: list[str]) -> bool:
+    """Köhnə parser xətası: başlıq sətri cavab kimi oxunub."""
+    probe = [str(c) for c in output_columns[:8]]
+    if not probe:
+        return False
+    hits = sum(1 for c in probe if answers.get(c) == c)
+    return hits >= max(3, len(probe) // 2)
+
+
 def _find_results_csv(output_root: Path) -> Path | None:
-    candidates = sorted(
-        output_root.rglob("*.csv"),
-        key=lambda p: p.stat().st_mtime if p.exists() else 0,
-        reverse=True,
-    )
-    for p in candidates:
+    """OMRChecker nəticə CSV — yalnız data sətri olan fayllar."""
+    result_candidates: list[tuple[int, Path]] = []
+    fallback: list[Path] = []
+    for p in output_root.rglob("*.csv"):
         name = p.name.lower()
-        if "error" in name:
+        if not _csv_has_data_rows(p):
             continue
-        if "result" in name or "results" in name:
-            return p
-    return candidates[0] if candidates else None
+        if "result" in name and "error" not in name:
+            try:
+                result_candidates.append((len(pd.read_csv(p)), p))
+            except Exception:  # noqa: BLE001
+                continue
+        elif name in ("errorfiles.csv", "multimarkedfiles.csv"):
+            fallback.append(p)
+    if result_candidates:
+        result_candidates.sort(key=lambda x: x[0], reverse=True)
+        return result_candidates[0][1]
+    return fallback[0] if fallback else None
 
 
 def _run_omrchecker_subprocess(work_dir: Path, out_dir: Path) -> subprocess.CompletedProcess:
@@ -205,41 +296,60 @@ def process_omr(image_bytes: bytes, template_config: dict[str, Any]) -> dict[str
 
         proc = _run_omrchecker_subprocess(work, out)
         if proc.returncode != 0:
+            err_tail = (proc.stderr or proc.stdout or "")[-800:]
             return _heuristic_fallback(
-                image_bytes, q_count,
-                f"OMRChecker exit {proc.returncode}: {(proc.stderr or '')[:500]}",
-                sheet_uuid, exam_id_from_qr,
+                image_bytes,
+                q_count,
+                f"OMRChecker exit {proc.returncode}: {err_tail}",
+                sheet_uuid,
+                exam_id_from_qr,
+                as_error=True,
             )
 
         results_csv = _find_results_csv(out)
         if results_csv is None:
             return _heuristic_fallback(
-                image_bytes, q_count, "No results CSV from OMRChecker.",
-                sheet_uuid, exam_id_from_qr,
+                image_bytes,
+                q_count,
+                "No results CSV from OMRChecker.",
+                sheet_uuid,
+                exam_id_from_qr,
+                as_error=True,
             )
 
         try:
-            df = pd.read_csv(results_csv, header=None)
+            df = pd.read_csv(results_csv)
             if df.empty:
                 raise ValueError("empty results")
-            row = df.iloc[-1].tolist()
-            answers = _parse_results_row(row, out_cols)
+            answers = _parse_results_dataframe(df, out_cols)
+            if _answers_look_like_header_spill(answers, out_cols):
+                raise ValueError("header row parsed as data")
         except Exception as err:  # noqa: BLE001
             return _heuristic_fallback(
-                image_bytes, q_count, f"Parse error: {err}",
-                sheet_uuid, exam_id_from_qr,
+                image_bytes,
+                q_count,
+                f"Parse error: {err}",
+                sheet_uuid,
+                exam_id_from_qr,
+                as_error=True,
             )
 
+        alignment_failed = _alignment_failed_row(df)
         blank_ratio = _blank_ratio_questions(answers, q_count)
         confidence = max(0.0, min(1.0, 1.0 - 0.4 * blank_ratio))
-        status = "ok" if confidence >= 0.85 else "manual_review"
+        if alignment_failed:
+            confidence = min(confidence, 0.25)
+        status = "ok" if confidence >= 0.85 and not alignment_failed else "manual_review"
+        detail = "omrchecker"
+        if alignment_failed:
+            detail = "omrchecker_alignment_failed"
         return {
             "answers": answers,
             "confidence": round(confidence, 4),
             "status": status,
             "multi_marked": 0,
             "blank_ratio": round(blank_ratio, 4),
-            "detail": "omrchecker",
+            "detail": detail,
             "sheet_uuid": sheet_uuid,
             "exam_id_from_qr": exam_id_from_qr,
         }

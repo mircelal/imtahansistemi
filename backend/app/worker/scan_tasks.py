@@ -263,9 +263,6 @@ def _sheet_cfg_for_omr_recompute(cfg: dict[str, Any]) -> dict[str, Any]:
 def _template_for_sheet_row(row: AnswerSheetTemplate | None, db: Any, exam: Exam) -> dict[str, Any]:
     if row and row.template_config:
         cfg = dict(row.template_config)
-        cfg = _invalidate_stale_omr_template_cfg(cfg)
-        if "omr_template" in cfg:
-            return cfg["omr_template"]
         return get_omr_template(_sheet_cfg_for_omr_recompute(cfg))
     return _get_omr_template_for_exam(db, exam)
 
@@ -287,9 +284,6 @@ def _get_omr_template_for_exam(db: Any, exam: Exam) -> dict[str, Any]:
     )
     if latest_sheet and latest_sheet.template_config:
         cfg = dict(latest_sheet.template_config)
-        cfg = _invalidate_stale_omr_template_cfg(cfg)
-        if "omr_template" in cfg:
-            return cfg["omr_template"]
         return get_omr_template(_sheet_cfg_for_omr_recompute(cfg))
 
     # Fallback: exam-dən əsas konfiqurasiya
@@ -685,10 +679,17 @@ def _persist_result(
             student_id, st_reason = resolve_student_id_from_scan(db, exam, answers, tpl_cfg)
             conf = float(omr.get("confidence") or 0.0)
             st = ResultStatus.OK
-            if conf < settings.omr_confidence_threshold or omr.get("status") == "manual_review":
-                st = ResultStatus.MANUAL_REVIEW
             err = None
-            if template_expects_student_code(tpl_cfg) and student_id is None:
+            if omr.get("status") == "error":
+                st = ResultStatus.ERROR
+                omr_detail = str(omr.get("detail") or omr.get("error") or "OMR emal uğursuz")
+                err = f"OMR emal xətası — {omr_detail[:900]}"
+            elif conf < settings.omr_confidence_threshold or omr.get("status") == "manual_review":
+                st = ResultStatus.MANUAL_REVIEW
+                if str(omr.get("detail") or "") == "omrchecker_alignment_failed":
+                    align_hint = "Kart şablona uyğunlaşdırıla bilmədi — tam səhifə skan və ya foto yükləyin"
+                    err = f"{err}; {align_hint}" if err else align_hint
+            if template_expects_student_code(tpl_cfg) and student_id is None and st != ResultStatus.ERROR:
                 st = ResultStatus.MANUAL_REVIEW
                 hint = (
                     "Şagird kodu kartda tam doldurulmayıb"
