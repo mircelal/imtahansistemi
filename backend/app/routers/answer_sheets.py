@@ -1,4 +1,6 @@
 from io import BytesIO
+import json
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,6 +13,7 @@ from app.database import get_db
 from app.deps import ensure_exam_access, ensure_exam_write, get_current_user
 from app.models.entities import AnswerSheetTemplate, Exam, User
 from app.schemas.answer_sheets import (
+    AnswerSheetAuditResponse,
     AnswerSheetDraftRequest,
     AnswerSheetDraftSaved,
     AnswerSheetGenerateRequest,
@@ -23,17 +26,32 @@ from app.schemas.answer_sheets import (
     SheetLookupResponse,
 )
 from app.services.answer_sheet_preset_merge import build_merged_answer_sheet_config
+from app.services.layout_audit import (
+    audit_answer_sheet_layout,
+    layout_publishability_issues,
+    verify_generated_pdf_matches_audit,
+)
+from app.services.layout_normalize import apply_layout_publish_guards
+from app.services.mcq_sections import enrich_mcq_sections_from_grading
 from app.services.pdf_generator import (
     generate_answer_sheet_pdf,
     get_omr_template,
     pdf_page_png,
 )
 from app.services.exam_branding import load_header_logo_bytes_for_exam
+from app.services.exam_readiness import assert_answer_key_complete
 from app.services.student_resolve import merge_student_identity_into_config
 from app.services.storage import StorageService
 
 router = APIRouter(prefix="/api/answer-sheets", tags=["answer-sheets"])
 settings = get_settings()
+
+
+def _prepare_answer_sheet_config(cfg: dict[str, Any], grading_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Freeform şablonlarda istifadəçi mövqelərini saxla; fənn qruplarını imtahandan doldur."""
+    out = enrich_mcq_sections_from_grading(dict(cfg), grading_config)
+    preserve = out.get("layout_mode") == "freeform"
+    return apply_layout_publish_guards(out, preserve_identity_positions=preserve)
 
 
 def _strip_header_logo(cfg: dict) -> dict:
@@ -57,12 +75,42 @@ async def generate_answer_sheet(
         layout_preset_id=payload.layout_preset_id,
         require_write=True,
     )
+    if exam_row is None:
+        raise HTTPException(status_code=404, detail="İmtahan tapılmadı")
+    await assert_answer_key_complete(db, exam_row)
     cfg = merge_student_identity_into_config(dict(merged))
     if exam_row:
         lb, _ct = await load_header_logo_bytes_for_exam(db, exam_row)
         if lb:
             cfg["header_logo_bytes"] = lb
+    cfg = _prepare_answer_sheet_config(
+        cfg,
+        dict(exam_row.grading_config or {}) if exam_row else None,
+    )
+    audit = audit_answer_sheet_layout(cfg)
+    layout_issues = layout_publishability_issues(audit)
+    if layout_issues:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "LAYOUT_NOT_PUBLISHABLE",
+                "message": "Layout yoxlamasından keçmədiyi üçün PDF yaradılmadı. Parametrləri düzəldin və ya auditə baxın.",
+                "layout_warnings": layout_issues,
+                "dim_layout_mm_reference": audit.get("dim_layout_mm_reference"),
+            },
+        )
+
     pdf_bytes, sheet_uuid = generate_answer_sheet_pdf(cfg, payload.exam_id)
+    pdf_verify = verify_generated_pdf_matches_audit(pdf_bytes, audit)
+    if pdf_verify:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PDF_LAYOUT_INCONSISTENT",
+                "message": "Yaradılan PDF kağız ölçüsü audit ilə uyğun gəlmir — server inzibatçısına bildirin.",
+                "issues": pdf_verify,
+            },
+        )
 
     cfg_omr = _strip_header_logo(cfg)
     config_with_template = dict(cfg_omr)
@@ -87,6 +135,51 @@ async def generate_answer_sheet(
         pdf_path=object_path,
         sheet_uuid=sheet_uuid,
         download_url=f"/api/answer-sheets/exam/{payload.exam_id}/download-by-sheet/{sheet_uuid}",
+        layout_warnings=list(audit.get("layout_warnings") or []),
+    )
+
+
+@router.post("/audit", response_model=AnswerSheetAuditResponse)
+async def audit_answer_sheet(
+    payload: AnswerSheetPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Layout təhlükəsizliyi və çap checklist — PDF generasiyası olmadan."""
+    merged, exam_row, _ = await build_merged_answer_sheet_config(
+        db=db,
+        user=user,
+        exam_id=payload.exam_id,
+        template_config=payload.template_config,
+        layout_preset_id=payload.layout_preset_id,
+        require_write=False,
+    )
+    cfg = merge_student_identity_into_config(dict(merged))
+    if exam_row:
+        lb, _ = await load_header_logo_bytes_for_exam(db, exam_row)
+        if lb:
+            cfg["header_logo_bytes"] = lb
+    cfg = _prepare_answer_sheet_config(
+        cfg,
+        dict(exam_row.grading_config or {}) if exam_row else None,
+    )
+    data = audit_answer_sheet_layout(cfg)
+    issues = layout_publishability_issues(data)
+    return AnswerSheetAuditResponse(
+        paper=str(data["paper"]),
+        page_mm=list(data["page_mm"]),
+        content_right_mm=float(data["content_right_mm"]),
+        safe_bottom_mm=float(data["safe_bottom_mm"]),
+        layout_warnings=list(data.get("layout_warnings") or []),
+        print_checklist=list(data.get("print_checklist") or []),
+        font_status=dict(data.get("font_status") or {}),
+        dim_layout_mm_reference=dict(data["dim_layout_mm_reference"])
+        if isinstance(data.get("dim_layout_mm_reference"), dict)
+        else None,
+        two_page_required=bool(data.get("two_page_required")),
+        effective_single_page_layout=bool(data.get("effective_single_page_layout", True)),
+        publishable=len(issues) == 0,
+        effective_template_config=_strip_header_logo(cfg),
     )
 
 
@@ -97,8 +190,26 @@ async def save_answer_sheet_draft(
     user: User = Depends(get_current_user),
 ):
     """Kart parametrlərini PDF olmadan saxlayır (skan üçün sonra PDF ilə təsdiqləyin)."""
-    await ensure_exam_write(payload.exam_id, user, db)
-    cfg = merge_student_identity_into_config(dict(payload.template_config))
+    merged, exam_row, eff_pid = await build_merged_answer_sheet_config(
+        db=db,
+        user=user,
+        exam_id=payload.exam_id,
+        template_config=payload.template_config,
+        layout_preset_id=payload.layout_preset_id,
+        require_write=True,
+    )
+    if exam_row is None:
+        raise HTTPException(status_code=404, detail="İmtahan tapılmadı")
+    await assert_answer_key_complete(db, exam_row)
+    cfg = merge_student_identity_into_config(dict(merged))
+    if exam_row:
+        lb, _ = await load_header_logo_bytes_for_exam(db, exam_row)
+        if lb:
+            cfg["header_logo_bytes"] = lb
+    cfg = _prepare_answer_sheet_config(
+        cfg,
+        dict(exam_row.grading_config or {}) if exam_row else None,
+    )
     cfg_clean = _strip_header_logo(cfg)
     sheet_uuid = str(uuid4())
     row = AnswerSheetTemplate(
@@ -107,6 +218,7 @@ async def save_answer_sheet_draft(
         template_config=cfg_clean,
         pdf_path=None,
         is_draft=True,
+        layout_preset_id=eff_pid,
     )
     db.add(row)
     await db.commit()
@@ -136,11 +248,41 @@ async def finalize_answer_sheet_draft(
 
     cfg = merge_student_identity_into_config(dict(row.template_config or {}))
     exam_row = await db.get(Exam, exam_id)
+    if exam_row is None:
+        raise HTTPException(status_code=404, detail="İmtahan tapılmadı")
+    await assert_answer_key_complete(db, exam_row)
     if exam_row:
         lb, _ = await load_header_logo_bytes_for_exam(db, exam_row)
         if lb:
             cfg["header_logo_bytes"] = lb
+    cfg = _prepare_answer_sheet_config(
+        cfg,
+        dict(exam_row.grading_config or {}) if exam_row else None,
+    )
+    audit = audit_answer_sheet_layout(cfg)
+    layout_issues = layout_publishability_issues(audit)
+    if layout_issues:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "LAYOUT_NOT_PUBLISHABLE",
+                "message": "Layout yoxlamasından keçmədiyi üçün PDF təsdiqlənmədi.",
+                "layout_warnings": layout_issues,
+                "dim_layout_mm_reference": audit.get("dim_layout_mm_reference"),
+            },
+        )
+
     pdf_bytes, su_out = generate_answer_sheet_pdf(cfg, exam_id, sheet_uuid=row.sheet_uuid)
+    pdf_verify = verify_generated_pdf_matches_audit(pdf_bytes, audit)
+    if pdf_verify:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "PDF_LAYOUT_INCONSISTENT",
+                "message": "Yaradılan PDF audit ilə uyğun gəlmir.",
+                "issues": pdf_verify,
+            },
+        )
     if su_out != row.sheet_uuid:
         row.sheet_uuid = su_out
 
@@ -157,6 +299,7 @@ async def finalize_answer_sheet_draft(
         pdf_path=object_path,
         sheet_uuid=row.sheet_uuid or "",
         download_url=f"/api/answer-sheets/exam/{exam_id}/download-by-sheet/{row.sheet_uuid}",
+        layout_warnings=list(audit.get("layout_warnings") or []),
     )
 
 
@@ -295,23 +438,18 @@ async def get_exam_omr_template(
         raise HTTPException(status_code=404, detail="Template tapılmadı")
 
     cfg = dict(latest.template_config or {})
-    # Həmişə cari get_omr_template (şaquli DİM sütunları üçün direction və s. sinxron)
-    if any(
-        k in cfg
-        for k in (
-            "question_count",
-            "paper_size",
-            "columns_count",
-            "layout_mode",
-            "mcq_grid",
-            "options_per_question",
-        )
-    ):
-        cfg.pop("omr_template", None)
-        return get_omr_template(cfg)
+    cfg = _invalidate_stale_omr_template(cfg)
     if "omr_template" in cfg:
         return cfg["omr_template"]
     return get_omr_template(cfg)
+
+
+def _invalidate_stale_omr_template(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Yalnız açıq stale flag olduqda saxlanmış OMR şablonunu sil."""
+    if cfg.get("_omr_template_stale"):
+        cfg.pop("omr_template", None)
+        cfg.pop("_omr_template_stale", None)
+    return cfg
 
 
 @router.post("/preview")
@@ -334,9 +472,19 @@ async def preview_answer_sheet(
         lb, _ = await load_header_logo_bytes_for_exam(db, exam_row)
         if lb:
             cfg_prev["header_logo_bytes"] = lb
+    cfg_prev = _prepare_answer_sheet_config(
+        cfg_prev,
+        dict(exam_row.grading_config or {}) if exam_row else None,
+    )
+    audit = audit_answer_sheet_layout(cfg_prev)
+    issues = layout_publishability_issues(audit)
     pdf_bytes, _ = generate_answer_sheet_pdf(cfg_prev, payload.exam_id)
     png = pdf_page_png(pdf_bytes, max(0, int(payload.page_index)))
-    return Response(content=png, media_type="image/png")
+    headers = {
+        "X-Publishable": "true" if len(issues) == 0 else "false",
+        "X-Layout-Warnings": json.dumps(list(audit.get("layout_warnings") or []), ensure_ascii=False),
+    }
+    return Response(content=png, media_type="image/png", headers=headers)
 
 
 def _normalize_answer_key_for_grading(raw: dict) -> dict[int, str]:

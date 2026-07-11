@@ -3,23 +3,21 @@ import json
 from io import StringIO
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.deps import ensure_exam_access, ensure_exam_write, get_current_user
 from app.models.entities import BankQuestion, BankSubject, Question, QuestionType, User
-from app.schemas.question_bank import QuestionFromBankCreate
+from app.schemas.question_bank import QuestionFromBankBulkCreate, QuestionFromBankBulkResult, QuestionFromBankCreate
 from app.schemas.questions import QuestionCreate, QuestionImportResult, QuestionOut, QuestionUpdate
 from app.services.bank_question_options import normalize_bank_options
 from app.services.question_bank_norm import normalize_difficulty, parse_difficulty_csv
 
+from app.services.omr_template_stale import mark_exam_omr_templates_stale
+
 router = APIRouter(prefix="/api/exams", tags=["questions"])
-
-
-async def _sync_exam_question_count(db: AsyncSession, exam_id: int) -> None:
-    _ = db, exam_id
 
 
 def _default_mcq_options_if_needed(qtype: QuestionType, options):
@@ -149,6 +147,11 @@ async def create_question(
     user: User = Depends(get_current_user),
 ):
     await ensure_exam_write(exam_id, user, db)
+    if payload.qtype == QuestionType.TF:
+        raise HTTPException(
+            status_code=400,
+            detail="Doğru/Yanlış sualları hələ dəstəklənmir — çoxseçimli (MCQ) sual istifadə edin",
+        )
     exists = await db.scalar(
         select(Question.id).where(Question.exam_id == exam_id, Question.order_index == payload.order_index)
     )
@@ -177,6 +180,7 @@ async def create_question(
         metadata_json=meta,
     )
     db.add(row)
+    await mark_exam_omr_templates_stale(db, exam_id)
     await db.commit()
     loaded = await _load_question(db, row.id)
     if loaded is None:
@@ -219,6 +223,70 @@ async def create_question_from_bank(
     if loaded is None:
         raise HTTPException(status_code=500, detail="Sual yaradılmadı")
     return _serialize_question(loaded)
+
+
+@router.post("/{exam_id}/questions/from-bank/bulk", response_model=QuestionFromBankBulkResult)
+async def create_questions_from_bank_bulk(
+    exam_id: int,
+    payload: QuestionFromBankBulkCreate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    await ensure_exam_write(exam_id, user, db)
+    seen_ids: set[int] = set()
+    unique_ids: list[int] = []
+    for raw in payload.bank_question_ids:
+        bid = int(raw)
+        if bid in seen_ids:
+            continue
+        seen_ids.add(bid)
+        unique_ids.append(bid)
+    if not unique_ids:
+        raise HTTPException(status_code=400, detail="Ən azı bir sual seçilməlidir")
+
+    if payload.start_order_index is not None:
+        next_order = int(payload.start_order_index)
+    else:
+        max_order = await db.scalar(
+            select(func.max(Question.order_index)).where(Question.exam_id == exam_id)
+        )
+        next_order = int(max_order or 0) + 1
+
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    for bid in unique_ids:
+        clash = await db.scalar(
+            select(Question.id).where(Question.exam_id == exam_id, Question.order_index == next_order)
+        )
+        if clash is not None:
+            skipped += 1
+            errors.append(f"#{bid}: sıra {next_order} artıq doludur")
+            next_order += 1
+            continue
+        bank = await db.scalar(
+            select(BankQuestion).options(selectinload(BankQuestion.subject_ref)).where(BankQuestion.id == bid)
+        )
+        if bank is None:
+            skipped += 1
+            errors.append(f"#{bid}: bazada tapılmadı")
+            continue
+        meta = dict(bank.metadata_json or {})
+        row = Question(
+            exam_id=exam_id,
+            bank_question_id=bank.id,
+            order_index=next_order,
+            qtype=bank.qtype,
+            stem=bank.stem,
+            options=bank.options,
+            points=bank.points,
+            metadata_json=meta,
+        )
+        db.add(row)
+        imported += 1
+        next_order += 1
+    await db.commit()
+    return QuestionFromBankBulkResult(imported=imported, skipped=skipped, errors=errors)
 
 
 @router.put("/{exam_id}/questions/{question_id}", response_model=QuestionOut)
@@ -303,8 +371,7 @@ async def delete_question(
     if row is None or row.exam_id != exam_id:
         raise HTTPException(status_code=404, detail="Question not found")
     await db.delete(row)
-    await db.commit()
-    await _sync_exam_question_count(db, exam_id)
+    await mark_exam_omr_templates_stale(db, exam_id)
     await db.commit()
     return {"message": "Deleted"}
 
@@ -384,6 +451,6 @@ async def import_questions_csv(
             skipped += 1
             continue
     await db.commit()
-    await _sync_exam_question_count(db, exam_id)
+    await mark_exam_omr_templates_stale(db, exam_id)
     await db.commit()
     return QuestionImportResult(imported=imported, skipped=skipped)

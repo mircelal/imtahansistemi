@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
-import { useForm } from "react-hook-form";
+import { useForm, Controller } from "react-hook-form";
 import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import {
   downloadAnswerSheetPdf,
   finalizeAnswerSheetDraft,
   generateAnswerSheet,
+  getApiErrorMessage,
   listExamSheetTemplates,
   saveAnswerSheetDraft
 } from "../../api/answerSheets";
@@ -17,27 +18,62 @@ import {
   deleteExam,
   downloadExamBookletCover,
   downloadExamQuestionBooklet,
+  downloadExamQuestionBookletDocx,
   getAnswerKey,
   getExam,
   getExamIntegrations,
+  getExamReadiness,
   listExams,
   saveAnswerKey,
-  updateExam
+  updateExam,
+  type ExamReadiness,
 } from "../../api/exams";
 import { listBankSubjects, listQuestionBank } from "../../api/questionBank";
 import { listAnswerSheetPresets } from "../../api/sheetPresets";
-import { addQuestionFromBank, createQuestion, deleteQuestion, importQuestionsCsv, listQuestions } from "../../api/questions";
-import type { BankQuestion } from "../../api/questionBank";
+import { addQuestionsFromBankBulk, createQuestion, deleteQuestion, importQuestionsCsv, listQuestions } from "../../api/questions";
 import { useAuthStore } from "../../store/authStore";
+import PageHeader from "../../components/ui/PageHeader";
 import { plainTextFromHtml } from "../../utils/html";
 import {
   buildAnswerSheetIdentityOverlay,
   defaultAnswerCardIdentity,
   type AnswerCardIdentitySelection,
 } from "./buildAnswerCardIdentity";
+import ExamCreateForm from "./components/ExamCreateForm";
+import ExamListPage from "./components/ExamListPage";
+import ExamIntegrationsStrip from "./components/ExamIntegrationsStrip";
+import ExamSettingsEditor from "./components/ExamSettingsEditor";
+import ExamWizardStepper from "./components/ExamWizardStepper";
+import ExamQuestionBankPicker from "./components/ExamQuestionBankPicker";
+import ExamQuestionsPanel, { ExamCsvImportZone, type QuestionAddMode } from "./components/ExamQuestionsPanel";
+import ExamWizardGuide from "./components/ExamWizardGuide";
+import ExamStepSubNav from "./components/ExamStepSubNav";
+import SheetStatusBadge, { sheetStatusFromReadiness } from "./components/SheetStatusBadge";
+import { examWizardSteps, type ExamStep1SubSection } from "./examWizardSteps";
+import LiveSheetPreview from "../AnswerSheetDesigner/LiveSheetPreview";
+import { RichHtmlEditor } from "../../components/RichHtmlEditor";
+import { examInput, examLabel, examPrimaryBtn, examSecondaryBtn, examSection, examSectionBody } from "./components/examUiTokens";
+import {
+  DEFAULT_BOOKLET_VARIANTS,
+  defaultBookletConfig,
+  resolveBookletConfig,
+} from "../../constants/bookletLayoutSpec";
+
+type PaperSize = "A4" | "A3" | "A4L" | "A3L";
+
+function paperSizeFromPreset(
+  presetId: number | null | undefined,
+  presets: { id: number; template_config?: Record<string, unknown> }[] | undefined,
+): PaperSize {
+  if (presetId == null || !presets?.length) return "A4";
+  const p = presets.find((x) => x.id === presetId);
+  const raw = p?.template_config?.paper_size;
+  if (raw === "A3" || raw === "A4L" || raw === "A3L" || raw === "A4") return raw;
+  return "A4";
+}
 
 type ExamBasicsForm = {
-  course_id: number;
+  course_id: number | "";
   title: string;
   description: string;
   question_count: number;
@@ -45,11 +81,17 @@ type ExamBasicsForm = {
   columns_count: number;
   scheduled_at: string;
   seat_quota: string;
+  venue: string;
+  city: string;
+  resale_enabled: boolean;
   add_ticket: boolean;
   ticket_title: string;
   ticket_description: string;
   ticket_price: number;
   ticket_quota: string;
+  answer_sheet_preset_id: number | "";
+  negative_marking: boolean;
+  negative_ratio: number;
 };
 
 type QuestionForm = {
@@ -61,118 +103,26 @@ type QuestionForm = {
   difficulty: "" | "easy" | "medium" | "hard";
 };
 
-const steps = ["İmtahan", "Suallar və fənnlər", "Cavab açarı", "PDF kartı"] as const;
+const steps = examWizardSteps;
+const inputClass = examInput;
+const labelClass = examLabel;
 
-const inputClass =
-  "mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100";
-const labelClass = "block text-sm font-medium text-slate-700";
-
-function toDatetimeLocalInput(iso: string | null | undefined) {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "";
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-function ExamScheduleEditor({ examId, exam }: { examId: number; exam: Exam }) {
-  const qc = useQueryClient();
-  const [scheduled, setScheduled] = useState("");
-  const [quota, setQuota] = useState("");
-
-  useEffect(() => {
-    setScheduled(toDatetimeLocalInput(exam.scheduled_at));
-    setQuota(exam.seat_quota != null ? String(exam.seat_quota) : "");
-  }, [exam.id, exam.scheduled_at, exam.seat_quota]);
-
-  const saveMut = useMutation({
-    mutationFn: () => {
-      const qRaw = quota.trim();
-      let seat_quota: number | null = null;
-      if (qRaw !== "") {
-        const n = Number(qRaw);
-        if (!Number.isFinite(n) || n < 1) {
-          throw new Error("Yer/kontingent ən azı 1 olmalıdır və ya boş saxlanılmalıdır.");
-        }
-        seat_quota = n;
-      }
-      return updateExam(examId, {
-        scheduled_at: scheduled.trim() === "" ? null : new Date(scheduled).toISOString(),
-        seat_quota
-      });
-    },
-    onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: ["exam", examId] });
-      await qc.invalidateQueries({ queryKey: ["exams"] });
-    }
-  });
-
-  return (
-    <div className="rounded-xl border border-sky-100 bg-sky-50/40 p-4 shadow-sm">
-      <h3 className="text-sm font-semibold text-sky-950">İmtahan planı</h3>
-      <p className="mt-1 text-xs text-sky-900/85">
-        Keçirilmə vaxtı və ən çox neçə iştirakçı (yer/kontingent). Əlavə məhdudiyyət üçün biletin öz kvotasını da
-        istifadə edə bilərsiniz.
-      </p>
-      <div className="mt-3 grid gap-3 sm:grid-cols-3">
-        <label className={`${labelClass} sm:col-span-1`}>
-          Planlaşdırılmış tarix / saat
-          <input
-            type="datetime-local"
-            className={inputClass}
-            value={scheduled}
-            onChange={(e) => setScheduled(e.target.value)}
-          />
-        </label>
-        <label className={`${labelClass} sm:col-span-1`}>
-          Yer sayı (iştirakçı limiti)
-          <input
-            type="number"
-            min={1}
-            className={inputClass}
-            placeholder="Boş = limit yoxdur"
-            value={quota}
-            onChange={(e) => setQuota(e.target.value)}
-          />
-        </label>
-        <div className="flex items-end sm:col-span-1">
-          <button
-            type="button"
-            disabled={saveMut.isPending}
-            className="w-full rounded-lg bg-sky-800 px-4 py-2 text-sm font-medium text-white hover:bg-sky-900 disabled:opacity-50"
-            onClick={() => {
-              saveMut.mutate(undefined, {
-                onError: (e) => {
-                  window.alert(e instanceof Error ? e.message : "Yadda saxlama xətası");
-                }
-              });
-            }}
-          >
-            {saveMut.isPending ? "Saxlanılır…" : "Planı saxla"}
-          </button>
-        </div>
-      </div>
-      {saveMut.isError && (
-        <p className="mt-2 text-xs text-red-700">
-          Dəyərləri yoxlayın (tarix və ya yer sayı).
-        </p>
-      )}
-    </div>
-  );
-}
-
-function difficultyAz(d: string | null | undefined) {
-  if (!d) return "—";
-  switch (d) {
-    case "easy":
-      return "Asan";
-    case "medium":
-      return "Orta";
-    case "hard":
-      return "Çətin";
-    default:
-      return d;
+function answerKeyStepBlockedReason(
+  plannedQuestionCount: number,
+  registered: number,
+  readiness: ExamReadiness | undefined,
+): string | null {
+  if (plannedQuestionCount === 0) {
+    return "Planlı sual sayı 0-dır — əvvəlcə imtahan parametrlərində sual sayını təyin edin.";
   }
+  if (registered > 0 && registered < plannedQuestionCount) {
+    return `Qeydiyyatdan keçmiş sual sayı (${registered}) planlı saydan (${plannedQuestionCount}) azdır. Bütün sualları əlavə edin və ya planlı sayı düzəldin.`;
+  }
+  const qOk = readiness?.steps.find((s) => s.id === "questions")?.complete;
+  if (!qOk && registered < plannedQuestionCount) {
+    return `Cavab açarı üçün ən azı ${plannedQuestionCount} sual sətri lazımdır (hazırda ${registered}).`;
+  }
+  return null;
 }
 
 function ExamsWizardPage() {
@@ -189,6 +139,15 @@ function ExamsWizardPage() {
   const [participantLabel, setParticipantLabel] = useState("");
   const [participantCode, setParticipantCode] = useState("");
   const [institution, setInstitution] = useState("Təhsil müəssisəsi");
+  const [examCode, setExamCode] = useState("");
+  const [coverLine1, setCoverLine1] = useState("");
+  const [coverLine2, setCoverLine2] = useState("");
+  const [bookletDurationMinutes, setBookletDurationMinutes] = useState<number | "">("");
+  const [bookletVariant, setBookletVariant] = useState("A");
+  const [bookletOrganiser, setBookletOrganiser] = useState(defaultBookletConfig().organiser ?? "");
+  const [bookletSector, setBookletSector] = useState("");
+  const [bookletSeries, setBookletSeries] = useState("");
+  const [bookletVariants, setBookletVariants] = useState<string[]>([...DEFAULT_BOOKLET_VARIANTS]);
   /** İki səhifəli PDF-də şəxsiyyət + MCQ tək şəkil/şablonda OMR üçün (backend `omr_two_page_stitched`). */
   const [omrTwoPageStitched, setOmrTwoPageStitched] = useState(false);
   const [gradingSubjectRows, setGradingSubjectRows] = useState<{ code: string; title: string }[]>([]);
@@ -202,10 +161,16 @@ function ExamsWizardPage() {
   );
   const [gradingLoadedForExamId, setGradingLoadedForExamId] = useState<number | null>(null);
   const [csvDragActive, setCsvDragActive] = useState(false);
+  const [step1SubSection, setStep1SubSection] = useState<ExamStep1SubSection>("suallar");
+  const [questionAddMode, setQuestionAddMode] = useState<QuestionAddMode>("bank");
+  const [gradingSaveError, setGradingSaveError] = useState<string | null>(null);
+  const [gradingSavedOk, setGradingSavedOk] = useState(false);
+  const [bulkBankMsg, setBulkBankMsg] = useState<string | null>(null);
+  const [deleteExamConfirm, setDeleteExamConfirm] = useState(false);
 
-  const { register, handleSubmit, reset, watch } = useForm<ExamBasicsForm>({
+  const { register, handleSubmit, reset, watch, setValue } = useForm<ExamBasicsForm>({
     defaultValues: {
-      course_id: 1,
+      course_id: "",
       question_count: 20,
       options_per_question: 4,
       columns_count: 2,
@@ -213,15 +178,19 @@ function ExamsWizardPage() {
       description: "",
       scheduled_at: "",
       seat_quota: "",
+      venue: "",
+      city: "",
+      resale_enabled: false,
       add_ticket: false,
       ticket_title: "",
       ticket_description: "",
       ticket_price: 0,
-      ticket_quota: ""
+      ticket_quota: "",
+      answer_sheet_preset_id: "",
+      negative_marking: false,
+      negative_ratio: 0.25,
     }
   });
-  const addTicketEnabled = watch("add_ticket");
-
   const qForm = useForm<QuestionForm>({
     defaultValues: { order_index: 1, qtype: "mcq", stem: "", points: 1, subject_id: "", difficulty: "" }
   });
@@ -245,6 +214,32 @@ function ExamsWizardPage() {
   }, [examParam, wizardStepParam]);
 
   const coursesQuery = useQuery({ queryKey: ["courses"], queryFn: listCourses });
+
+  useEffect(() => {
+    const cs = coursesQuery.data;
+    if (!cs?.length || umumiExam) return;
+    const cur = watch("course_id");
+    if (cur === "" || cur == null) {
+      setValue("course_id", cs[0].id);
+    }
+  }, [coursesQuery.data, umumiExam, setValue, watch]);
+
+  const createPresetsQuery = useQuery({
+    queryKey: ["sheet-presets-create", umumiExam, watch("course_id")],
+    queryFn: () => {
+      if (umumiExam) return listAnswerSheetPresets({ scope: "global_only" });
+      const cid = watch("course_id");
+      return listAnswerSheetPresets(cid === "" ? undefined : { course_id: Number(cid) });
+    },
+    enabled: step === 0 && examId == null,
+  });
+
+  useEffect(() => {
+    if (!umumiExam) return;
+    setAnswerCardIdentity((prev) => ({ ...prev, student_code: false }));
+    setValue("answer_sheet_preset_id", "");
+  }, [umumiExam, setValue]);
+
   const examQuery = useQuery({
     queryKey: ["exam", examId],
     queryFn: () => getExam(examId!),
@@ -282,6 +277,20 @@ function ExamsWizardPage() {
         .filter((r) => r.subject_code.length > 0),
     );
     setGradingPolicyJson(JSON.stringify(ex.grading_policy ?? {}, null, 2));
+    const policy = (ex.grading_policy ?? {}) as Record<string, unknown>;
+    const dur = policy.duration_minutes;
+    if (typeof dur === "number" && dur > 0) {
+      setBookletDurationMinutes(dur);
+    } else {
+      setBookletDurationMinutes("");
+    }
+    setExamCode(`IMT-${ex.id}`);
+    const bc = resolveBookletConfig(gc as Record<string, unknown>);
+    setBookletOrganiser(bc.organiser ?? defaultBookletConfig().organiser ?? "");
+    setBookletSector(bc.sector ?? "");
+    setBookletSeries(bc.exam_series ?? "");
+    setBookletVariants(bc.variants ?? [...DEFAULT_BOOKLET_VARIANTS]);
+    setBookletVariant(bc.variants?.[0] ?? "A");
     const ac = gc.answer_card_identity;
     if (ac && typeof ac === "object" && !Array.isArray(ac)) {
       setAnswerCardIdentity({ ...defaultAnswerCardIdentity(), ...(ac as Partial<AnswerCardIdentitySelection>) });
@@ -294,6 +303,11 @@ function ExamsWizardPage() {
     queryKey: ["exam-integrations", examId],
     queryFn: () => getExamIntegrations(examId!),
     enabled: examId != null
+  });
+  const readinessQuery = useQuery({
+    queryKey: ["exam-readiness", examId],
+    queryFn: () => getExamReadiness(examId!),
+    enabled: examId != null,
   });
 
   const sheetPresetsQuery = useQuery({
@@ -321,8 +335,6 @@ function ExamsWizardPage() {
 
   const [bankStemSearch, setBankStemSearch] = useState("");
   const [bankFilterSubjectId, setBankFilterSubjectId] = useState("");
-  const [pickBankId, setPickBankId] = useState("");
-  const [pickOrderIndex, setPickOrderIndex] = useState(1);
 
   const bankPickQuery = useQuery({
     queryKey: ["question-bank-pick", examId, bankStemSearch, bankFilterSubjectId],
@@ -361,18 +373,23 @@ function ExamsWizardPage() {
       const sq = payload.seat_quota.trim();
       const seatQuotaNum = sq === "" ? NaN : Number(sq);
       return createExam({
-        course_id: umumiExam ? null : Number(payload.course_id),
+        course_id: umumiExam ? null : payload.course_id === "" ? null : Number(payload.course_id),
         title: payload.title,
         description: payload.description || undefined,
         question_count: Number(payload.question_count),
         options_per_question: Number(payload.options_per_question),
         columns_count: Number(payload.columns_count),
-        negative_marking: false,
-        negative_ratio: 0,
+        negative_marking: payload.negative_marking,
+        negative_ratio: payload.negative_marking ? Number(payload.negative_ratio) || 0 : 0,
         is_active: true,
         scheduled_at: payload.scheduled_at.trim() ? new Date(payload.scheduled_at).toISOString() : undefined,
         seat_quota:
           sq !== "" && Number.isFinite(seatQuotaNum) && seatQuotaNum >= 1 ? Math.floor(seatQuotaNum) : undefined,
+        resale_enabled: umumiExam ? payload.resale_enabled : false,
+        city: payload.city.trim() || undefined,
+        venue: payload.venue.trim() || undefined,
+        answer_sheet_preset_id:
+          payload.answer_sheet_preset_id === "" ? undefined : Number(payload.answer_sheet_preset_id),
         bundled_ticket: bundled
       });
     },
@@ -402,20 +419,6 @@ function ExamsWizardPage() {
     }
   });
 
-  const addFromBankMut = useMutation({
-    mutationFn: () =>
-      addQuestionFromBank(examId!, {
-        bank_question_id: Number(pickBankId),
-        order_index: pickOrderIndex
-      }),
-    onSuccess: async () => {
-      setPickBankId("");
-      await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
-      await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
-      await queryClient.invalidateQueries({ queryKey: ["question-bank-pick"] });
-    }
-  });
-
   const delQuestionMut = useMutation({
     mutationFn: (qid: number) => deleteQuestion(examId!, qid),
     onSuccess: async () => {
@@ -437,9 +440,56 @@ function ExamsWizardPage() {
     }
   });
 
+  /** İmtahan yaradılarkən təyin olunan planlı sual sayı — cavab açarı və kart bununla uyğunlaşır. */
+  const plannedQuestionCount = Math.max(0, examQuery.data?.question_count ?? 0);
+
+  function wizardStepAllowed(next: number, readiness: ExamReadiness | undefined): boolean {
+    if (next < 0 || next > 3) return false;
+    if (examId == null && next > 0) return false;
+    if (next === 0) return true;
+    if (next === 1) return examId != null;
+    if (next === 2) {
+      const registered = questionsQuery.data?.length ?? 0;
+      if (registered === 0) return false;
+      const qOk = readiness?.steps.find((s) => s.id === "questions")?.complete;
+      if (registered > 0 && registered < plannedQuestionCount) {
+        return false;
+      }
+      return Boolean(qOk || (plannedQuestionCount > 0 && registered >= plannedQuestionCount));
+    }
+    if (next === 3) {
+      return Boolean(readiness?.steps.find((s) => s.id === "answer_key")?.complete);
+    }
+    return false;
+  }
+
+  useEffect(() => {
+    if (examId == null) return;
+    if (!wizardStepAllowed(step, readinessQuery.data)) {
+      let clamp = 0;
+      for (let i = Math.min(step, 3); i >= 0; i--) {
+        if (wizardStepAllowed(i, readinessQuery.data)) {
+          clamp = i;
+          break;
+        }
+      }
+      if (clamp !== step) {
+        setStep(clamp);
+        setSearchParams(
+          (prev) => {
+            const n = new URLSearchParams(prev);
+            n.set("exam", String(examId));
+            n.set("wizardStep", String(clamp));
+            return n;
+          },
+          { replace: true },
+        );
+      }
+    }
+  }, [examId, step, readinessQuery.data, questionsQuery.data, plannedQuestionCount]);
+
   function goToWizardStep(next: number) {
-    if (next < 0 || next > 3) return;
-    if (examId == null && next > 0) return;
+    if (!wizardStepAllowed(next, readinessQuery.data)) return;
     setStep(next);
     if (examId != null) {
       setSearchParams(
@@ -466,18 +516,55 @@ function ExamsWizardPage() {
   }, [orderedQuestions]);
 
   useEffect(() => {
-    setPickOrderIndex(nextQuestionOrder);
-  }, [nextQuestionOrder]);
-
-  /** İmtahan yaradılarkən təyin olunan planlı sual sayı — cavab açarı və kart bununla uyğunlaşır. */
-  const plannedQuestionCount = Math.max(0, examQuery.data?.question_count ?? 0);
+    qForm.setValue("order_index", nextQuestionOrder);
+  }, [nextQuestionOrder, qForm]);
 
   const canPickFromBank = user?.role === "admin" || user?.role === "manager";
+
+  useEffect(() => {
+    if (canPickFromBank) {
+      setQuestionAddMode("bank");
+    } else {
+      setQuestionAddMode("csv");
+    }
+  }, [canPickFromBank]);
+
+  const addBulkFromBankMut = useMutation({
+    mutationFn: (bankIds: number[]) =>
+      addQuestionsFromBankBulk(examId!, {
+        bank_question_ids: bankIds,
+        start_order_index: nextQuestionOrder,
+      }),
+    onSuccess: async (res) => {
+      const parts = [`${res.imported} sual əlavə olundu`];
+      if (res.skipped > 0) parts.push(`${res.skipped} keçildi`);
+      if (res.errors.length) parts.push(res.errors.slice(0, 3).join("; "));
+      setBulkBankMsg(parts.join(" · "));
+      await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
+      await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+      await queryClient.invalidateQueries({ queryKey: ["question-bank-pick"] });
+    },
+    onError: () => {
+      setBulkBankMsg("Toplu əlavə alınmadı — yenidən cəhd edin.");
+    },
+  });
+
+  const registeredQuestionCount = questionsQuery.data?.length ?? 0;
+  const answerKeyBlockedReason = answerKeyStepBlockedReason(
+    plannedQuestionCount,
+    registeredQuestionCount,
+    readinessQuery.data,
+  );
+  const answerKeyComplete = Boolean(readinessQuery.data?.steps.find((s) => s.id === "answer_key")?.complete);
+  const bookletDownloadReady =
+    registeredQuestionCount >= plannedQuestionCount && plannedQuestionCount > 0;
+
+  const canGoToAnswerKey = wizardStepAllowed(2, readinessQuery.data);
 
   const sheetsQuery = useQuery({
     queryKey: ["answerSheets", examId],
     queryFn: () => listExamSheetTemplates(examId!),
-    enabled: examId != null && step === 3
+    enabled: examId != null,
   });
 
   useEffect(() => {
@@ -515,7 +602,13 @@ function ExamsWizardPage() {
 
   const saveKeyMut = useMutation({
     mutationFn: () => saveAnswerKey(examId!, answerRows),
-    onSuccess: () => goToWizardStep(3),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["exam-readiness", examId] });
+      goToWizardStep(3);
+    },
+    onError: () => {
+      setImportMsg("Cavab açarı saxlanılmadı — bütün sətirləri yoxlayın.");
+    },
   });
 
   const saveGradingMut = useMutation({
@@ -550,14 +643,30 @@ function ExamsWizardPage() {
         throw new Error("Bal siyasəti (JSON) düzgün deyil.");
       }
       return updateExam(examId, {
-        grading_config: { subjects, question_blocks, answer_card_identity: answerCardIdentity },
+        grading_config: {
+          subjects,
+          question_blocks,
+          answer_card_identity: answerCardIdentity,
+          booklet_config: {
+            organiser: bookletOrganiser.trim() || defaultBookletConfig().organiser,
+            sector: bookletSector.trim(),
+            exam_series: bookletSeries.trim(),
+            variants: bookletVariants.length > 0 ? bookletVariants : [...DEFAULT_BOOKLET_VARIANTS],
+          },
+        },
         grading_policy,
       });
     },
     onSuccess: async () => {
       setGradingLoadedForExamId(null);
+      setGradingSavedOk(true);
+      setGradingSaveError(null);
       await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
-    }
+      await queryClient.invalidateQueries({ queryKey: ["exam-readiness", examId] });
+    },
+    onError: (err: Error) => {
+      setGradingSaveError(err.message || "Bal/fənn parametrləri saxlanılmadı.");
+    },
   });
 
   const genPdfMut = useMutation({
@@ -565,7 +674,8 @@ function ExamsWizardPage() {
       const exam = examQuery.data;
       if (!exam || examId == null) throw new Error("İmtahan yüklənməyib");
       const qn = plannedQuestionCount > 0 ? plannedQuestionCount : exam.question_count;
-      const identityOv = buildAnswerSheetIdentityOverlay(answerCardIdentity);
+      const paperSize = paperSizeFromPreset(exam.answer_sheet_preset_id, sheetPresetsQuery.data);
+      const identityOv = buildAnswerSheetIdentityOverlay(answerCardIdentity, paperSize);
       const runtimeOverlay: Record<string, unknown> = {
         ...identityOv,
         participant_label: participantLabel.trim() || undefined,
@@ -585,7 +695,7 @@ function ExamsWizardPage() {
                 question_count: qn,
                 options_per_question: exam.options_per_question,
                 columns_count: exam.columns_count,
-                paper_size: "A4",
+                paper_size: paperSize,
                 title: "CAVAB KARTI",
                 header_subtitle: "",
                 ...runtimeOverlay,
@@ -595,7 +705,10 @@ function ExamsWizardPage() {
       return res;
     },
     onSuccess: (res) => {
-      setPdfMsg(`PDF yaradıldı və yükləndi. Kart UUID: ${res.sheet_uuid}`);
+      const lw = (res.layout_warnings ?? []).filter(Boolean);
+      const extra =
+        lw.length > 0 ? `\n\nLayout xəbərdarlığı:\n${lw.map((x) => `• ${x}`).join("\n")}` : "";
+      setPdfMsg(`PDF yaradıldı və yükləndi. Kart UUID: ${res.sheet_uuid}${extra}`);
       queryClient.invalidateQueries({ queryKey: ["answerSheets", examId] });
       if (examId != null) queryClient.invalidateQueries({ queryKey: ["exam-integrations", examId] });
     }
@@ -606,7 +719,8 @@ function ExamsWizardPage() {
       const exam = examQuery.data;
       if (!exam || examId == null) throw new Error("İmtahan yüklənməyib");
       const qn = plannedQuestionCount > 0 ? plannedQuestionCount : exam.question_count;
-      const identityOv = buildAnswerSheetIdentityOverlay(answerCardIdentity);
+      const paperSize = paperSizeFromPreset(exam.answer_sheet_preset_id, sheetPresetsQuery.data);
+      const identityOv = buildAnswerSheetIdentityOverlay(answerCardIdentity, paperSize);
       const runtimeOverlay: Record<string, unknown> = {
         ...identityOv,
         participant_label: participantLabel.trim() || undefined,
@@ -626,7 +740,7 @@ function ExamsWizardPage() {
           question_count: qn,
           options_per_question: exam.options_per_question,
           columns_count: exam.columns_count,
-          paper_size: "A4",
+          paper_size: paperSize,
           title: "CAVAB KARTI",
           header_subtitle: "",
           ...runtimeOverlay,
@@ -651,6 +765,24 @@ function ExamsWizardPage() {
 
   const courseIdForLinks = examQuery.data?.course_id ?? integrationsQuery.data?.course_id ?? null;
 
+  const step3PreviewPayload = useMemo(() => {
+    if (examId == null || !examQuery.data) return null;
+    const paperSize = paperSizeFromPreset(examQuery.data.answer_sheet_preset_id, sheetPresetsQuery.data);
+    const identity =
+      examQuery.data.course_id == null
+        ? { ...answerCardIdentity, student_code: false }
+        : answerCardIdentity;
+    return buildAnswerSheetIdentityOverlay(identity, paperSize);
+  }, [
+    examId,
+    examQuery.data,
+    sheetPresetsQuery.data,
+    answerCardIdentity,
+    participantLabel,
+    participantCode,
+    omrTwoPageStitched,
+  ]);
+
   async function handleQuestionsCsvFile(file: File | undefined) {
     if (!file || examId == null) return;
     setImportMsg(null);
@@ -661,151 +793,107 @@ function ExamsWizardPage() {
   }
 
   return (
-    <div className="mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-6 lg:py-8">
-      <header className="space-y-1">
-        <div className="flex flex-wrap items-center gap-3">
-          <Link
-            to="/exams"
-            className="inline-flex items-center gap-1.5 text-sm font-medium text-indigo-700 hover:text-indigo-900"
-          >
-            ← İmtahanlar siyahısı
-          </Link>
+    <div className="page-container-wide mx-auto max-w-4xl space-y-4 px-0 py-0 sm:px-0 lg:py-0">
+      <header className="space-y-3">
+        <Link to="/exams" className="inline-flex text-[13px] font-medium text-slate-600 hover:text-slate-900">
+          ← İmtahanlar
+        </Link>
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-semibold tracking-tight text-slate-900 sm:text-2xl">
+              {examId != null ? "İmtahan redaktəsi" : "Yeni imtahan"}
+            </h1>
+            <p className="mt-1 text-[13px] text-slate-500">
+              {examId != null
+                ? `№${examId}${examQuery.data?.title ? ` · ${examQuery.data.title}` : ""}`
+                : "Parametrlər, bilet və kart addımları."}
+            </p>
+          </div>
           {examId != null ? (
-            <span className="rounded-full bg-slate-100 px-2.5 py-0.5 text-xs font-medium text-slate-600">
-              №{examId}
-            </span>
+            <button type="button" className={examSecondaryBtn} onClick={() => goToWizardStep(1)}>
+              Suallara keç →
+            </button>
           ) : null}
         </div>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900 sm:text-[1.65rem]">İmtahan yaratma</h1>
-        <p className="max-w-2xl text-sm leading-relaxed text-slate-600">
-          Dörd addımda imtahanı qurun: əsas parametrlər, suallar və fənn konfiqurasiyası, cavab açarı, sonra cavab
-          kartı PDF-i. Addımlar arasında istənilən vaxt keçid edə bilərsiniz.
-        </p>
       </header>
 
-      {/* Addım göstəricisi */}
-      <nav aria-label="Sihirbaz addımları" className="card !p-4 sm:!p-5">
-        <ol className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:gap-1">
-          {steps.map((label, i) => {
-            const disabled = examId == null && i > 0;
-            const active = step === i;
-            const done = examId != null && step > i;
-            return (
-              <li key={label} className="flex items-center gap-1">
-                <button
-                  type="button"
-                  disabled={disabled}
-                  onClick={() => {
-                    if (disabled) return;
-                    goToWizardStep(i);
-                  }}
-                  className={[
-                    "flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left text-sm transition sm:w-auto sm:py-2",
-                    disabled
-                      ? "cursor-not-allowed border-slate-100 bg-slate-50 text-slate-400"
-                      : active
-                        ? "border-indigo-200 bg-indigo-50 text-indigo-950 shadow-sm ring-1 ring-indigo-100"
-                        : done
-                          ? "border-emerald-100 bg-emerald-50/80 text-emerald-900 hover:bg-emerald-50"
-                          : "border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50"
-                  ].join(" ")}
-                >
-                  <span
-                    className={[
-                      "flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold",
-                      active
-                        ? "bg-indigo-600 text-white"
-                        : done
-                          ? "bg-emerald-600 text-white"
-                          : "bg-slate-200 text-slate-700"
-                    ].join(" ")}
-                  >
-                    {done ? "✓" : i + 1}
-                  </span>
-                  <span className="min-w-0 font-medium leading-snug">{label}</span>
-                </button>
-                {i < steps.length - 1 && (
-                  <span
-                    className="mx-1 hidden h-px w-6 shrink-0 bg-slate-200 sm:block"
-                    aria-hidden
-                  />
-                )}
-              </li>
-            );
-          })}
-        </ol>
-      </nav>
+      <ExamWizardStepper
+        step={step}
+        examId={examId}
+        onStep={goToWizardStep}
+        stepAllowed={(i) => wizardStepAllowed(i, readinessQuery.data)}
+      />
+
+      <ExamWizardGuide
+        step={step}
+        step1SubSection={step1SubSection}
+        examId={examId}
+        plannedQuestionCount={plannedQuestionCount}
+        registeredQuestionCount={registeredQuestionCount}
+        gradingSaved={gradingSavedOk || Boolean(readinessQuery.data?.steps.find((s) => s.id === "grading")?.complete)}
+        answerKeyComplete={Boolean(readinessQuery.data?.steps.find((s) => s.id === "answer_key")?.complete)}
+        sheetConfirmed={Boolean(readinessQuery.data?.steps.find((s) => s.id === "sheet_template")?.complete)}
+        canGoToAnswerKey={canGoToAnswerKey}
+        onGoToSubSection={setStep1SubSection}
+        onGoToStep={goToWizardStep}
+      />
 
       {examId != null && (
-        <section
-          className="card border-indigo-100 bg-gradient-to-br from-indigo-50/90 to-white !shadow-sm"
-          aria-label="İmtahan inteqrasiyaları"
-        >
-          <h2 className="text-base font-semibold text-indigo-950">Kurs, bilet, kart və yoxlama</h2>
-          <p className="mt-1 text-sm text-slate-600">
-            {integrationsQuery.data?.course_id == null
-              ? "Ümumi imtahan (kurs bağlantısı yoxdur). Şagird kodu bu kontekstdə tətbiq olunmur; skan üçün kart şablonları saxlanılır."
-              : "Bu imtahan seçilmiş kursa bağlıdır; skan və şagird məlumatları həmin kurs kontekstindədir."}
-          </p>
-          {integrationsQuery.isLoading && <p className="mt-3 text-sm text-slate-500">Yüklənir...</p>}
-          {integrationsQuery.data && (
-            <ul className="mt-4 grid gap-3 text-sm text-slate-700 sm:grid-cols-2">
-              <li className="rounded-lg border border-indigo-100/80 bg-white/70 px-3 py-2">
-                <span className="font-medium text-slate-900">Kurs</span>
-                <span className="mt-0.5 block text-slate-600">
-                  {integrationsQuery.data.course_id == null ? "Ümumi (yox)" : `№${integrationsQuery.data.course_id}`}
-                </span>
-              </li>
-              <li className="rounded-lg border border-indigo-100/80 bg-white/70 px-3 py-2">
-                <span className="font-medium text-slate-900">Bilet</span>
-                <span className="mt-0.5 block text-slate-600">
-                  {integrationsQuery.data.linked_tickets.length === 0
-                    ? "Bağlı aktiv bilet yoxdur"
-                    : integrationsQuery.data.linked_tickets.map((t) => `№${t.id} «${t.title}»`).join(", ")}
-                </span>
-              </li>
-              <li className="rounded-lg border border-indigo-100/80 bg-white/70 px-3 py-2">
-                <span className="font-medium text-slate-900">Cavab kartı şablonları</span>
-                <span className="mt-0.5 block text-slate-600">
-                  {integrationsQuery.data.answer_sheet_templates_count} (PDF addımında artır)
-                </span>
-              </li>
-              <li className="rounded-lg border border-indigo-100/80 bg-white/70 px-3 py-2">
-                <span className="font-medium text-slate-900">Skan oturumları</span>
-                <span className="mt-0.5 block text-slate-600">
-                  cəmi {integrationsQuery.data.scan_sessions_total}, aktiv {integrationsQuery.data.scan_sessions_active}
-                </span>
-              </li>
-            </ul>
+        <SheetStatusBadge
+          status={sheetStatusFromReadiness(
+            readinessQuery.data,
+            examQuery.data?.answer_sheet_preset_id,
+            (sheetsQuery.data ?? []).filter((s) => s.is_draft).length,
+            (sheetsQuery.data ?? []).filter((s) => !s.is_draft && s.pdf_path).length,
           )}
-          <div className="mt-4 flex flex-wrap gap-2 border-t border-indigo-100/80 pt-4">
-            {courseIdForLinks != null && (
-              <Link
-                className="inline-flex items-center rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-indigo-700"
-                to={`/courses/${courseIdForLinks}`}
-              >
-                Kurs paneli
-              </Link>
-            )}
-            <Link
-              className="inline-flex items-center rounded-lg border border-indigo-200 bg-white px-3 py-2 text-sm font-medium text-indigo-800 transition hover:bg-indigo-50"
-              to={`/scan?exam=${examId}`}
-            >
-              Skan — bu imtahan
-            </Link>
-            {courseIdForLinks != null && (
-              <Link
-                className="inline-flex items-center rounded-lg border border-emerald-200 bg-emerald-50/80 px-3 py-2 text-sm font-medium text-emerald-900 transition hover:bg-emerald-100"
-                to={`/students?course=${courseIdForLinks}`}
-              >
-                Şagirdlər (kurs)
-              </Link>
-            )}
+        />
+      )}
+
+      {examId != null && readinessQuery.data && step > 0 && (
+        <section className={examSection} aria-label="Hazırlıq">
+          <div className={examSectionBody}>
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Hazırlıq</p>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {readinessQuery.data.steps.map((s) => (
+                <span
+                  key={s.id}
+                  className={`rounded-full px-2.5 py-1 text-[11px] font-medium ${
+                    s.complete ? "bg-emerald-100 text-emerald-800" : "bg-slate-100 text-slate-600"
+                  }`}
+                >
+                  {s.label}
+                </span>
+              ))}
+            </div>
+            {!readinessQuery.data.ready_for_scan && readinessQuery.data.missing.length > 0 ? (
+              <p className="mt-2 text-[11px] text-amber-700">Çatışmayan: {readinessQuery.data.missing.join(" · ")}</p>
+            ) : null}
           </div>
         </section>
       )}
 
+      {examId != null && (
+        <ExamIntegrationsStrip
+          examId={examId}
+          data={integrationsQuery.data}
+          isLoading={integrationsQuery.isLoading}
+          courseId={courseIdForLinks}
+        />
+      )}
+
       {examId != null && step === 1 && (
+        <ExamStepSubNav
+          active={step1SubSection}
+          onChange={setStep1SubSection}
+          status={{
+            kart: gradingSavedOk || Boolean(readinessQuery.data?.steps.find((s) => s.id === "grading")?.complete),
+            suallar:
+              plannedQuestionCount > 0 && registeredQuestionCount >= plannedQuestionCount,
+          }}
+        />
+      )}
+
+      {examId != null && step === 1 && step1SubSection === "kart" && (
         <section className="card border-slate-200 bg-slate-50/50">
           <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
             <div>
@@ -819,11 +907,13 @@ function ExamsWizardPage() {
               type="button"
               className="mt-2 shrink-0 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:opacity-50 sm:mt-0"
               disabled={saveGradingMut.isPending}
-              onClick={() =>
+              onClick={() => {
+                setGradingSaveError(null);
                 saveGradingMut.mutate(undefined, {
-                  onError: (e) => window.alert(e instanceof Error ? e.message : "Saxlama xətası"),
-                })
-              }
+                  onError: (e) =>
+                    setGradingSaveError(e instanceof Error ? e.message : "Saxlama xətası"),
+                });
+              }}
             >
               Saxla
             </button>
@@ -875,7 +965,9 @@ function ExamsWizardPage() {
                   ["variant", "Variant (A/B)"],
                   ["section", "Bölmə (Az/RU/GÜ)"],
                 ] as const
-              ).map(([key, lab]) => (
+              )
+                .filter(([key]) => !(examQuery.data?.course_id == null && key === "student_code"))
+                .map(([key, lab]) => (
                 <li key={key}>
                   <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-white/80 bg-white/90 px-3 py-2 text-sm text-slate-800 shadow-sm">
                     <input
@@ -1054,7 +1146,12 @@ function ExamsWizardPage() {
             )}
           </div>
 
-          {saveGradingMut.isError && (
+          {gradingSaveError && (
+            <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800">
+              {gradingSaveError}
+            </p>
+          )}
+          {saveGradingMut.isError && !gradingSaveError && (
             <p className="mt-3 text-sm text-red-600">
               Saxlama alınmadı — məlumatları yoxlayın (fənn kodları və blok uyğunluğu).
             </p>
@@ -1065,162 +1162,30 @@ function ExamsWizardPage() {
         </section>
       )}
 
-      {step === 0 && examId != null && (
-        <div className="card flex flex-col gap-4 border-amber-100 bg-amber-50/40 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="font-medium text-slate-900">Cari imtahan №{examId}</p>
-            <p className="mt-1 text-sm text-slate-600">Davam edin və ya sıfırdan yeni imtahan yaradın.</p>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700"
-              onClick={() => goToWizardStep(1)}
-            >
-              Suallara keç
-            </button>
-            <button
-              type="button"
-              className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
-              onClick={() => {
-                setExamId(null);
-                setUmumiExam(false);
-                setImportMsg(null);
-                setPdfMsg(null);
-                reset();
-              }}
-            >
-              Yeni imtahan
-            </button>
-          </div>
-        </div>
+      {step === 0 && examId != null && examQuery.data && (
+        <ExamSettingsEditor
+          examId={examId}
+          exam={examQuery.data}
+          isAdmin={user?.role === "admin"}
+          linkedTicketsCount={integrationsQuery.data?.linked_tickets.length ?? 0}
+          courseId={examQuery.data.course_id}
+        />
       )}
 
       {step === 0 && examId == null && (
-        <form className="card space-y-6" onSubmit={handleSubmit((v) => createExamMut.mutate(v))}>
-          <div>
-            <h2 className="text-base font-semibold text-slate-900">Əsas məlumatlar</h2>
-            <p className="mt-1 text-sm text-slate-600">Kurs və imtahan parametrlərini daxil edin.</p>
-          </div>
-          {user?.role === "admin" && (
-            <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-800">
-              <input
-                type="checkbox"
-                className="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                checked={umumiExam}
-                onChange={(e) => setUmumiExam(e.target.checked)}
-              />
-              <span>
-                <strong className="font-semibold">Ümumi imtahan</strong>
-                <span className="mt-1 block text-slate-600">
-                  Kurs seçilmir; qapaq və cavab kartında sistem logosu istifadə olunur. Bilet əlavə etmək mümkün deyil.
-                </span>
-              </span>
-            </label>
-          )}
-          <div className="grid gap-5 sm:grid-cols-2">
-            <label className={labelClass}>
-              Kurs
-              <select
-                className={inputClass}
-                disabled={umumiExam}
-                {...register("course_id", { valueAsNumber: true })}
-              >
-                {(coursesQuery.data ?? []).map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className={labelClass}>
-              Başlıq
-              <input className={inputClass} placeholder="məs. Riyaziyyat — buraxılış" {...register("title", { required: true })} />
-            </label>
-            <label className={`${labelClass} sm:col-span-2`}>
-              Təsvir
-              <input className={inputClass} placeholder="Qısa təsvir (istəyə bağlı)" {...register("description")} />
-            </label>
-            <label className={labelClass}>
-              Planlaşdırılan sual sayı
-              <input className={inputClass} type="number" min={1} {...register("question_count", { valueAsNumber: true })} />
-            </label>
-            <label className={labelClass}>
-              Hər sual üçün variant
-              <input className={inputClass} type="number" min={2} max={5} {...register("options_per_question", { valueAsNumber: true })} />
-            </label>
-            <label className={labelClass}>
-              Sütun sayı (kartda)
-              <input className={inputClass} type="number" min={1} max={4} {...register("columns_count", { valueAsNumber: true })} />
-            </label>
-            <label className={labelClass}>
-              İmtahan tarixi / saat (istəyə bağlı)
-              <input className={inputClass} type="datetime-local" {...register("scheduled_at")} />
-            </label>
-            <label className={labelClass}>
-              Yer sayı — limit (istəyə bağlı)
-              <input className={inputClass} type="number" min={1} placeholder="Boş = limitsiz" {...register("seat_quota")} />
-            </label>
-          </div>
-
-          {!umumiExam && (
-          <fieldset className="rounded-xl border border-slate-200 bg-slate-50/80 p-4">
-            <legend className="px-1 text-sm font-semibold text-slate-800">Bilet (kurs satışı)</legend>
-            <p className="mb-3 text-xs text-slate-600">İmtahan yaradılarkən kursa avtomatik bağlanan bilet.</p>
-            <label className="flex cursor-pointer items-start gap-3 text-sm text-slate-700">
-              <input
-                type="checkbox"
-                className="mt-1 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
-                {...register("add_ticket")}
-              />
-              <span>Bu imtahan üçün dərhal bilet yaradın</span>
-            </label>
-            {addTicketEnabled && (
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <label className={`${labelClass} sm:col-span-2`}>
-                  Bilet başlığı
-                  <input
-                    className={inputClass}
-                    placeholder="məs. Riyaziyyat buraxılış — 2026"
-                    {...register("ticket_title", {
-                      validate: (v) =>
-                        !addTicketEnabled || (v && v.trim().length > 0) || "Bilet başlığı mütləqdir"
-                    })}
-                  />
-                </label>
-                <label className={`${labelClass} sm:col-span-2`}>
-                  Qısa təsvir
-                  <input className={inputClass} placeholder="İstəyə bağlı" {...register("ticket_description")} />
-                </label>
-                <label className={labelClass}>
-                  Qiymət (AZN)
-                  <input
-                    className={inputClass}
-                    type="number"
-                    step="0.01"
-                    {...register("ticket_price", { valueAsNumber: true })}
-                  />
-                </label>
-                <label className={labelClass}>
-                  Kontingent (boş = limitsiz)
-                  <input className={inputClass} type="number" min={1} placeholder="—" {...register("ticket_quota")} />
-                </label>
-              </div>
-            )}
-          </fieldset>
-          )}
-
-          <div className="flex flex-wrap items-center gap-3 border-t border-slate-100 pt-5">
-            <button
-              type="submit"
-              disabled={createExamMut.isPending}
-              className="rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {createExamMut.isPending ? "Yaradılır…" : "İmtahan yarat və davam et"}
-            </button>
-            {createExamMut.isError && <p className="text-sm text-red-600">Yaratma xətası — məlumatları yoxlayın.</p>}
-          </div>
-        </form>
+        <ExamCreateForm
+          register={register}
+          watch={watch}
+          setValue={setValue}
+          courses={coursesQuery.data ?? []}
+          sheetPresets={createPresetsQuery.data ?? []}
+          umumiExam={umumiExam}
+          onUmumiExamChange={setUmumiExam}
+          isAdmin={user?.role === "admin"}
+          isPending={createExamMut.isPending}
+          isError={createExamMut.isError}
+          onSubmit={handleSubmit((v) => createExamMut.mutate(v))}
+        />
       )}
 
       {step >= 1 && examId != null && (
@@ -1233,113 +1198,127 @@ function ExamsWizardPage() {
                 {examQuery.data?.title ? ` — ${examQuery.data.title}` : ""}
               </h2>
             </div>
-            <button
-              type="button"
-              className="self-start rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-800 transition hover:bg-red-100 sm:self-auto"
-              onClick={() => delExamMut.mutate(examId)}
-            >
-              İmtahanı sil
-            </button>
+            {deleteExamConfirm ? (
+              <div className="flex flex-wrap items-center gap-2 self-start sm:self-auto">
+                <span className="text-sm text-red-800">Silməyə əminsiniz?</span>
+                <button
+                  type="button"
+                  className="rounded-lg bg-red-600 px-3 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+                  disabled={delExamMut.isPending}
+                  onClick={() => delExamMut.mutate(examId)}
+                >
+                  {delExamMut.isPending ? "Silinir…" : "Bəli, sil"}
+                </button>
+                <button
+                  type="button"
+                  className={examSecondaryBtn}
+                  onClick={() => setDeleteExamConfirm(false)}
+                >
+                  Ləğv et
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="self-start rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-800 transition hover:bg-red-100 sm:self-auto"
+                onClick={() => setDeleteExamConfirm(true)}
+              >
+                İmtahanı sil
+              </button>
+            )}
           </div>
 
-          {examQuery.data && step === 1 ? <ExamScheduleEditor examId={examId} exam={examQuery.data} /> : null}
 
-          {step === 1 && (
-            <div className="space-y-6">
-              <div>
-                <h3 className="text-base font-semibold text-slate-900">Suallar</h3>
-                <p className="mt-1 text-sm text-slate-600">
-                  CSV: <code className="text-xs">order_index</code>, <code className="text-xs">stem</code>; istəyə görə{" "}
-                  <code className="text-xs">qtype</code> (mcq/tf), <code className="text-xs">points</code>,{" "}
-                  <code className="text-xs">options_json</code>, <code className="text-xs">subject_id</code>,{" "}
-                  <code className="text-xs">subject_short_code</code> (və ya köhnə{" "}
-                  <code className="text-xs">subject_code</code>), <code className="text-xs">difficulty</code>{" "}
-                  (easy/medium/hard).
-                </p>
-              </div>
-
-              <div
-                className={[
-                  "rounded-xl border-2 border-dashed px-4 py-6 text-center transition",
-                  csvDragActive
-                    ? "border-indigo-400 bg-indigo-50/60"
-                    : "border-slate-200 bg-slate-50/50 hover:border-slate-300"
-                ].join(" ")}
-                onDragEnter={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setCsvDragActive(true);
-                }}
-                onDragLeave={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  if (!e.currentTarget.contains(e.relatedTarget as Node)) setCsvDragActive(false);
-                }}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                }}
-                onDrop={async (e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  setCsvDragActive(false);
-                  const f = e.dataTransfer.files?.[0];
-                  if (f && !f.name.toLowerCase().endsWith(".csv")) {
-                    setImportMsg("Yalnız .csv faylı qəbul edilir.");
-                    return;
-                  }
-                  await handleQuestionsCsvFile(f);
-                }}
-              >
-                <label className="cursor-pointer text-sm font-medium text-indigo-700 hover:text-indigo-900">
-                  <span>CSV fayl seçin və ya buraya buraxın</span>
-                  <input
-                    type="file"
-                    accept=".csv"
-                    className="sr-only"
-                    onChange={async (e) => {
-                      const f = e.target.files?.[0];
-                      await handleQuestionsCsvFile(f);
-                      e.target.value = "";
-                    }}
-                  />
-                </label>
-                {importMsg && (
-                  <p
-                    className={
-                      importMsg.includes("Yalnız") ? "mt-3 text-sm text-amber-800" : "mt-3 text-sm text-emerald-700"
+          {step === 1 && step1SubSection === "suallar" && (
+            <ExamQuestionsPanel
+              mode={questionAddMode}
+              onModeChange={setQuestionAddMode}
+              canUseBank={canPickFromBank}
+              plannedQuestionCount={plannedQuestionCount}
+              registeredQuestionCount={registeredQuestionCount}
+              bankPanel={
+                <ExamQuestionBankPicker
+                  questions={bankPickQuery.data ?? []}
+                  isLoading={bankPickQuery.isLoading}
+                  isError={bankPickQuery.isError}
+                  subjects={bankSubjectsQuery.data ?? []}
+                  subjectsLoading={bankSubjectsQuery.isLoading}
+                  plannedQuestionCount={plannedQuestionCount}
+                  registeredQuestionCount={registeredQuestionCount}
+                  nextOrderIndex={nextQuestionOrder}
+                  isAdding={addBulkFromBankMut.isPending}
+                  bulkResult={bulkBankMsg}
+                  search={bankStemSearch}
+                  subjectFilterId={bankFilterSubjectId}
+                  onSearchChange={setBankStemSearch}
+                  onSubjectFilterChange={setBankFilterSubjectId}
+                  onBulkAdd={(ids) => {
+                    setBulkBankMsg(null);
+                    addBulkFromBankMut.mutate(ids);
+                  }}
+                />
+              }
+              csvPanel={
+                <ExamCsvImportZone
+                  csvDragActive={csvDragActive}
+                  importMsg={importMsg}
+                  onDragActive={setCsvDragActive}
+                  onFile={async (f) => {
+                    if (f && !f.name.toLowerCase().endsWith(".csv")) {
+                      setImportMsg("Yalnız .csv faylı qəbul edilir.");
+                      return;
                     }
-                  >
-                    {importMsg}
-                  </p>
-                )}
-              </div>
-
-              {canPickFromBank && (
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-4 shadow-sm">
-                  <p className="mb-1 text-sm font-semibold text-emerald-950">Sual bazasından əlavə et</p>
-                  <p className="mb-3 text-xs text-emerald-900/85">
-                    Kartdan sualı seçin; sıra nömrəsini təyin edin (adətən növbəti boş sıra).
-                  </p>
-                  <div className="mb-4 grid gap-3 sm:grid-cols-12">
-                    <label className={`${labelClass} sm:col-span-5`}>
-                      Axtarış
+                    await handleQuestionsCsvFile(f);
+                  }}
+                />
+              }
+              manualPanel={
+                <form
+                  className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
+                  onSubmit={qForm.handleSubmit((v) => addQuestionMut.mutate(v))}
+                >
+                  <p className="mb-3 text-sm font-medium text-slate-800">Tək sual əlavə et</p>
+                  <div className="grid gap-3 sm:grid-cols-12">
+                    <label className={`${labelClass} sm:col-span-2`}>
+                      Sıra
                       <input
                         className={inputClass}
-                        value={bankStemSearch}
-                        onChange={(e) => setBankStemSearch(e.target.value)}
-                        placeholder="Sual mətninə görə"
+                        type="number"
+                        {...qForm.register("order_index", { valueAsNumber: true })}
                       />
                     </label>
-                    <label className={`${labelClass} sm:col-span-4`}>
-                      Fənn üzrə süzgəc
-                      <select
-                        className={inputClass}
-                        value={bankFilterSubjectId}
-                        onChange={(e) => setBankFilterSubjectId(e.target.value)}
-                        disabled={bankSubjectsQuery.isLoading}
-                      >
-                        <option value="">Hamısı</option>
+                    <label className={`${labelClass} sm:col-span-3`}>
+                      Növ
+                      <select className={inputClass} {...qForm.register("qtype")}>
+                        <option value="mcq">Çoxtan seçimli</option>
+                      </select>
+                      <p className="mt-1 text-xs text-amber-800">
+                        Doğru/Yanlış sualları hələ dəstəklənmir — OMR skan üçün yalnız MCQ istifadə edin.
+                      </p>
+                    </label>
+                    <label className={`${labelClass} sm:col-span-12`}>
+                      Sual mətni
+                      <Controller
+                        control={qForm.control}
+                        name="stem"
+                        render={({ field }) => (
+                          <RichHtmlEditor
+                            value={field.value}
+                            onChange={field.onChange}
+                            placeholder="Word-dən yapışdıra bilərsiniz. Boş buraxmaq da olar."
+                            minHeightClass="min-h-[120px]"
+                          />
+                        )}
+                      />
+                    </label>
+                    <label className={`${labelClass} sm:col-span-2`}>
+                      Xal
+                      <input className={inputClass} type="number" {...qForm.register("points", { valueAsNumber: true })} />
+                    </label>
+                    <label className={`${labelClass} sm:col-span-6`}>
+                      Fənn
+                      <select className={inputClass} disabled={bankSubjectsQuery.isLoading} {...qForm.register("subject_id")}>
+                        <option value="">— seçilməyə bilər —</option>
                         {(bankSubjectsQuery.data ?? []).map((s) => (
                           <option key={s.id} value={String(s.id)}>
                             {s.name}
@@ -1348,240 +1327,265 @@ function ExamsWizardPage() {
                         ))}
                       </select>
                     </label>
-                    <label className={`${labelClass} sm:col-span-3`}>
-                      İmtahanda sıra №
-                      <input
-                        className={inputClass}
-                        type="number"
-                        min={1}
-                        value={pickOrderIndex}
-                        onChange={(e) => setPickOrderIndex(Number(e.target.value))}
-                      />
+                    <label className={`${labelClass} sm:col-span-6`}>
+                      Çətinlik
+                      <select className={inputClass} {...qForm.register("difficulty")}>
+                        <option value="">—</option>
+                        <option value="easy">Asan</option>
+                        <option value="medium">Orta</option>
+                        <option value="hard">Çətin</option>
+                      </select>
                     </label>
                   </div>
-
-                  {bankPickQuery.isLoading && <p className="text-sm text-emerald-900/80">Yüklənir…</p>}
-                  {!bankPickQuery.isLoading && (bankPickQuery.data ?? []).length === 0 && (
-                    <p className="rounded-lg bg-white/80 px-3 py-4 text-center text-sm text-slate-600">
-                      Uyğun sual tapılmadı — axtarışı dəyişin və ya süzgəci təmizləyin.
+                  <button
+                    type="submit"
+                    disabled={addQuestionMut.isPending}
+                    className={`${examPrimaryBtn} mt-4`}
+                  >
+                    {addQuestionMut.isPending ? "Əlavə olunur…" : "Sualı əlavə et"}
+                  </button>
+                </form>
+              }
+              listPanel={
+                <>
+                  {questionsQuery.isLoading && <p className="text-sm text-slate-500">Suallar yüklənir…</p>}
+                  {!questionsQuery.isLoading && (questionsQuery.data ?? []).length > 0 && (
+                    <div className="overflow-hidden rounded-xl border border-slate-200">
+                      <table className="w-full text-left text-sm">
+                        <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                          <tr>
+                            <th className="px-4 py-3">№</th>
+                            <th className="px-4 py-3">Mətn</th>
+                            <th className="px-4 py-3">Növ</th>
+                            <th className="px-4 py-3">Fənn</th>
+                            <th className="px-4 py-3">Xal</th>
+                            <th className="px-4 py-3 text-right">Əməl</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 bg-white">
+                          {(questionsQuery.data ?? []).map((q) => (
+                            <tr key={q.id} className="hover:bg-slate-50/80">
+                              <td className="whitespace-nowrap px-4 py-3 font-medium text-slate-900">{q.order_index}</td>
+                              <td className="max-w-md px-4 py-3 text-slate-700">
+                                {plainTextFromHtml(q.stem || "").trim() ? (
+                                  plainTextFromHtml(q.stem || "").slice(0, 120) +
+                                  (plainTextFromHtml(q.stem || "").length > 120 ? "…" : "")
+                                ) : (
+                                  <span className="text-slate-400">— boş</span>
+                                )}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3 text-slate-600">{q.qtype === "tf" ? "D/Y" : "MT"}</td>
+                              <td className="whitespace-nowrap px-4 py-3 text-slate-600">
+                                {q.subject_short_code?.trim() || q.subject_name?.trim() || "—"}
+                              </td>
+                              <td className="whitespace-nowrap px-4 py-3 text-slate-600">{q.points}</td>
+                              <td className="px-4 py-3 text-right">
+                                <button
+                                  type="button"
+                                  className="text-sm font-medium text-red-600 hover:text-red-800"
+                                  onClick={() => delQuestionMut.mutate(q.id)}
+                                >
+                                  Sil
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  {!questionsQuery.isLoading && (questionsQuery.data ?? []).length === 0 && (
+                    <p className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-4 py-8 text-center text-sm text-slate-600">
+                      Hələ sual yoxdur. Yuxarıdan sual bazası, CSV və ya tək sual ilə əlavə edin.
                     </p>
                   )}
-                  <div className="grid max-h-[min(420px,50vh)] grid-cols-1 gap-2 overflow-y-auto sm:grid-cols-2">
-                    {(bankPickQuery.data ?? []).map((b: BankQuestion) => {
-                      const plain = plainTextFromHtml(b.stem || "");
-                      const preview = plain.trim() ? plain.slice(0, 220) + (plain.length > 220 ? "…" : "") : "(mətn yoxdur)";
-                      const sel = pickBankId === String(b.id);
-                      return (
-                        <button
-                          key={b.id}
-                          type="button"
-                          onClick={() => setPickBankId(String(b.id))}
-                          className={[
-                            "rounded-xl border p-3 text-left text-sm transition",
-                            sel
-                              ? "border-emerald-600 bg-white shadow-md ring-2 ring-emerald-300"
-                              : "border-emerald-100/90 bg-white/90 hover:border-emerald-300 hover:bg-white",
-                          ].join(" ")}
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <span className="font-semibold text-emerald-950">#{b.id}</span>
-                            <span className="shrink-0 rounded-full bg-emerald-100 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-emerald-900">
-                              {b.qtype === "tf" ? "D/Y" : "MT"}
-                            </span>
-                          </div>
-                          {b.subject ? (
-                            <p className="mt-1 text-xs font-medium text-emerald-900/90">
-                              {b.subject.short_code || b.subject.name}
-                            </p>
-                          ) : (
-                            <p className="mt-1 text-xs text-slate-400">Fənn yoxdur</p>
-                          )}
-                          <p className="mt-2 line-clamp-4 text-slate-700">{preview}</p>
-                        </button>
-                      );
-                    })}
-                  </div>
+                </>
+              }
+            />
+          )}
 
-                  <button
-                    type="button"
-                    disabled={pickBankId === "" || addFromBankMut.isPending}
-                    className="mt-4 w-full rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 sm:w-auto"
-                    onClick={() => addFromBankMut.mutate()}
-                  >
-                    {addFromBankMut.isPending ? "Əlavə olunur…" : "Seçilmiş sualı əlavə et"}
-                  </button>
-                  {bankPickQuery.isError ? (
-                    <p className="mt-2 text-xs text-red-700">Sual bazası yüklənmədi — yenidən yoxlayın.</p>
-                  ) : null}
-                </div>
-              )}
-
-              <form
-                className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
-                onSubmit={qForm.handleSubmit((v) => addQuestionMut.mutate(v))}
-              >
-                <p className="mb-3 text-sm font-medium text-slate-800">Tək sual əlavə et</p>
-                <div className="grid gap-3 sm:grid-cols-12">
-                  <label className={`${labelClass} sm:col-span-2`}>
-                    Sıra
+          {step === 1 && step1SubSection === "kitabca" && (
+            <div className="space-y-6">
+              <div className="rounded-xl border border-[#c0176a]/25 bg-[#fde8f3]/30 p-4">
+                <h4 className="text-sm font-semibold text-[#9b1257]">Sual kitabçası (DİM standartı)</h4>
+                <p className="mt-1 text-xs text-slate-700">
+                  Process magenta başlıq, fiducial marker, variant kodu (A–D), QR, rəsmi təlimatlar — cavab kartı ilə
+                  eyni vizual dil. Sektor və təşkilatçı dövlət səviyyəli imtahanlar üçün.
+                </p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  <label className={labelClass}>
+                    Təşkilatçı
                     <input
                       className={inputClass}
-                      type="number"
-                      {...qForm.register("order_index", { valueAsNumber: true })}
+                      value={bookletOrganiser}
+                      onChange={(e) => setBookletOrganiser(e.target.value)}
+                      placeholder="Dövlət İmtahan Mərkəzi"
                     />
                   </label>
-                  <label className={`${labelClass} sm:col-span-3`}>
-                    Növ
-                    <select className={inputClass} {...qForm.register("qtype")}>
-                      <option value="mcq">Çoxtan seçimli</option>
-                      <option value="tf">Doğru / Yanlış</option>
-                    </select>
-                  </label>
-                  <label className={`${labelClass} sm:col-span-5`}>
-                    Sual mətni
+                  <label className={labelClass}>
+                    Sektor / sahə
                     <input
                       className={inputClass}
-                      placeholder="Boş buraxıla bilər (yalnız sıra)"
-                      {...qForm.register("stem")}
+                      value={bookletSector}
+                      onChange={(e) => setBookletSector(e.target.value)}
+                      placeholder="Təhsil, həkimlik, dövlət qulluğu…"
                     />
                   </label>
-                  <label className={`${labelClass} sm:col-span-2`}>
-                    Xal
-                    <input className={inputClass} type="number" {...qForm.register("points", { valueAsNumber: true })} />
+                  <label className={labelClass}>
+                    Müəssisə
+                    <input
+                      className={inputClass}
+                      value={institution}
+                      onChange={(e) => setInstitution(e.target.value)}
+                    />
                   </label>
-                  <label className={`${labelClass} sm:col-span-6`}>
-                    Fənn (sual bazası)
-                    <select className={inputClass} disabled={bankSubjectsQuery.isLoading} {...qForm.register("subject_id")}>
-                      <option value="">— seçilməyə bilər —</option>
-                      {(bankSubjectsQuery.data ?? []).map((s) => (
-                        <option key={s.id} value={String(s.id)}>
-                          {s.name}
-                          {s.short_code ? ` (${s.short_code})` : ""}
+                  <label className={labelClass}>
+                    İmtahan kodu
+                    <input
+                      className={inputClass}
+                      value={examCode}
+                      onChange={(e) => setExamCode(e.target.value)}
+                      placeholder={examId != null ? `IMT-${examId}` : "IMT-…"}
+                    />
+                  </label>
+                  <label className={labelClass}>
+                    Variant (endirmə)
+                    <select className={inputClass} value={bookletVariant} onChange={(e) => setBookletVariant(e.target.value)}>
+                      {(bookletVariants.length > 0 ? bookletVariants : [...DEFAULT_BOOKLET_VARIANTS]).map((v) => (
+                        <option key={v} value={v}>
+                          {v}
                         </option>
                       ))}
                     </select>
                   </label>
-                  <label className={`${labelClass} sm:col-span-6`}>
-                    Çətinlik
-                    <select className={inputClass} {...qForm.register("difficulty")}>
-                      <option value="">—</option>
-                      <option value="easy">Asan</option>
-                      <option value="medium">Orta</option>
-                      <option value="hard">Çətin</option>
-                    </select>
+                  <label className={labelClass}>
+                    Müddət (dəqiqə)
+                    <input
+                      className={inputClass}
+                      type="number"
+                      min={1}
+                      max={600}
+                      value={bookletDurationMinutes}
+                      onChange={(e) =>
+                        setBookletDurationMinutes(e.target.value === "" ? "" : Number(e.target.value))
+                      }
+                      placeholder="Məs: 90"
+                    />
+                  </label>
+                  <label className={`${labelClass} sm:col-span-2`}>
+                    Aktiv variantlar (cavab kartı ilə uyğun)
+                    <input
+                      className={inputClass}
+                      value={bookletVariants.join(", ")}
+                      onChange={(e) =>
+                        setBookletVariants(
+                          e.target.value
+                            .split(/[,;\s]+/)
+                            .map((x) => x.trim().toUpperCase())
+                            .filter(Boolean),
+                        )
+                      }
+                      placeholder="A, B, C, D"
+                    />
+                  </label>
+                  <label className={labelClass}>
+                    Seriya
+                    <input className={inputClass} value={bookletSeries} onChange={(e) => setBookletSeries(e.target.value)} />
+                  </label>
+                  <label className={labelClass}>
+                    Qeyd 1
+                    <input className={inputClass} value={coverLine1} onChange={(e) => setCoverLine1(e.target.value)} />
+                  </label>
+                  <label className={labelClass}>
+                    Qeyd 2
+                    <input className={inputClass} value={coverLine2} onChange={(e) => setCoverLine2(e.target.value)} />
                   </label>
                 </div>
-                <button
-                  type="submit"
-                  disabled={addQuestionMut.isPending}
-                  className="mt-4 rounded-lg bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
-                >
-                  Əlavə et
-                </button>
-              </form>
-
-              {questionsQuery.isLoading && <p className="text-sm text-slate-500">Suallar yüklənir…</p>}
-              {!questionsQuery.isLoading && (questionsQuery.data ?? []).length > 0 && (
-                <div className="overflow-hidden rounded-xl border border-slate-200">
-                  <table className="w-full text-left text-sm">
-                    <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                      <tr>
-                        <th className="px-4 py-3">№</th>
-                        <th className="px-4 py-3">Mətn</th>
-                        <th className="px-4 py-3">Növ</th>
-                        <th className="px-4 py-3">Fənn</th>
-                        <th className="px-4 py-3">Çətinlik</th>
-                        <th className="px-4 py-3">Xal</th>
-                        <th className="px-4 py-3 text-right">Əməl</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100 bg-white">
-                      {(questionsQuery.data ?? []).map((q) => (
-                        <tr key={q.id} className="hover:bg-slate-50/80">
-                          <td className="whitespace-nowrap px-4 py-3 font-medium text-slate-900">{q.order_index}</td>
-                          <td className="max-w-md px-4 py-3 text-slate-700">
-                            {plainTextFromHtml(q.stem || "").trim() ? (
-                              plainTextFromHtml(q.stem || "").slice(0, 160) +
-                              (plainTextFromHtml(q.stem || "").length > 160 ? "…" : "")
-                            ) : (
-                              <span className="text-slate-400">— boş</span>
-                            )}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3 text-slate-600">{q.qtype}</td>
-                          <td className="whitespace-nowrap px-4 py-3 text-slate-600">
-                            {q.subject_short_code?.trim() || q.subject_name?.trim() ? (
-                              <>
-                                {q.subject_short_code?.trim() ?? ""}
-                                {q.subject_short_code?.trim() && q.subject_name?.trim() ? " · " : ""}
-                                {q.subject_name?.trim() ?? ""}
-                              </>
-                            ) : (
-                              <span className="text-slate-400">—</span>
-                            )}
-                          </td>
-                          <td className="whitespace-nowrap px-4 py-3 text-slate-600">{difficultyAz(q.difficulty)}</td>
-                          <td className="whitespace-nowrap px-4 py-3 text-slate-600">{q.points}</td>
-                          <td className="px-4 py-3 text-right">
-                            <button
-                              type="button"
-                              className="text-sm font-medium text-red-600 hover:text-red-800"
-                              onClick={() => delQuestionMut.mutate(q.id)}
-                            >
-                              Sil
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-              {!questionsQuery.isLoading && (questionsQuery.data ?? []).length === 0 && (
-                <p className="rounded-lg border border-slate-100 bg-slate-50 px-4 py-6 text-center text-sm text-slate-500">
-                  Əlavə edilmiş sual sətiri yoxdur — istəsəniz CSV ilə və ya tək-tək əlavə edin. Cavab açarı və kitabça
-                  planlı sual sayına ({plannedQuestionCount}) uyğun qurulacaq; mətn boş ola bilər.
-                </p>
-              )}
-
-              <div className="rounded-xl border border-violet-100 bg-violet-50/40 p-4">
-                <h4 className="text-sm font-semibold text-violet-950">Sual kitabçası PDF</h4>
-                <p className="mt-1 text-xs text-violet-900/80">
-                  Üz qapağında logo (kurs və ya sistem), tam kitabçada isə planlı say qədər yer — mətni sonradan əlavə
-                  etsəniz yenidən yükləyin.
+                <p className="mt-2 text-[11px] text-slate-500">
+                  Kitabça parametrləri «Bal / fənn» saxlananda yadda saxlanır. Variant hərfi cavab kartındakı variant
+                  sahəsi ilə eyni olmalıdır.
                 </p>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
-                    className="rounded-lg border border-violet-200 bg-white px-3 py-2 text-sm font-medium text-violet-900 hover:bg-violet-50 disabled:opacity-40"
+                    className="rounded-lg border border-[#c0176a]/30 bg-white px-3 py-2 text-sm font-medium text-[#9b1257] hover:bg-[#fde8f3] disabled:opacity-40"
                     disabled={examId == null}
                     onClick={() =>
                       examId != null &&
                       downloadExamBookletCover(examId, {
                         institution: institution.trim(),
-                        subtitle: examQuery.data?.description ?? ""
+                        subtitle: examQuery.data?.description ?? "",
+                        line1: coverLine1.trim(),
+                        line2: coverLine2.trim(),
+                        exam_code: examCode.trim() || undefined,
+                        variant: bookletVariant,
+                        duration_minutes:
+                          typeof bookletDurationMinutes === "number" ? bookletDurationMinutes : undefined,
                       })
                     }
                   >
-                    Üz qapağı endir
+                    Üz qapağı (DİM PDF)
                   </button>
                   <button
                     type="button"
-                    className="rounded-lg bg-violet-600 px-3 py-2 text-sm font-semibold text-white hover:bg-violet-700 disabled:opacity-40"
-                    disabled={examId == null || plannedQuestionCount < 1}
+                    className="rounded-lg bg-[#c0176a] px-3 py-2 text-sm font-semibold text-white hover:bg-[#9b1257] disabled:opacity-40"
+                    disabled={examId == null || !bookletDownloadReady}
+                    title={
+                      !bookletDownloadReady
+                        ? `Sual kitabçası üçün ən azı ${plannedQuestionCount} qeydiyyatlı sual lazımdır (hazırda ${registeredQuestionCount})`
+                        : undefined
+                    }
                     onClick={() =>
                       examId != null &&
+                      bookletDownloadReady &&
                       downloadExamQuestionBooklet(examId, {
                         cover_institution: institution.trim(),
-                        cover_subtitle: examQuery.data?.description ?? ""
+                        cover_subtitle: examQuery.data?.description ?? "",
+                        cover_line1: coverLine1.trim(),
+                        cover_line2: coverLine2.trim(),
+                        exam_code: examCode.trim() || undefined,
+                        variant: bookletVariant,
+                        duration_minutes:
+                          typeof bookletDurationMinutes === "number" ? bookletDurationMinutes : undefined,
                       })
                     }
                   >
-                    Tam kitabça endir
+                    Tam kitabça (DİM PDF)
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg border border-[#c0176a]/40 bg-white px-3 py-2 text-sm font-medium text-[#9b1257] hover:bg-[#fde8f3] disabled:opacity-40"
+                    disabled={examId == null || !bookletDownloadReady}
+                    title={
+                      !bookletDownloadReady
+                        ? `Sual kitabçası üçün ən azı ${plannedQuestionCount} qeydiyyatlı sual lazımdır (hazırda ${registeredQuestionCount})`
+                        : undefined
+                    }
+                    onClick={() =>
+                      examId != null &&
+                      bookletDownloadReady &&
+                      downloadExamQuestionBookletDocx(examId, {
+                        cover_institution: institution.trim(),
+                        cover_subtitle: examQuery.data?.description ?? "",
+                        cover_line1: coverLine1.trim(),
+                        cover_line2: coverLine2.trim(),
+                        exam_code: examCode.trim() || undefined,
+                        variant: bookletVariant,
+                        duration_minutes:
+                          typeof bookletDurationMinutes === "number" ? bookletDurationMinutes : undefined,
+                      })
+                    }
+                  >
+                    Word (.docx)
                   </button>
                 </div>
               </div>
+            </div>
+          )}
 
-              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
+          {step === 1 && (
+            <div className="flex flex-col gap-2 border-t border-slate-100 pt-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
                 <p className="text-sm text-slate-600">
                   Planlı sual sayı: <strong className="text-slate-900">{plannedQuestionCount}</strong>
                   {orderedQuestions.length > 0 && (
@@ -1594,12 +1598,17 @@ function ExamsWizardPage() {
                 <button
                   type="button"
                   onClick={() => goToWizardStep(2)}
-                  disabled={plannedQuestionCount === 0}
+                  disabled={!canGoToAnswerKey}
                   className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Cavab açarına keç
                 </button>
               </div>
+              {!canGoToAnswerKey && answerKeyBlockedReason ? (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+                  {answerKeyBlockedReason}
+                </p>
+              ) : null}
             </div>
           )}
 
@@ -1629,38 +1638,31 @@ function ExamsWizardPage() {
                       const isTf = qMeta?.qtype === "tf";
                       return (
                         <tr key={`${row.question_number}-${idx}`} className="hover:bg-slate-50/90">
-                          <td className="whitespace-nowrap px-4 py-2 font-medium text-slate-900">{row.question_number}</td>
-                          <td className="px-4 py-2">
+                          <td className="whitespace-nowrap px-4 py-2 font-medium text-slate-900">
+                            {row.question_number}
                             {isTf ? (
-                              <select
-                                className={`${inputClass} !mt-0 max-w-[140px] py-1.5`}
-                                value={row.correct_answer}
-                                onChange={(e) => {
-                                  const next = [...answerRows];
-                                  next[idx] = { ...next[idx], correct_answer: e.target.value };
-                                  setAnswerRows(next);
-                                }}
-                              >
-                                <option value="T">T (Doğru)</option>
-                                <option value="F">F (Yanlış)</option>
-                              </select>
-                            ) : (
-                              <select
-                                className={`${inputClass} !mt-0 max-w-[100px] py-1.5`}
-                                value={row.correct_answer}
-                                onChange={(e) => {
-                                  const next = [...answerRows];
-                                  next[idx] = { ...next[idx], correct_answer: e.target.value };
-                                  setAnswerRows(next);
-                                }}
-                              >
-                                {letters.map((L) => (
-                                  <option key={L} value={L}>
-                                    {L}
-                                  </option>
-                                ))}
-                              </select>
-                            )}
+                              <span className="ml-1 block text-[10px] font-normal text-amber-700">
+                                D/Y — skan dəstəklənmir
+                              </span>
+                            ) : null}
+                          </td>
+                          <td className="px-4 py-2">
+                            <select
+                              className={`${inputClass} !mt-0 max-w-[100px] py-1.5`}
+                              value={isTf ? "A" : row.correct_answer}
+                              onChange={(e) => {
+                                const next = [...answerRows];
+                                next[idx] = { ...next[idx], correct_answer: e.target.value };
+                                setAnswerRows(next);
+                              }}
+                              disabled={isTf}
+                            >
+                              {letters.map((L) => (
+                                <option key={L} value={L}>
+                                  {L}
+                                </option>
+                              ))}
+                            </select>
                           </td>
                           <td className="px-4 py-2">
                             <input
@@ -1736,8 +1738,14 @@ function ExamsWizardPage() {
                 </button>
               </div>
               <div className="rounded-xl border border-emerald-100 bg-emerald-50/50 p-4">
+                {examQuery.data?.course_id == null && (
+                  <p className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+                    Bu imtahan heç bir kursa aid deyil — yalnız <strong>ümumi (qlobal)</strong> dizayn şablonları
+                    seçilə bilər.
+                  </p>
+                )}
                 <label className={labelClass}>
-                  Mövcud cavab kartı şablonu
+                  Dizayn şablonu (kitabxana)
                   <select
                     className={inputClass}
                     disabled={linkSheetPresetMut.isPending || sheetPresetsQuery.isLoading}
@@ -1762,7 +1770,10 @@ function ExamsWizardPage() {
                   {(user?.role === "admin" || user?.role === "manager" || user?.role === "operator") ? (
                     <>
                       {" "}
-                      <Link className="font-medium text-emerald-800 underline" to="/designer">
+                      <Link
+                        className="font-medium text-emerald-800 underline"
+                        to={`/designer?examId=${examId}${examQuery.data?.answer_sheet_preset_id ? `&presetId=${examQuery.data.answer_sheet_preset_id}` : ""}`}
+                      >
                         Cavab kartı dizaynerində
                       </Link>{" "}
                       yeni şablon yaradıb saxlaya bilərsiniz.
@@ -1819,12 +1830,33 @@ function ExamsWizardPage() {
                   </span>
                 </span>
               </label>
+              {examId != null && step3PreviewPayload ? (
+                <div className="rounded-xl border border-slate-200 bg-white p-4">
+                  <h4 className="text-sm font-semibold text-slate-900">Canlı kart önizləməsi</h4>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Seçilmiş dizayn şablonu və şəxsiyyət parametrləri üzrə PDF önizləmə.
+                  </p>
+                  <div className="mt-3 max-h-[480px] overflow-auto rounded-lg border border-slate-100">
+                    <LiveSheetPreview
+                      examId={examId}
+                      templatePayload={{
+                        ...step3PreviewPayload,
+                        participant_label: participantLabel.trim() || undefined,
+                        participant_code: participantCode.trim() || undefined,
+                      }}
+                      layoutPresetId={examQuery.data?.answer_sheet_preset_id}
+                      depsKey={`${examId}-${JSON.stringify(step3PreviewPayload)}-${participantLabel}-${participantCode}`}
+                    />
+                  </div>
+                </div>
+              ) : null}
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   className="rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50"
                   onClick={() => genPdfMut.mutate()}
-                  disabled={genPdfMut.isPending}
+                  disabled={genPdfMut.isPending || !answerKeyComplete}
+                  title={!answerKeyComplete ? "Əvvəlcə cavab açarını tam saxlayın" : undefined}
                 >
                   {genPdfMut.isPending ? "Hazırlanır…" : "PDF yarat və endir"}
                 </button>
@@ -1832,7 +1864,8 @@ function ExamsWizardPage() {
                   type="button"
                   className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-sm font-semibold text-amber-950 hover:bg-amber-100 disabled:opacity-50"
                   onClick={() => draftPdfMut.mutate()}
-                  disabled={draftPdfMut.isPending || genPdfMut.isPending}
+                  disabled={draftPdfMut.isPending || genPdfMut.isPending || !answerKeyComplete}
+                  title={!answerKeyComplete ? "Əvvəlcə cavab açarını tam saxlayın" : undefined}
                 >
                   {draftPdfMut.isPending ? "Saxlanır…" : "Qaralama saxla"}
                 </button>
@@ -1846,9 +1879,31 @@ function ExamsWizardPage() {
                 </button>
               </div>
               {pdfMsg && <p className="text-sm font-medium text-emerald-700">{pdfMsg}</p>}
-              {genPdfMut.isError && <p className="text-sm text-red-600">Xəta — yenidən cəhd edin.</p>}
-              {draftPdfMut.isError && <p className="text-sm text-red-600">Qaralama saxlanmadı.</p>}
-              {finalizePdfMut.isError && <p className="text-sm text-red-600">Təsdiqləmə xətası.</p>}
+              {readinessQuery.data?.ready_for_scan && examId != null && (
+                <div className="flex flex-wrap gap-2 border-t border-slate-200 pt-4">
+                  <Link
+                    to={`/scan?exam=${examId}`}
+                    className="rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700"
+                  >
+                    Skana keç
+                  </Link>
+                  <Link
+                    to={`/reports?exam=${examId}`}
+                    className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-800 hover:bg-slate-50"
+                  >
+                    Nəticələrə keç
+                  </Link>
+                </div>
+              )}
+              {genPdfMut.isError && (
+                <p className="whitespace-pre-wrap text-sm text-red-600">{getApiErrorMessage(genPdfMut.error)}</p>
+              )}
+              {draftPdfMut.isError && (
+                <p className="whitespace-pre-wrap text-sm text-red-600">{getApiErrorMessage(draftPdfMut.error)}</p>
+              )}
+              {finalizePdfMut.isError && (
+                <p className="whitespace-pre-wrap text-sm text-red-600">{getApiErrorMessage(finalizePdfMut.error)}</p>
+              )}
 
               <div className="rounded-xl border border-slate-200 bg-slate-50/80 p-4">
                 <h4 className="text-sm font-semibold text-slate-900">Yaradılmış kartlar</h4>
@@ -1872,7 +1927,8 @@ function ExamsWizardPage() {
                         <button
                           type="button"
                           className="shrink-0 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
-                          disabled={finalizePdfMut.isPending}
+                          disabled={finalizePdfMut.isPending || !answerKeyComplete}
+                          title={!answerKeyComplete ? "Əvvəlcə cavab açarını tam saxlayın" : undefined}
                           onClick={() => finalizePdfMut.mutate(s.id)}
                         >
                           PDF təsdiqlə
@@ -1892,179 +1948,6 @@ function ExamsWizardPage() {
               </div>
             </div>
           )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function examOperationalReady(e: Exam): boolean {
-  const ak = e.answer_key_rows ?? 0;
-  return e.question_count > 0 && ak >= e.question_count;
-}
-
-function ExamListPage() {
-  const user = useAuthStore((s) => s.user);
-  const navigate = useNavigate();
-  const [courseFilter, setCourseFilter] = useState<number | "">("");
-  const examsQuery = useQuery({
-    queryKey: ["exams", courseFilter === "" ? "all" : courseFilter],
-    queryFn: () => listExams(courseFilter === "" ? undefined : Number(courseFilter))
-  });
-  const coursesQuery = useQuery({ queryKey: ["courses"], queryFn: listCourses });
-
-  const courseName = (id: number | null) => {
-    if (id == null) return "Ümumi";
-    const c = (coursesQuery.data ?? []).find((x) => x.id === id);
-    return c?.name ?? `Kurs #${id}`;
-  };
-
-  if (user?.role === "student") {
-    return (
-      <div className="mx-auto max-w-5xl px-4 py-8">
-        <p className="text-slate-600">Bu səhifə şagirdlər üçün mövcud deyil.</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mx-auto max-w-5xl space-y-6 px-4 py-6 sm:px-6 lg:py-8">
-      <header className="flex flex-col gap-4 border-b border-slate-100 pb-6 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">İmtahanlar</h1>
-          <p className="mt-1 max-w-2xl text-sm text-slate-600">
-            Yeni imtahan yaradıldıqda avtomatik burada görünür. Planlı sual sayına uyğun cavab açarı saxlanandan sonra
-            həmin imtahan üzrə skan və nəticələrə keçə bilərsiniz.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => navigate("/exams/yarat")}
-          className="inline-flex shrink-0 items-center justify-center rounded-xl bg-indigo-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700"
-        >
-          Yeni imtahan yarat
-        </button>
-      </header>
-
-      <div className="flex flex-wrap items-end gap-3">
-        <label className={labelClass}>
-          Kurs üzrə süzgəc
-          <select
-            className={`${inputClass} mt-1 block w-full min-w-[220px] sm:w-auto`}
-            value={courseFilter === "" ? "" : String(courseFilter)}
-            onChange={(e) => setCourseFilter(e.target.value === "" ? "" : Number(e.target.value))}
-          >
-            <option value="">Hamısı</option>
-            {(coursesQuery.data ?? []).map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
-        </label>
-      </div>
-
-      {examsQuery.isLoading && <p className="text-sm text-slate-500">Yüklənir…</p>}
-      {examsQuery.isError && <p className="text-sm text-red-600">Siyahı yüklənmədi.</p>}
-
-      {!examsQuery.isLoading && (examsQuery.data ?? []).length === 0 && (
-        <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50/80 px-6 py-12 text-center">
-          <p className="text-slate-600">Hələ imtahan yoxdur.</p>
-          <button
-            type="button"
-            onClick={() => navigate("/exams/yarat")}
-            className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700"
-          >
-            İlk imtahanı yaradın
-          </button>
-        </div>
-      )}
-
-      {(examsQuery.data ?? []).length > 0 && (
-        <div className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-          <table className="w-full text-left text-sm">
-            <thead className="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
-              <tr>
-                <th className="px-4 py-3">№</th>
-                <th className="px-4 py-3">Başlıq</th>
-                <th className="px-4 py-3">Kurs</th>
-                <th className="px-4 py-3">Hazırlıq</th>
-                <th className="px-4 py-3 text-right">Əməllər</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {(examsQuery.data ?? []).map((e) => {
-                const ready = examOperationalReady(e);
-                const qr = e.questions_registered ?? 0;
-                const ak = e.answer_key_rows ?? 0;
-                const sheets = e.confirmed_sheet_templates ?? 0;
-                return (
-                  <tr key={e.id} className="hover:bg-slate-50/80">
-                    <td className="whitespace-nowrap px-4 py-3 font-medium text-slate-900">{e.id}</td>
-                    <td className="max-w-[200px] px-4 py-3 text-slate-800 sm:max-w-md">
-                      <span className="line-clamp-2">{e.title}</span>
-                    </td>
-                    <td className="px-4 py-3 text-slate-600">{courseName(e.course_id)}</td>
-                    <td className="px-4 py-3">
-                      <span
-                        className={
-                          ready
-                            ? "inline-flex rounded-full bg-emerald-100 px-2.5 py-0.5 text-xs font-medium text-emerald-900"
-                            : "inline-flex rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-900"
-                        }
-                      >
-                        {ready ? "Əməliyyata hazır" : "Qurulur"}
-                      </span>
-                      <p className="mt-1 text-[11px] leading-snug text-slate-500">
-                        Cavab açarı: {ak}/{e.question_count} · DB sualı: {qr}
-                        {ready && sheets === 0 ? " · kart şablonu təsdiqlənməyib" : ""}
-                      </p>
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex flex-wrap justify-end gap-1.5">
-                        <Link
-                          to={`/exams/yarat?exam=${e.id}`}
-                          className="rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs font-medium text-slate-800 hover:bg-slate-50"
-                        >
-                          Quruluş
-                        </Link>
-                        {ready ? (
-                          <Link
-                            to={`/scan?exam=${e.id}`}
-                            className="rounded-lg bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700"
-                          >
-                            Skan
-                          </Link>
-                        ) : (
-                          <span
-                            className="cursor-not-allowed rounded-lg bg-slate-100 px-2 py-1 text-xs text-slate-400"
-                            title="Cavab açarını tam saxlayın"
-                          >
-                            Skan
-                          </span>
-                        )}
-                        {ready ? (
-                          <Link
-                            to={`/reports?exam=${e.id}`}
-                            className="rounded-lg border border-violet-200 px-2 py-1 text-xs font-medium text-violet-900 hover:bg-violet-50"
-                          >
-                            Nəticə
-                          </Link>
-                        ) : (
-                          <span
-                            className="cursor-not-allowed rounded-lg border border-slate-100 px-2 py-1 text-xs text-slate-400"
-                            title="Cavab açarını tam saxlayın"
-                          >
-                            Nəticə
-                          </span>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
         </div>
       )}
     </div>
