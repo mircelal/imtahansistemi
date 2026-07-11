@@ -9,6 +9,12 @@ class ScanSessionCreate(BaseModel):
     operator_id: int
 
 
+class ScanSessionEnsure(BaseModel):
+    """İmtahan üçün aktiv skan partiyasını tap və ya avtomatik yarat."""
+
+    exam_id: int
+
+
 class ScanSessionOut(BaseModel):
     id: int
     exam_id: int
@@ -40,6 +46,11 @@ class ScanResultOut(BaseModel):
     student_full_name: str | None = None
 
 
+class AssignStudentRequest(BaseModel):
+    student_id: int | None = None
+    student_number: str | None = None
+
+
 class ManualCorrectionRequest(BaseModel):
     corrected_answers: dict[str, Any]
 
@@ -65,3 +76,4 @@ class ScanReadingOut(BaseModel):
     meta: dict[str, Any]
     raw_detected: dict[str, Any]
     template_hints: dict[str, Any] | None = None
+    effective_answer_key: dict[str, str] | None = None

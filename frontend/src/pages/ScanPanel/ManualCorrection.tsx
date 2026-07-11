@@ -3,10 +3,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
 import { getAnswerKey, getExam } from "../../api/exams";
 import type { ScanResult } from "../../api/scans";
-import { getScanReading, getScanResult, listScanResults, saveScanCorrection } from "../../api/scans";
+import { assignScanStudent, getScanReading, getScanResult, listScanResults, saveScanCorrection } from "../../api/scans";
+import { formatScoreBreakdownSummary } from "./scoreBreakdownDisplay";
 
 type Props = {
   examId: number | null;
+  courseId: number | null;
   sessionId: number | null;
   resultId: number | null;
   onSelectResult: (id: number | null) => void;
@@ -57,7 +59,7 @@ function findPrevPendingId(rows: ScanResult[], currentId: number | null): number
   return null;
 }
 
-export default function ManualCorrection({ examId, sessionId, resultId, onSelectResult }: Props) {
+export default function ManualCorrection({ examId, courseId, sessionId, resultId, onSelectResult }: Props) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<Record<number, string>>({});
   const [omrSnapshot, setOmrSnapshot] = useState<Record<number, string>>({});
@@ -66,6 +68,8 @@ export default function ManualCorrection({ examId, sessionId, resultId, onSelect
   const [imgErr, setImgErr] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [assignCode, setAssignCode] = useState("");
+  const [assignMsg, setAssignMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const resultQ = useQuery({
@@ -151,10 +155,18 @@ export default function ManualCorrection({ examId, sessionId, resultId, onSelect
     return [...new Set(fromDet)].sort((a, b) => a - b);
   }, [keyQ.data, draft]);
 
-  const keyByQ = useMemo(
-    () => new Map((keyQ.data ?? []).map((k) => [k.question_number, k.correct_answer])),
-    [keyQ.data]
-  );
+  const keyByQ = useMemo(() => {
+    const eff = readingQ.data?.effective_answer_key;
+    if (eff && Object.keys(eff).length > 0) {
+      const entries: [number, string][] = [];
+      for (const [qn, ca] of Object.entries(eff)) {
+        const n = Number(qn);
+        if (Number.isFinite(n)) entries.push([n, ca]);
+      }
+      return new Map(entries);
+    }
+    return new Map((keyQ.data ?? []).map((k) => [k.question_number, k.correct_answer] as [number, string]));
+  }, [readingQ.data?.effective_answer_key, keyQ.data]);
 
   const optCount = Math.min(5, Math.max(2, examQ.data?.options_per_question ?? 5));
   const optionLetters = useMemo(() => Array.from({ length: optCount }, (_, i) => String.fromCharCode(65 + i)), [optCount]);
@@ -254,6 +266,19 @@ export default function ManualCorrection({ examId, sessionId, resultId, onSelect
                 <span className="rounded-md bg-white px-2.5 py-1 font-medium tabular-nums text-slate-800 shadow-sm ring-1 ring-slate-200">
                   Bal: {r.score != null ? r.score.toFixed(2) : "—"} / {r.max_score != null ? r.max_score.toFixed(2) : "—"}
                 </span>
+                {r.score_breakdown && typeof r.score_breakdown === "object" ? (
+                  (() => {
+                    const summary = formatScoreBreakdownSummary(
+                      r.score_breakdown as Record<string, unknown>,
+                      examQ.data?.negative_marking,
+                    );
+                    return summary ? (
+                      <span className="rounded-md bg-violet-50 px-2 py-1 text-[11px] text-violet-900" title={summary}>
+                        {summary}
+                      </span>
+                    ) : null;
+                  })()
+                ) : null}
                 <span
                   className={`rounded-md px-2.5 py-1 text-xs font-semibold uppercase tracking-wide ${
                     r.status === "ok"
@@ -336,6 +361,44 @@ export default function ManualCorrection({ examId, sessionId, resultId, onSelect
 
         {/* Sağ: DİM tipli cədvəl */}
         <div className="flex flex-col p-4 sm:p-5">
+          {courseId != null && resultId != null && (r?.student_id == null || r?.status !== "ok") && (
+            <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50/80 p-3">
+              <p className="text-xs font-semibold text-amber-950">Şagird kodunu təyin et</p>
+              <p className="mt-1 text-[11px] text-amber-900/90">6 rəqəmli kurs kodunu daxil edin.</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <input
+                  className="w-32 rounded border border-amber-300 px-2 py-1.5 font-mono text-sm"
+                  placeholder="123456"
+                  maxLength={6}
+                  value={assignCode}
+                  onChange={(e) => setAssignCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                />
+                <button
+                  type="button"
+                  className="rounded-md bg-amber-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-900"
+                  onClick={async () => {
+                    if (assignCode.length !== 6) {
+                      setAssignMsg("6 rəqəm daxil edin");
+                      return;
+                    }
+                    try {
+                      const updated = await assignScanStudent(resultId, { student_number: assignCode });
+                      queryClient.setQueryData(["scan-result", resultId], updated);
+                      await queryClient.invalidateQueries({ queryKey: ["scan-results", sessionId] });
+                      setAssignMsg("Şagird təyin olundu.");
+                      setAssignCode("");
+                    } catch {
+                      setAssignMsg("Kod tapılmadı və ya icazə yoxdur.");
+                    }
+                  }}
+                >
+                  Təyin et
+                </button>
+              </div>
+              {assignMsg ? <p className="mt-2 text-xs text-amber-900">{assignMsg}</p> : null}
+            </div>
+          )}
+
           {readingQ.data && (
             <div className="mb-4 rounded-lg border border-slate-200 bg-slate-50/80 p-3 text-sm">
               <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">Kanonik oxunuş (şablon xəritəsi)</p>

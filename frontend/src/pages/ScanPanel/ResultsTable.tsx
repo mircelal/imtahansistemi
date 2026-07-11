@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { listScanResults } from "../../api/scans";
+import { formatScoreBreakdownSummary } from "./scoreBreakdownDisplay";
 
 type Props = {
   sessionId: number | null;
+  sessionStatus?: string | null;
   selectedResultId: number | null;
   onSelectResult: (id: number | null) => void;
 };
@@ -20,14 +22,15 @@ const statusClass: Record<string, string> = {
   error: "text-red-700"
 };
 
-export default function ResultsTable({ sessionId, selectedResultId, onSelectResult }: Props) {
+export default function ResultsTable({ sessionId, sessionStatus, selectedResultId, onSelectResult }: Props) {
   const [onlyPendingReview, setOnlyPendingReview] = useState(false);
 
   const q = useQuery({
     queryKey: ["scan-results", sessionId],
     queryFn: () => listScanResults(sessionId!),
     enabled: sessionId != null,
-    refetchInterval: 3000
+    refetchInterval:
+      sessionStatus === "pending" || sessionStatus === "processing" ? 3000 : false,
   });
 
   const rows = q.data ?? [];
@@ -99,7 +102,8 @@ export default function ResultsTable({ sessionId, selectedResultId, onSelectResu
                 <th className="py-2 pr-4">Şagird</th>
                 <th className="py-2 pr-4">Fayl</th>
                 <th className="py-2 pr-4">Xal</th>
-                <th className="py-2">Status</th>
+                <th className="py-2 pr-4">Status</th>
+                <th className="py-2">Xəta / qeyd</th>
               </tr>
             </thead>
             <tbody>
@@ -132,12 +136,36 @@ export default function ResultsTable({ sessionId, selectedResultId, onSelectResu
                       {shortPath}
                     </td>
                     <td className="py-2 pr-4">
-                      {row.score != null && row.max_score != null
-                        ? `${row.score} / ${row.max_score}`
-                        : "—"}
+                      {row.score != null && row.max_score != null ? (
+                        <>
+                          <span>
+                            {row.score} / {row.max_score}
+                          </span>
+                          {row.score_breakdown && typeof row.score_breakdown === "object" ? (
+                            (() => {
+                              const summary = formatScoreBreakdownSummary(
+                                row.score_breakdown as Record<string, unknown>,
+                              );
+                              return summary ? (
+                                <span
+                                  className="mt-0.5 block truncate text-[10px] text-violet-700"
+                                  title={summary}
+                                >
+                                  {summary}
+                                </span>
+                              ) : null;
+                            })()
+                          ) : null}
+                        </>
+                      ) : (
+                        "—"
+                      )}
                     </td>
-                    <td className={`py-2 font-medium ${statusClass[row.status] ?? "text-slate-700"}`}>
+                    <td className={`py-2 pr-4 font-medium ${statusClass[row.status] ?? "text-slate-700"}`}>
                       {statusLabel[row.status] ?? row.status}
+                    </td>
+                    <td className="max-w-[200px] truncate py-2 text-xs text-red-700" title={row.error_message ?? ""}>
+                      {row.error_message ?? "—"}
                     </td>
                   </tr>
                 );

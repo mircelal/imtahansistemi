@@ -71,17 +71,19 @@ def _compute_per_question(
 
     if sheet_answer_key and isinstance(sheet_answer_key, dict):
         raw = sheet_answer_key.get("answers") if "answers" in sheet_answer_key else sheet_answer_key
+        sheet_map: dict[int, str] = {}
         if isinstance(raw, dict) and raw:
             for ks, ca in raw.items():
                 try:
                     num = int(ks)
                 except (TypeError, ValueError):
                     continue
-                ca_u = str(ca).strip().upper()
-                ak = by_num.get(num)
-                pts = float(ak.points) if ak else 1.0
-                one_q(num, pts, ca_u)
-            return per_q
+                sheet_map[num] = str(ca).strip().upper()
+        for num in sorted(by_num.keys()):
+            k = by_num[num]
+            ca = sheet_map.get(num, (k.correct_answer or "").strip().upper())
+            one_q(num, float(k.points), ca)
+        return per_q
 
     for num in sorted(by_num.keys()):
         k = by_num[num]
@@ -138,8 +140,7 @@ def score_exam(
         weighted_max += m
 
     breakdown: dict[str, Any] = {
-        "version": 1,
-        "wrong_policy": gp.get("wrong_policy") or ("exam_negative" if exam.negative_marking else "none"),
+        "negative_marking": bool(exam.negative_marking),
         "by_question": {str(k): {"earned": round(v[0], 4), "max": round(v[1], 4)} for k, v in sorted(per_q.items())},
         "by_subject_raw": {k: {"earned": round(v["earned"], 4), "max": round(v["max"], 4)} for k, v in by_subject.items()},
         "by_subject_weighted": by_subject_weighted,

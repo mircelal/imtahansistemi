@@ -49,10 +49,13 @@ export type ScanReading = {
   meta: Record<string, unknown>;
   raw_detected: Record<string, unknown>;
   template_hints: Record<string, unknown> | null;
+  effective_answer_key?: Record<string, string> | null;
 };
 
-export async function listScanSessions() {
-  const { data } = await api.get<ScanSession[]>("/api/scans/sessions");
+export async function listScanSessions(examId?: number) {
+  const { data } = await api.get<ScanSession[]>("/api/scans/sessions", {
+    params: examId != null ? { exam_id: examId } : undefined,
+  });
   return data;
 }
 
@@ -63,6 +66,12 @@ export async function getScanSession(sessionId: number) {
 
 export async function createScanSession(payload: { exam_id: number; operator_id: number }) {
   const { data } = await api.post<ScanSession>("/api/scans/sessions", payload);
+  return data;
+}
+
+/** İmtahan üçün aktiv skan partiyasını tap və ya avtomatik yarat (manual oturum seçimi lazım deyil). */
+export async function ensureScanSession(examId: number) {
+  const { data } = await api.post<ScanSession>("/api/scans/sessions/ensure", { exam_id: examId });
   return data;
 }
 
@@ -103,6 +112,14 @@ export async function downloadSessionReadingJson(sessionId: number): Promise<Blo
   const { data } = await api.get<Blob>(`/api/scans/sessions/${sessionId}/results/export-reading.json`, {
     responseType: "blob"
   });
+  return data;
+}
+
+export async function assignScanStudent(
+  resultId: number,
+  payload: { student_id?: number; student_number?: string },
+) {
+  const { data } = await api.put<ScanResult>(`/api/scans/results/${resultId}/assign-student`, payload);
   return data;
 }
 

@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from app.models.entities import Exam, ScanResult, ScanSession
+from app.models.entities import AnswerKey, Exam, ScanResult, ScanSession
 from app.services.dim_identity import resolve_identity_fields
 
 
@@ -119,6 +119,26 @@ def build_identity_key_labels(template_config: dict[str, Any] | None) -> dict[st
     return labels
 
 
+def build_effective_answer_key(
+    keys: list[AnswerKey],
+    sheet_answer_key: dict[str, Any] | None,
+) -> dict[str, str]:
+    """Sheet açarı + əsas açar birləşməsi (sheet üstünlük)."""
+    out: dict[str, str] = {}
+    for k in sorted(keys, key=lambda x: x.question_number):
+        ca = (k.correct_answer or "").strip().upper()
+        if ca:
+            out[str(k.question_number)] = ca
+    if sheet_answer_key and isinstance(sheet_answer_key, dict):
+        raw = sheet_answer_key.get("answers") if "answers" in sheet_answer_key else sheet_answer_key
+        if isinstance(raw, dict):
+            for ks, ca in raw.items():
+                ca_u = str(ca).strip().upper()
+                if ca_u:
+                    out[str(ks)] = ca_u
+    return out
+
+
 def build_scan_reading_dict(
     *,
     result: ScanResult,
@@ -126,6 +146,7 @@ def build_scan_reading_dict(
     exam: Exam,
     template_config: dict[str, Any] | None,
     qr_raw_hint: str | None = None,
+    answer_keys: list[AnswerKey] | None = None,
 ) -> dict[str, Any]:
     raw = dict(result.detected_answers or {})
     meta, identity, mcq = split_detected_answers(raw)
@@ -152,11 +173,18 @@ def build_scan_reading_dict(
     status_s = st.value if hasattr(st, "value") else str(st)
 
     hints: dict[str, Any] = {}
+    sheet_key_raw = None
     if template_config:
         if template_config.get("omr_two_page_stitched"):
             hints["omr_two_page_stitched"] = True
         if template_config.get("single_page_layout") is False:
             hints["single_page_layout"] = False
+        sk = template_config.get("sheet_answer_key")
+        sheet_key_raw = sk if isinstance(sk, dict) else None
+
+    effective_answer_key: dict[str, str] | None = None
+    if answer_keys:
+        effective_answer_key = build_effective_answer_key(answer_keys, sheet_key_raw)
 
     out: dict[str, Any] = {
         "version": READING_VERSION,
@@ -177,5 +205,6 @@ def build_scan_reading_dict(
         "meta": meta,
         "raw_detected": raw,
         "template_hints": hints or None,
+        "effective_answer_key": effective_answer_key,
     }
     return out
