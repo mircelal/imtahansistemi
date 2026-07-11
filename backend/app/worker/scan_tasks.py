@@ -32,6 +32,8 @@ from app.services.storage import StorageService
 from app.worker.scan_session_lock import (
     acquire_scan_session_lock,
     extend_scan_session_lock,
+    force_acquire_scan_session_lock,
+    is_scan_session_locked,
     mark_scan_session_reprocess_pending,
     pop_scan_session_reprocess_pending,
     release_scan_session_lock,
@@ -468,6 +470,28 @@ def _reapply_session_corrections(session_id: int, snapshot: dict[str, list[dict[
         db.commit()
 
 
+def _sync_session_progress(
+    session_id: int,
+    processed: int,
+    *,
+    status: SessionStatus | None = None,
+    total: int | None = None,
+) -> None:
+    """UI faizi — hər kart emal olunanda yenilənir (yalnız job sonunda deyil)."""
+    with SyncSessionLocal() as db:
+        s = db.get(ScanSession, session_id)
+        if s is None:
+            return
+        s.processed_images = processed
+        if total is not None:
+            s.total_images = total
+        if status is not None:
+            s.status = status
+        elif s.status == SessionStatus.PENDING:
+            s.status = SessionStatus.PROCESSING
+        db.commit()
+
+
 def _max_score_for_exam(db: Any, exam_id: int) -> float:
     exam = db.get(Exam, exam_id)
     if exam is None:
@@ -763,145 +787,168 @@ def _persist_zip_error(session_id: int, exam_id: int, logical_path: str, message
 def process_scan_session(self, session_id: int) -> dict[str, Any]:
     lock_token = acquire_scan_session_lock(session_id)
     if lock_token is None:
-        mark_scan_session_reprocess_pending(session_id)
-        return {"error": "session already processing", "session_id": session_id, "requeue": True}
+        with SyncSessionLocal() as db:
+            sess = db.get(ScanSession, session_id)
+            stale_processing = (
+                sess is not None
+                and sess.status == SessionStatus.PROCESSING
+                and not is_scan_session_locked(session_id)
+            )
+        if stale_processing:
+            lock_token = force_acquire_scan_session_lock(session_id)
+        else:
+            mark_scan_session_reprocess_pending(session_id)
+            return {"error": "session already processing", "session_id": session_id, "requeue": True}
 
     storage = StorageService()
     bucket = settings.minio_bucket_uploads
     storage.ensure_bucket(bucket)
 
-    correction_snapshot: dict[str, list[dict[str, Any]]] = {}
-    processed = 0
-
     try:
-        with SyncSessionLocal() as db:
-            sess = db.get(ScanSession, session_id)
-            if sess is None:
-                return {"error": "session not found"}
-            exam_id = sess.exam_id
-            correction_snapshot = _snapshot_session_corrections(db, session_id)
-            subq = select(ScanResult.id).where(ScanResult.session_id == session_id)
-            db.execute(delete(ManualCorrection).where(ManualCorrection.scan_result_id.in_(subq)))
-            db.execute(delete(ScanResult).where(ScanResult.session_id == session_id))
-            sess.status = SessionStatus.PROCESSING
-            sess.processed_images = 0
-            sess.finished_at = None
-            db.commit()
-
-            exam = db.get(Exam, exam_id)
-            if exam is None:
-                with SyncSessionLocal() as db_err:
-                    s = db_err.get(ScanSession, session_id)
-                    if s:
-                        s.status = SessionStatus.ERROR
-                        db_err.commit()
-                return {"error": "exam not found"}
-
-        prefix = f"scans/{session_id}/"
-        try:
-            names = storage.list_object_names(bucket, prefix)
-        except Exception as e:  # noqa: BLE001
-            with SyncSessionLocal() as db2:
-                s = db2.get(ScanSession, session_id)
-                if s:
-                    s.status = SessionStatus.ERROR
-                    db2.commit()
-            return {"error": str(e)}
-
-        processed = 0
-        collected: list[tuple[str, bytes]] = []
-        for name in sorted(names, key=_natural_sort_key):
-            if name.endswith("/"):
-                continue
-            lower = name.lower()
-            try:
-                data = storage.get_bytes(bucket, name)
-            except Exception as e:  # noqa: BLE001
-                _persist_notice_result(
-                    session_id,
-                    exam_id,
-                    name,
-                    f"Fayl oxunmadı: {str(e)[:200]}",
-                    status=ResultStatus.ERROR,
-                )
-                processed += 1
-                continue
-            if lower.endswith(".zip"):
-                try:
-                    items = _iter_zip_images(data)
-                except ValueError as e:
-                    _persist_zip_error(session_id, exam_id, f"{name}:zip", str(e))
-                    processed += 1
-                    continue
-                for fname, img in items:
-                    collected.append((f"{name}:{fname}", img))
-            elif lower.endswith(_IMAGE_EXT):
-                collected.append((name, data))
-
-        with SyncSessionLocal() as db:
-            default_tpl_cfg = _latest_template_config_for_exam(db, exam_id)
-
-        if len(collected) >= 2:
+        passes = 0
+        last_processed = 0
+        while True:
+            passes += 1
+            if passes > 8:
+                break
             with SyncSessionLocal() as db:
-                first_cfg, _ = _resolve_image_template_config(
-                    db, exam_id, collected[0][1], default_tpl_cfg
-                )
-                two_page_stitched = (
-                    first_cfg.get("single_page_layout") is False
-                    and bool(first_cfg.get("omr_two_page_stitched"))
-                )
-        else:
-            two_page_stitched = False
-
-        if two_page_stitched:
-            stitch_pairs = _pair_collected_for_stitch(collected)
-            for top_name, top_b, bot_name, bot_b in stitch_pairs:
-                extend_scan_session_lock(session_id, lock_token)
-                if bot_name and bot_b:
-                    merged = _stitch_images_vertical(top_b, bot_b)
-                    storage_key = _save_stitched_image(storage, bucket, session_id, merged)
-                    _persist_result(session_id, exam_id, merged, storage_key)
-                else:
-                    _persist_result(session_id, exam_id, top_b, top_name)
-                processed += 1
-        else:
-            with SyncSessionLocal() as db:
-                for fname, img in collected:
-                    extend_scan_session_lock(session_id, lock_token)
-                    cfg, tpl_err = _resolve_image_template_config(db, exam_id, img, default_tpl_cfg)
-                    if tpl_err:
-                        _persist_notice_result(session_id, exam_id, fname, tpl_err)
-                        processed += 1
-                        continue
-                    if not _scan_image_allowed_for_template(fname, cfg):
-                        _persist_notice_result(
-                            session_id,
-                            exam_id,
-                            fname,
-                            "İki səhifəli kart: 1-ci səhifə skan edilmir (yalnız MCQ səhifəsi gözlənilir)",
-                        )
-                        processed += 1
-                        continue
-                    _persist_result(session_id, exam_id, img, fname)
-                    processed += 1
-
-        _reapply_session_corrections(session_id, correction_snapshot)
-        _flag_duplicate_student_results(session_id)
-
-        with SyncSessionLocal() as db:
-            s = db.get(ScanSession, session_id)
-            if s:
-                s.processed_images = processed
-                s.status = SessionStatus.DONE
-                s.finished_at = datetime.utcnow()
+                sess = db.get(ScanSession, session_id)
+                if sess is None:
+                    return {"error": "session not found"}
+                exam_id = sess.exam_id
+                correction_snapshot = _snapshot_session_corrections(db, session_id)
+                subq = select(ScanResult.id).where(ScanResult.session_id == session_id)
+                db.execute(delete(ManualCorrection).where(ManualCorrection.scan_result_id.in_(subq)))
+                db.execute(delete(ScanResult).where(ScanResult.session_id == session_id))
+                sess.status = SessionStatus.PROCESSING
+                sess.processed_images = 0
+                sess.finished_at = None
                 db.commit()
 
-        requeued = False
-        if pop_scan_session_reprocess_pending(session_id):
-            celery_app.send_task("scan.process_session", args=[session_id])
-            requeued = True
+                exam = db.get(Exam, exam_id)
+                if exam is None:
+                    with SyncSessionLocal() as db_err:
+                        s = db_err.get(ScanSession, session_id)
+                        if s:
+                            s.status = SessionStatus.ERROR
+                            db_err.commit()
+                    return {"error": "exam not found"}
 
-        return {"session_id": session_id, "processed": processed, "requeued": requeued}
+            prefix = f"scans/{session_id}/"
+            try:
+                names = storage.list_object_names(bucket, prefix)
+            except Exception as e:  # noqa: BLE001
+                with SyncSessionLocal() as db2:
+                    s = db2.get(ScanSession, session_id)
+                    if s:
+                        s.status = SessionStatus.ERROR
+                        db2.commit()
+                return {"error": str(e)}
+
+            processed = 0
+            collected: list[tuple[str, bytes]] = []
+            for name in sorted(names, key=_natural_sort_key):
+                if name.endswith("/"):
+                    continue
+                lower = name.lower()
+                try:
+                    data = storage.get_bytes(bucket, name)
+                except Exception as e:  # noqa: BLE001
+                    _persist_notice_result(
+                        session_id,
+                        exam_id,
+                        name,
+                        f"Fayl oxunmadı: {str(e)[:200]}",
+                        status=ResultStatus.ERROR,
+                    )
+                    processed += 1
+                    _sync_session_progress(session_id, processed)
+                    continue
+                if lower.endswith(".zip"):
+                    try:
+                        items = _iter_zip_images(data)
+                    except ValueError as e:
+                        _persist_zip_error(session_id, exam_id, f"{name}:zip", str(e))
+                        processed += 1
+                        _sync_session_progress(session_id, processed)
+                        continue
+                    for fname, img in items:
+                        collected.append((f"{name}:{fname}", img))
+                elif lower.endswith(_IMAGE_EXT):
+                    collected.append((name, data))
+
+            with SyncSessionLocal() as db:
+                default_tpl_cfg = _latest_template_config_for_exam(db, exam_id)
+
+            if len(collected) >= 2:
+                with SyncSessionLocal() as db:
+                    first_cfg, _ = _resolve_image_template_config(
+                        db, exam_id, collected[0][1], default_tpl_cfg
+                    )
+                    two_page_stitched = (
+                        first_cfg.get("single_page_layout") is False
+                        and bool(first_cfg.get("omr_two_page_stitched"))
+                    )
+            else:
+                two_page_stitched = False
+
+            if two_page_stitched:
+                stitch_pairs = _pair_collected_for_stitch(collected)
+                job_total = max(len(stitch_pairs), processed)
+                _sync_session_progress(session_id, processed, total=job_total)
+                for top_name, top_b, bot_name, bot_b in stitch_pairs:
+                    extend_scan_session_lock(session_id, lock_token)
+                    if bot_name and bot_b:
+                        merged = _stitch_images_vertical(top_b, bot_b)
+                        storage_key = _save_stitched_image(storage, bucket, session_id, merged)
+                        _persist_result(session_id, exam_id, merged, storage_key)
+                    else:
+                        _persist_result(session_id, exam_id, top_b, top_name)
+                    processed += 1
+                    _sync_session_progress(session_id, processed)
+            else:
+                job_total = max(len(collected), processed)
+                _sync_session_progress(session_id, processed, total=job_total)
+                with SyncSessionLocal() as db:
+                    for fname, img in collected:
+                        extend_scan_session_lock(session_id, lock_token)
+                        cfg, tpl_err = _resolve_image_template_config(db, exam_id, img, default_tpl_cfg)
+                        if tpl_err:
+                            _persist_notice_result(session_id, exam_id, fname, tpl_err)
+                            processed += 1
+                            _sync_session_progress(session_id, processed)
+                            continue
+                        if not _scan_image_allowed_for_template(fname, cfg):
+                            _persist_notice_result(
+                                session_id,
+                                exam_id,
+                                fname,
+                                "İki səhifəli kart: 1-ci səhifə skan edilmir (yalnız MCQ səhifəsi gözlənilir)",
+                            )
+                            processed += 1
+                            _sync_session_progress(session_id, processed)
+                            continue
+                        _persist_result(session_id, exam_id, img, fname)
+                        processed += 1
+                        _sync_session_progress(session_id, processed)
+
+            _reapply_session_corrections(session_id, correction_snapshot)
+            _flag_duplicate_student_results(session_id)
+
+            with SyncSessionLocal() as db:
+                s = db.get(ScanSession, session_id)
+                if s:
+                    s.processed_images = processed
+                    s.status = SessionStatus.DONE
+                    s.finished_at = datetime.utcnow()
+                    db.commit()
+
+            last_processed = processed
+            if not pop_scan_session_reprocess_pending(session_id):
+                break
+            extend_scan_session_lock(session_id, lock_token)
+
+        return {"session_id": session_id, "processed": last_processed, "passes": passes}
     except httpx.HTTPError:
         with SyncSessionLocal() as db_fail:
             s = db_fail.get(ScanSession, session_id)

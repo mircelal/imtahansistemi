@@ -24,6 +24,17 @@ def scan_lock_key(session_id: int) -> str:
     return f"{SCAN_LOCK_PREFIX}{session_id}"
 
 
+def is_scan_session_locked(session_id: int) -> bool:
+    return bool(_redis_client().exists(scan_lock_key(session_id)))
+
+
+def force_acquire_scan_session_lock(session_id: int) -> str:
+    """Köhnə/kilit bitmiş PROCESSING sessiyasını davam etdirmək üçün."""
+    token = uuid.uuid4().hex
+    _redis_client().set(scan_lock_key(session_id), token, ex=SCAN_LOCK_TTL_SEC)
+    return token
+
+
 def acquire_scan_session_lock(session_id: int) -> str | None:
     """
     Kilid tutulursa unikal token qaytarır; artıq emal gedirsə None.

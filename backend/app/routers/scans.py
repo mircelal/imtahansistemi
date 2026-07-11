@@ -307,7 +307,10 @@ async def upload_images(
     sess_row.total_images = (sess_row.total_images or 0) + uploaded
     await db.commit()
     if auto_process:
-        celery_app.send_task("scan.process_session", args=[session_id])
+        if sess_row.status == SessionStatus.PROCESSING:
+            mark_scan_session_reprocess_pending(session_id)
+        else:
+            celery_app.send_task("scan.process_session", args=[session_id])
     return {"session_id": session_id, "uploaded": uploaded, "queued": auto_process}
 
 
@@ -318,6 +321,17 @@ async def queue_process_session(
     user: User = Depends(get_current_user),
 ):
     await ensure_scan_session_access(session_id, user, db)
+    sess_row = await db.get(ScanSession, session_id)
+    if sess_row is None:
+        raise HTTPException(status_code=404, detail="Skan oturumu tapılmadı")
+    if sess_row.status == SessionStatus.PROCESSING:
+        from app.worker.scan_session_lock import is_scan_session_locked, mark_scan_session_reprocess_pending
+
+        if is_scan_session_locked(session_id):
+            mark_scan_session_reprocess_pending(session_id)
+            return {"session_id": session_id, "queued": True, "deferred": True}
+        sess_row.status = SessionStatus.PENDING
+        await db.commit()
     celery_app.send_task("scan.process_session", args=[session_id])
     return {"session_id": session_id, "queued": True}
 

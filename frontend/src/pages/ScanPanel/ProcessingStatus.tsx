@@ -36,8 +36,23 @@ export default function ProcessingStatus({ sessionId }: Props) {
   const s = q.data;
   const pct =
     s && s.total_images > 0 ? Math.min(100, Math.round((s.processed_images / s.total_images) * 100)) : 0;
+  const stuckPending =
+    s != null &&
+    s.total_images > 0 &&
+    s.processed_images === 0 &&
+    s.status === "pending";
+  const processingActive = s?.status === "processing";
 
   const requeue = async () => {
+    if (
+      !window.confirm(
+        stuckPending
+          ? "Emal başlamayıb və ya dayanıb. Fayllar yenidən emal növbəsinə göndərilsin?"
+          : "Bu oturumdakı bütün fayllar yenidən emal növbəsinə göndərilsin? Mövcud nəticələr yenilənə bilər.",
+      )
+    ) {
+      return;
+    }
     await queueProcessSession(sessionId);
     await queryClient.invalidateQueries({ queryKey: ["scan-session", sessionId] });
     await queryClient.invalidateQueries({ queryKey: ["scan-results", sessionId] });
@@ -67,15 +82,36 @@ export default function ProcessingStatus({ sessionId }: Props) {
       {q.isError && <p className="mt-2 text-sm text-red-600">Status oxuna bilmədi.</p>}
       {s && (
         <>
+          {processingActive && (
+            <div className="mt-3 rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-950">
+              <strong className="font-semibold">Emal davam edir.</strong> OMR hər kartı oxuyur — bir kart
+              adətən 20–60 saniyə çəkə bilər; faiz hər kart bitəndə yenilənir.
+            </div>
+          )}
+          {stuckPending && (
+            <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950">
+              <strong className="font-semibold">Emal gözləyir.</strong>{" "}
+              Fayllar yüklənib, amma OMR emal işçisi (worker) növbəyə düşməyibsə faiz 0% qalır.{" "}
+              <button
+                type="button"
+                className="font-semibold text-amber-900 underline hover:text-amber-950"
+                onClick={() => requeue()}
+              >
+                İndi emala göndər
+              </button>
+            </div>
+          )}
           <p className="mt-2 text-sm text-slate-600">
             Yüklənmiş fayl sayı: <strong>{s.total_images}</strong> · Son işləmədə emal olunan kart:{" "}
             <strong>{s.processed_images}</strong>
           </p>
           <p className="mt-1 text-xs text-slate-500">
-            ZIP içindəki hər şəkil ayrıca nəticə kimi sayılır; göstəricilər son Celery işindən sonra yenilənir.
+            ZIP-də hər şəkil ayrıca sətir sayılır; faiz son emal job-u bitəndə yenilənir (təxmini göstərici).
           </p>
           <progress className="mt-3 h-2 w-full rounded accent-indigo-600" max={100} value={pct} />
-          <p className="mt-1 text-xs text-slate-500">{pct}% (fayl sayına nisbətən təxmini)</p>
+          <p className="mt-1 text-xs text-slate-500">
+            {s.processed_images} / {s.total_images} fayl emal olunub ({pct}%)
+          </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
               type="button"
