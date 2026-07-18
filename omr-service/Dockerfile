@@ -16,11 +16,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && pip install --no-cache-dir -r /opt/OMRChecker/requirements.txt \
     && pip install --no-cache-dir "opencv-python-headless>=4.8"
 
+COPY omr-service/scripts/patch_omrchecker_headless.py /tmp/patch_omrchecker_headless.py
+RUN python /tmp/patch_omrchecker_headless.py
+
 ENV OMRCHECKER_ROOT=/opt/OMRChecker
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Backend: get_omr_template — PDF / dizayner ilə eyni fieldBlocks (şaquli DİM, timing zolağı, origin TL)
+COPY backend /opt/imtahan
+ENV PYTHONPATH=/opt/imtahan
 
-COPY . .
+COPY omr-service/requirements.txt /tmp/omr-req.txt
+COPY omr-service/requirements-backend-bridge.txt /tmp/bridge-req.txt
+RUN pip install --no-cache-dir -r /tmp/omr-req.txt -r /tmp/bridge-req.txt
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+COPY omr-service /app/
+RUN sed -i 's/\r$//' /app/scripts/uvicorn_entrypoint.sh && chmod +x /app/scripts/uvicorn_entrypoint.sh
+
+CMD ["/app/scripts/uvicorn_entrypoint.sh"]

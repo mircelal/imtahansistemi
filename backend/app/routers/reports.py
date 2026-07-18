@@ -12,10 +12,32 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.deps import ensure_course_access, ensure_exam_access, get_current_user
+from app.deps import ensure_exam_access, ensure_course_access, get_current_user
 from app.models.entities import AnswerKey, Exam, ResultStatus, ScanResult, ScanSession, Student, User
+from app.schemas.reports import ReportExamDetailOut, ReportOverviewOut
+from app.services.report_analytics import build_exam_report_detail, build_reports_overview
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
+
+
+@router.get("/overview", response_model=ReportOverviewOut)
+async def reports_overview(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Bütün əlçatan imtahanların xülasəsi — səhifə açılanda boş qalmır."""
+    return await build_reports_overview(db, user)
+
+
+@router.get("/exams/{exam_id}/detail", response_model=ReportExamDetailOut)
+async def exam_report_detail(
+    exam_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Seçilmiş imtahan üçün tam analitika paneli."""
+    exam = await ensure_exam_access(exam_id, user, db)
+    return await build_exam_report_detail(db, exam)
 
 
 async def _build_summary(db: AsyncSession, exam_id: int) -> dict:
@@ -27,10 +49,18 @@ async def _build_summary(db: AsyncSession, exam_id: int) -> dict:
             "maximum": 0,
             "std_dev": 0,
             "participation": 0,
+            "unique_students": 0,
+            "scan_rows": 0,
             "histogram": [],
         }
-    rows = (await db.scalars(select(ScanResult.score).where(ScanResult.session_id.in_(sessions)))).all()
-    values = [float(v) for v in rows if v is not None]
+    rows = (
+        await db.execute(
+            select(ScanResult.score, ScanResult.student_id).where(ScanResult.session_id.in_(sessions))
+        )
+    ).all()
+    values = [float(v) for v, _ in rows if v is not None]
+    unique_students = len({sid for _, sid in rows if sid is not None})
+    scan_rows = len(rows)
     if not values:
         return {
             "average": 0,
@@ -38,6 +68,8 @@ async def _build_summary(db: AsyncSession, exam_id: int) -> dict:
             "maximum": 0,
             "std_dev": 0,
             "participation": 0,
+            "unique_students": 0,
+            "scan_rows": 0,
             "histogram": [],
         }
     return {
@@ -45,7 +77,9 @@ async def _build_summary(db: AsyncSession, exam_id: int) -> dict:
         "minimum": min(values),
         "maximum": max(values),
         "std_dev": pstdev(values) if len(values) > 1 else 0,
-        "participation": len(values),
+        "participation": unique_students,
+        "unique_students": unique_students,
+        "scan_rows": scan_rows,
         "histogram": _score_histogram(values),
     }
 

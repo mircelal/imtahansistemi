@@ -1,12 +1,43 @@
 import { useState } from "react";
 
 export type PaperSize = "A4" | "A4L" | "A3" | "A3L";
+export type SheetFormat = "standard" | "a3_duplex_fold";
+
+export type FoldPanelOverride = {
+  question_from?: number;
+  question_to?: number;
+  mcq_sections?: McqSection[];
+  identity_section?: boolean;
+  title?: string;
+};
+
+export type OpenBlock = {
+  kind: "grid_in" | "essay";
+  question_number: number;
+  x_mm: number;
+  y_mm: number;
+  answer_length?: number;
+  alphabet?: "digits" | "digits_letters_az";
+  box_w_mm?: number;
+  box_h_mm?: number;
+  max_lines?: number;
+  /** DİM / grading defaults (PDF çəkmir; imtahan xalı üçün istinad) */
+  max_points?: number;
+  page?: number;
+  panel?: number;
+};
 
 export type SheetConfig = {
   question_count: number;
   options_per_question: 2 | 3 | 4 | 5;
   columns_count: 1 | 2 | 3 | 4 | 5 | 6;
   paper_size: PaperSize;
+  /** A3 ikitərəfli qatlanan 4-panelli kart */
+  sheet_format?: SheetFormat;
+  /** Panel üzrə override (sual diapazonu, şəxsiyyət və s.) */
+  fold_panels?: Record<string, FoldPanelOverride>;
+  /** Açıq sual blokları (grid_in / essay) */
+  open_blocks?: OpenBlock[];
   title: string;
   /** Boşdursa PDF-də yalnız başlıq; lazım olanda magentanın alt sətri */
   header_subtitle: string;
@@ -56,6 +87,21 @@ export type SheetConfig = {
   mcq_num_to_bubbles_pad_mm?: number;
   /** Şaquli A–E: mərkəz pitch ≥ balon Ø + bu (mm); PDF dim_sheet_layout ilə sinxron */
   mcq_tower_opt_min_clear_mm?: number;
+  /** Fənn/sual qrupları — hər biri öz başlığı və sual diapazonu ilə */
+  mcq_sections?: McqSection[];
+  /** Dizaynerdə cavab şəbəkəsi blokunun maqenta başlığı (PDF şəbəkə anchoru) */
+  mcq_grid_label?: string;
+};
+
+export type McqSection = {
+  title: string;
+  from_q: number;
+  to_q: number;
+  columns_count?: SheetConfig["columns_count"];
+  /** Stacked rejimdə fənn blokunun yuxarı kənarı (mm); boşdursa avtomatik yığılır */
+  top_mm?: number;
+  /** Stacked rejimdə fənn blokunun sol kənarı (mm); boşdursa mcq_grid.left_mm */
+  left_mm?: number;
 };
 
 export const DEFAULT_SHEET_CONFIG: SheetConfig = {
@@ -63,6 +109,8 @@ export const DEFAULT_SHEET_CONFIG: SheetConfig = {
   options_per_question: 5,
   columns_count: 4,
   paper_size: "A4",
+  sheet_format: "standard",
+  open_blocks: [],
   title: "CAVAB KARTI",
   header_subtitle: "",
   identity_ad_rows: 4,
@@ -87,6 +135,7 @@ export const DEFAULT_SHEET_CONFIG: SheetConfig = {
   mcq_hgap_mm: 3.35,
   mcq_vgap_mm: 8.0,
   mcq_options_layout: "vertical",
+  mcq_grid_label: "CAVABLAR",
 };
 
 export function useSheetConfig() {

@@ -14,6 +14,7 @@ from app.models.entities import (
     Course,
     CourseOperator,
     Exam,
+    ExamScoringProfile,
     ExamTicket,
     Question,
     ScanSession,
@@ -21,9 +22,20 @@ from app.models.entities import (
     User,
     UserRole,
 )
-from app.schemas.exams import AnswerKeyItem, ExamCreate, ExamIntegrationsOut, ExamListRowOut, ExamOut, ExamUpdate
+from app.schemas.exams import (
+    AnswerKeyItem,
+    ExamCreate,
+    ExamDashboardOut,
+    ExamIntegrationsOut,
+    ExamListRowOut,
+    ExamOut,
+    ExamUpdate,
+)
 from app.schemas.sheet_presets import AnswerSheetPresetBrief
+from app.services.answer_key_validation import validate_answer_key_item
 from app.services.answer_sheet_preset_merge import validate_exam_preset_assignment
+from app.services.exam_dashboard import build_exam_dashboard
+from app.services.exam_lifecycle import assert_exam_content_editable, lifecycle_payload
 from app.services.exam_readiness import compute_exam_readiness
 from app.services.grading_config import validate_grading_config
 from app.services.omr_template_stale import mark_exam_omr_templates_stale
@@ -32,9 +44,35 @@ from app.services.question_booklet_pdf import generate_booklet_cover_pdf, genera
 from app.services.question_booklet_docx import generate_question_booklet_docx
 from app.services.booklet_layout_audit import audit_booklet_config
 from app.services.booklet_layout_spec import resolve_booklet_config
+from app.services.dim_exam_preset import (
+    apply_dim_answer_key_points,
+    apply_dim_exam_fields,
+    apply_dim_question_points,
+)
+from app.services.exam_scoring_profiles import (
+    apply_scoring_profile_to_grading_config,
+    exam_fields_from_formula_config,
+    merge_profile_into_grading_policy,
+)
+from app.services.exam_types import normalize_exam_category
+from app.schemas.exam_scoring_profiles import ApplyScoringProfileRequest
 from app.schemas.tickets import ExamTicketOut
+from app.services.scan_scoring import essay_question_numbers_from_questions
+from app.routers.exam_scoring_profiles import apply_scoring_profile_to_exam as _apply_profile_impl
 
 router = APIRouter(prefix="/api/exams", tags=["exams"])
+
+
+def _exam_out(row: Exam) -> ExamOut:
+    base = ExamOut.model_validate(row)
+    return base.model_copy(update=lifecycle_payload(row))
+
+
+def _validate_exam_window(scheduled_at, ends_at) -> None:
+    if scheduled_at is None or ends_at is None:
+        raise HTTPException(status_code=400, detail="İmtahanın başlama və bitmə tarixi mütləqdir")
+    if ends_at <= scheduled_at:
+        raise HTTPException(status_code=400, detail="Bitmə vaxtı başlama vaxtından sonra olmalıdır")
 
 
 @router.get("/", response_model=list[ExamListRowOut])
@@ -99,7 +137,7 @@ async def list_exams(
     out: list[ExamListRowOut] = []
     for row in rows:
         eid = row.id
-        base = ExamOut.model_validate(row)
+        base = _exam_out(row)
         out.append(
             ExamListRowOut(
                 **base.model_dump(),
@@ -124,11 +162,41 @@ async def create_exam(
             raise HTTPException(status_code=403, detail="Yalnız administrator bilet satışını aça bilər")
     else:
         await ensure_course_write(payload.course_id, user, db)
+    _validate_exam_window(payload.scheduled_at, payload.ends_at)
     await validate_exam_preset_assignment(
         db, course_id=payload.course_id, preset_id=payload.answer_sheet_preset_id
     )
     validate_grading_config(dict(payload.grading_config or {}), payload.question_count)
-    data = payload.model_dump(exclude={"bundled_ticket"})
+    data = payload.model_dump(exclude={"bundled_ticket", "use_dim_preset"})
+    data["exam_category"] = await normalize_exam_category(db, data.get("exam_category"))
+    if payload.use_dim_preset:
+        dim = apply_dim_exam_fields(
+            grading_policy=dict(data.get("grading_policy") or {}),
+            question_count=int(data.get("question_count") or 0),
+            force_question_count=False,
+        )
+        data["options_per_question"] = dim["options_per_question"]
+        data["negative_marking"] = dim["negative_marking"]
+        data["negative_ratio"] = dim["negative_ratio"]
+        data["grading_policy"] = dim["grading_policy"]
+    profile_id = data.get("scoring_profile_id")
+    if profile_id is not None:
+        profile = await db.get(ExamScoringProfile, int(profile_id))
+        if profile is None or not profile.is_active:
+            raise HTTPException(status_code=404, detail="Hesablama profili tapılmadı")
+        fc = dict(profile.formula_config or {})
+        gc = apply_scoring_profile_to_grading_config(
+            fc, dict(data.get("grading_config") or {}), replace_blocks=True
+        )
+        fields = exam_fields_from_formula_config(fc)
+        data.update(fields)
+        data["grading_config"] = gc
+        data["grading_policy"] = merge_profile_into_grading_policy(
+            dict(data.get("grading_policy") or {}), fc, gc
+        )
+        data["exam_category"] = profile.category
+        data["scoring_profile_id"] = profile.id
+        validate_grading_config(gc, int(data.get("question_count") or payload.question_count))
     entity = Exam(**data, created_by_id=user.id)
     db.add(entity)
     await db.flush()
@@ -142,7 +210,72 @@ async def create_exam(
         )
     await db.commit()
     await db.refresh(entity)
-    return ExamOut.model_validate(entity)
+    return _exam_out(entity)
+
+
+@router.post("/{exam_id}/apply-scoring-profile/{profile_id}", response_model=dict)
+async def apply_scoring_profile(
+    exam_id: int,
+    profile_id: int,
+    payload: ApplyScoringProfileRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """İmtahana hesablama profili (fənn çəkiləri, formula, üstünlük) tətbiq et."""
+    return await _apply_profile_impl(
+        exam_id,
+        profile_id,
+        payload or ApplyScoringProfileRequest(),
+        db,
+        user,
+    )
+
+
+@router.post("/{exam_id}/apply-dim-preset", response_model=dict)
+async def apply_dim_preset(
+    exam_id: int,
+    force_question_count: bool = Query(False, description="Sual sayını 30 et"),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Mövcud imtahana DİM standartı: 4 variant, mənfi bal off, differential xallar."""
+    exam = await ensure_exam_write(exam_id, user, db)
+    assert_exam_content_editable(exam)
+    dim = apply_dim_exam_fields(
+        grading_policy=dict(exam.grading_policy or {}),
+        question_count=int(exam.question_count or 0),
+        force_question_count=force_question_count,
+    )
+    exam.options_per_question = int(dim["options_per_question"])
+    exam.negative_marking = bool(dim["negative_marking"])
+    exam.negative_ratio = float(dim["negative_ratio"])
+    exam.grading_policy = dim["grading_policy"]
+    if "question_count" in dim:
+        exam.question_count = int(dim["question_count"])
+
+    q_rows = (
+        await db.scalars(select(Question).where(Question.exam_id == exam_id).order_by(Question.order_index.asc()))
+    ).all()
+    essay_q = essay_question_numbers_from_questions(list(q_rows))
+    q_updated = apply_dim_question_points(q_rows)
+
+    ak_rows = (
+        await db.scalars(select(AnswerKey).where(AnswerKey.exam_id == exam_id).order_by(AnswerKey.question_number))
+    ).all()
+    ak_updated = apply_dim_answer_key_points(ak_rows, essay_question_numbers=essay_q)
+
+    await mark_exam_omr_templates_stale(db, exam_id)
+    await db.commit()
+    await db.refresh(exam)
+    return {
+        "message": "DİM standartı tətbiq olundu",
+        "options_per_question": exam.options_per_question,
+        "negative_marking": exam.negative_marking,
+        "question_count": exam.question_count,
+        "questions_updated": q_updated,
+        "answer_keys_updated": ak_updated,
+        "grading_policy": exam.grading_policy,
+    }
 
 
 @router.get("/{exam_id}/integrations", response_model=ExamIntegrationsOut)
@@ -191,10 +324,19 @@ async def get_exam_integrations(
     )
 
 
+@router.get("/{exam_id}/dashboard", response_model=ExamDashboardOut)
+async def get_exam_dashboard(
+    exam_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)
+):
+    """Dövlət imtahanı səviyyəsində iştirak / nəticə paneli."""
+    exam = await ensure_exam_access(exam_id, user, db)
+    return await build_exam_dashboard(db, exam)
+
+
 @router.get("/{exam_id}", response_model=ExamOut)
 async def get_exam(exam_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     row = await ensure_exam_access(exam_id, user, db)
-    out = ExamOut.model_validate(row)
+    out = _exam_out(row)
     brief = None
     if row.answer_sheet_preset_id:
         pr = await db.get(AnswerSheetLayoutPreset, row.answer_sheet_preset_id)
@@ -397,7 +539,16 @@ async def update_exam(
     exam_id: int, payload: ExamUpdate, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)
 ):
     row = await ensure_exam_write(exam_id, user, db)
+    assert_exam_content_editable(row)
     data = payload.model_dump(exclude_unset=True)
+    if "exam_category" in data and data["exam_category"] is not None:
+        data["exam_category"] = await normalize_exam_category(db, data["exam_category"])
+    sched = data["scheduled_at"] if "scheduled_at" in data else row.scheduled_at
+    ends = data["ends_at"] if "ends_at" in data else row.ends_at
+    if sched is not None or ends is not None:
+        if sched is None or ends is None:
+            raise HTTPException(status_code=400, detail="İmtahanın başlama və bitmə tarixi birlikdə təyin olunmalıdır")
+        _validate_exam_window(sched, ends)
     if "resale_enabled" in data and row.course_id is not None:
         raise HTTPException(status_code=400, detail="Kurs imtahanında bilet satışı flag-i yalnız platform imtahanları üçündür")
     if "resale_enabled" in data and user.role != UserRole.ADMIN:
@@ -426,7 +577,7 @@ async def update_exam(
         await mark_exam_omr_templates_stale(db, exam_id)
     await db.commit()
     await db.refresh(row)
-    out = ExamOut.model_validate(row)
+    out = _exam_out(row)
     if answer_key_cleared:
         note = " [Cavab açarı sual sayı dəyişdiyi üçün silindi]"
         return out.model_copy(update={"description": (out.description or "") + note})
@@ -436,6 +587,7 @@ async def update_exam(
 @router.delete("/{exam_id}")
 async def delete_exam(exam_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
     row = await ensure_exam_write(exam_id, user, db)
+    assert_exam_content_editable(row)
     await db.delete(row)
     await db.commit()
     return {"message": "Deleted"}
@@ -452,6 +604,7 @@ async def save_answer_key(
     exam_row = await db.get(Exam, exam_id)
     if exam_row is None:
         raise HTTPException(status_code=404, detail="Exam not found")
+    assert_exam_content_editable(exam_row)
     expected = int(exam_row.question_count or 0)
     if expected < 1:
         raise HTTPException(status_code=400, detail="İmtahan üçün sual sayı təyin edilməyib")
@@ -461,8 +614,14 @@ async def save_answer_key(
             detail=f"Cavab açarı uzunluğu ({len(payload)}) imtahanın sual sayına ({expected}) bərabər olmalıdır",
         )
     opts = int(exam_row.options_per_question or 4)
-    valid_letters = {chr(ord("A") + i) for i in range(max(2, min(opts, 5)))}
+    q_rows = (
+        await db.scalars(
+            select(Question).where(Question.exam_id == exam_id).order_by(Question.order_index.asc())
+        )
+    ).all()
+    by_order: dict[int, Question] = {int(q.order_index): q for q in q_rows}
     seen_q: set[int] = set()
+    normalized: list[tuple[int, str, float]] = []
     for item in payload:
         qn = int(item.question_number)
         if qn < 1 or qn > expected:
@@ -473,22 +632,22 @@ async def save_answer_key(
         if qn in seen_q:
             raise HTTPException(status_code=400, detail=f"Təkrarlanan sual nömrəsi: {qn}")
         seen_q.add(qn)
-        ca = str(item.correct_answer or "").strip().upper()
-        if ca not in valid_letters:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Sual {qn}: düzgün cavab «{ca}» etibarlı variant deyil ({', '.join(sorted(valid_letters))})",
-            )
-        if float(item.points) < 0:
-            raise HTTPException(status_code=400, detail=f"Sual {qn}: bal mənfi ola bilməz")
+        ca = validate_answer_key_item(
+            question_number=qn,
+            correct_answer=str(item.correct_answer or ""),
+            points=float(item.points),
+            question=by_order.get(qn),
+            options_per_question=opts,
+        )
+        normalized.append((qn, ca, float(item.points)))
     await db.execute(delete(AnswerKey).where(AnswerKey.exam_id == exam_id))
-    for item in payload:
+    for qn, ca, pts in normalized:
         db.add(
             AnswerKey(
                 exam_id=exam_id,
-                question_number=int(item.question_number),
-                correct_answer=str(item.correct_answer).strip().upper(),
-                points=float(item.points),
+                question_number=qn,
+                correct_answer=ca,
+                points=pts,
             )
         )
     await db.commit()
@@ -497,7 +656,10 @@ async def save_answer_key(
 
 @router.get("/{exam_id}/answer-key", response_model=list[AnswerKeyItem])
 async def get_answer_key(exam_id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
-    await ensure_exam_access(exam_id, user, db)
+    # Write-level access; operators must not read answer keys
+    await ensure_exam_write(exam_id, user, db)
+    if user.role == UserRole.OPERATOR:
+        raise HTTPException(status_code=403, detail="Forbidden")
     rows = (
         await db.scalars(
             select(AnswerKey)

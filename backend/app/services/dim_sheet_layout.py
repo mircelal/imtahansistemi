@@ -8,6 +8,12 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from app.services.sheet_layout_spec import (
+    MIN_FREE_FORM_MCQ_RESERVE_MM,
+    MIN_GRID_ABOVE_FOOTER_MM,
+    SAFE_CONTENT_INSET_MM,
+)
+
 # Azərbaycan latın əlifbası (32 hərf, OMR MCQ32 üçün)
 AZ_LATIN = tuple("ABCÇDEƏFGĞHXIİJKQLMNOPÖRSŞTUÜVYZ")
 
@@ -112,8 +118,34 @@ L_BASE: dict[str, float] = {
     # Şaquli (DİM) MCQ: sütunlar arası — mcq_hgap_mm verilməyibsə (köhnə API), üfüqi hgap 7.5 yox, bu
     "mcq_tower_strip_gap_mm": 3.35,
     # Şaquli A–E: mərkəz–mərkəz ≥ Ø + bu — kənarlar arasında çap üçün aydın boşluq (PDF/OMR)
-    "mcq_tower_opt_min_clear_mm": 1.0,
+    "mcq_tower_opt_min_clear_mm": 1.05,
 }
+
+# PDF PAPERS ilə eyni mm (reportlab importu olmadan)
+_PAPER_PAGE_MM: dict[str, tuple[float, float]] = {
+    "A4": (210.0, 297.0),
+    "A3": (297.0, 420.0),
+    "A4L": (297.0, 210.0),
+    "A3L": (420.0, 297.0),
+}
+
+
+def page_dimensions_mm(cfg: dict[str, Any] | None) -> tuple[float, float]:
+    cfg = cfg or {}
+    key = str(cfg.get("paper_size", "A4"))
+    return _PAPER_PAGE_MM.get(key, _PAPER_PAGE_MM["A4"])
+
+
+def mcq_grid_content_bottom_mm(ph_mm: float) -> float:
+    """MCQ üçün `gb` — `max_questions_fit_below_identity` ilə eyni (mm, səhifə yuxarısından)."""
+    lb = L_BASE
+    return float(ph_mm) - float(lb["margin"]) - float(lb["footer_h"])
+
+
+def freeform_mcq_grid_top_anchor_max_mm(ph_mm: float) -> float:
+    """MCQ anchor-un yuxarı həddi: `gb` altında grid_top_pad + buffer."""
+    return mcq_grid_content_bottom_mm(ph_mm) - float(L_BASE["grid_top_pad"]) - 0.5
+
 
 ID_DIGIT_D = 4.0
 ID_DIGIT_VGAP = 4.15
@@ -155,6 +187,183 @@ def identity_zone_top_mm() -> float:
     Köhnə səhv: margin+header_h — margin burada təkrarlanmırdı.
     """
     return header_magenta_top_from_page_top_mm() + float(L_BASE["header_h"])
+
+
+def identity_fields_bottom_mm(cfg: dict[str, Any]) -> float:
+    """Sərbəst dizayn: bütün identity_fields alt kənarı (mm, kağız yuxarısından)."""
+    from app.services.dim_identity import _field_height_mm, resolve_identity_fields
+
+    zone_top = identity_zone_top_mm()
+    fields = resolve_identity_fields(cfg)
+    if not fields:
+        return zone_top + 10.0
+    mx = zone_top + 3.0
+    for f in fields:
+        y0 = float(f.get("y_mm", zone_top))
+        mx = max(mx, y0 + _field_height_mm(f, cfg))
+    return float(mx)
+
+
+def freeform_mcq_grid_top_anchor_mm(
+    mg: dict[str, Any] | None,
+    id_h_mm: float,
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    """
+    Sərbəst dizayn: anchor sahələrin dərhal altından; saxlanmış top_mm yalnız aşağı sürükləmə üçündür.
+    """
+    mg = mg or {}
+    cfg = cfg or {}
+    _, ph_mm = page_dimensions_mm(cfg)
+    max_gt = freeform_mcq_grid_top_anchor_max_mm(ph_mm)
+    sep = float(L_BASE["sep_v"])
+    from app.services.dim_identity import resolve_identity_fields
+    from app.services.mcq_sections import should_show_mcq_grid_label
+
+    label_headroom = 4.8 if should_show_mcq_grid_label(cfg) else 0.0
+
+    if cfg.get("layout_mode") == "freeform" and resolve_identity_fields(cfg):
+        min_gt = identity_fields_bottom_mm(cfg) + sep + label_headroom
+    else:
+        min_gt = identity_zone_top_mm() + float(id_h_mm) + sep + label_headroom
+    min_gt = min(float(min_gt), float(max_gt))
+
+    raw = mg.get("top_mm")
+    if raw is None:
+        return float(min_gt)
+    try:
+        rv = float(raw)
+    except (TypeError, ValueError):
+        return float(min_gt)
+    if rv <= 0:
+        return float(min_gt)
+    return min(max(float(min_gt), rv), float(max_gt))
+
+
+def mcq_content_bottom_mm(
+    cfg: dict[str, Any],
+    pw_mm: float,
+    ph_mm: float,
+    *,
+    force_single_sheet_grid: bool = False,
+) -> float | None:
+    """
+    MCQ şəbəkəsinin ən aşağı balonunun aşağı kənarı (mm, həmin səhifənin yuxarısından).
+    İki səhifədə MCQ yalnız 2-ci səhifədədirsə — 2-ci səhifə üçün hesablanır (birinci səhifədə MCQ yoxdursa None deyil, 2-ci səhifə hündürlüyü ph_mm ilə eynidir).
+    """
+    lb = L_BASE
+    q_count = max(1, int(cfg.get("question_count", 50)))
+    options = max(2, min(5, int(cfg.get("options_per_question", 5))))
+    cols = max(1, min(6, int(cfg.get("columns_count", 2))))
+
+    cfg_h = dict(cfg)
+    pc = cfg.get("participant_code") or cfg.get("sheet_code")
+    if pc:
+        cfg_h["participant_code"] = str(pc)
+    id_h = identity_height_mm(cfg_h)
+    layout_ff = cfg.get("layout_mode") == "freeform"
+    mg0 = cfg.get("mcq_grid") or {}
+    if force_single_sheet_grid:
+        two_page = False
+    else:
+        two_page = answer_sheet_two_page_required(cfg, pw_mm, ph_mm)
+
+    def _grid_bottom(gt_anchor: float, left_anchor: float) -> float:
+        from app.services.mcq_sections import (
+            mcq_blocks_content_bottom_mm,
+            mcq_sections_use_stacked,
+            prepare_mcq_grid_blocks,
+        )
+
+        if mcq_sections_use_stacked(cfg):
+            bl, _, _, _, _, _, nc_f = prepare_mcq_grid_blocks(
+                pw_mm, ph_mm, cfg, gt_anchor, left_anchor,
+            )
+            bottom = mcq_blocks_content_bottom_mm(bl, nc=nc_f, options=options)
+            return max(float(gt_anchor), bottom)
+
+        bd_f, vg_f, hg_f, nc_f = resolve_mcq_spacing(
+            ph_mm, cols, q_count, gt_anchor, cfg, pw_mm=pw_mm, left_mm=left_anchor,
+        )
+        if nc_f > 0:
+            bl, _, _ = compute_mcquestion_tower_rows(
+                pw_mm, ph_mm, q_count, gt_anchor, left_anchor,
+                bd_f, vg_f, hg_f, nc_f, options, cfg,
+            )
+        else:
+            bl, _, _ = compute_mcquestion_blocks_with_gt(
+                pw_mm, ph_mm, cols, q_count, gt_anchor,
+                left_mm=left_anchor, bubble_d=bd_f, vgap=vg_f, hgap=hg_f,
+            )
+        bottom = float(gt_anchor)
+        if nc_f > 0:
+            pad_below_num = float(cfg.get("mcq_num_to_bubbles_pad_mm", 0.48))
+            for blk in bl:
+                if blk.get("layout") != "mcq_tower_row":
+                    continue
+                row_y0 = float(blk["row_y0_mm"])
+                bd_use = float(blk["bd"])
+                opt_vg = float(blk["opt_vgap"])
+                nc = float(blk["num_cell_mm"])
+                row_h = nc + pad_below_num + (options - 1) * opt_vg + bd_use
+                bottom = max(bottom, row_y0 + row_h)
+        else:
+            for blk in bl:
+                qs = list(blk.get("qs") or [])
+                per = len(qs)
+                if per <= 0:
+                    continue
+                bd = float(blk.get("_bd", lb["bubble_d"]))
+                vg = float(blk.get("_vg", lb["vgap"]))
+                first_by = float(blk["fby"])
+                last_c = first_by + (per - 1) * vg
+                bottom = max(bottom, last_c + bd / 2.0)
+        return bottom
+
+    if two_page:
+        gt_p2 = identity_zone_top_mm() + float(lb["sep_v"])
+        return _grid_bottom(gt_p2, content_left_mm())
+
+    if layout_ff:
+        gt = freeform_mcq_grid_top_anchor_mm(mg0, id_h, cfg)
+        la = float(mg0.get("left_mm", content_left_mm()))
+    else:
+        gt = identity_zone_top_mm() + id_h + float(lb["sep_v"])
+        la = content_left_mm()
+    return _grid_bottom(gt, la)
+
+
+def answer_sheet_two_page_required(cfg: dict[str, Any], pw_mm: float, ph_mm: float) -> bool:
+    """
+    MCQ-lər bir səhifədə yerləşmirsə və ya bir səhifəlik çəkilən şəbəkənin altı
+    təhlükəsiz zonadan aşağı düşürsə — PDF/OMR üçün ikinci səhifə lazımdır
+    («Tək səhifə» seçimi səhv olsa belə).
+    """
+    cfg = cfg or {}
+    q_count = max(1, int(cfg.get("question_count", 50)))
+    cols = max(1, min(6, int(cfg.get("columns_count", 2))))
+    cfg_h = dict(cfg)
+    pc = cfg.get("participant_code") or cfg.get("sheet_code")
+    if pc:
+        cfg_h["participant_code"] = str(pc)
+    id_h = identity_height_mm(cfg_h)
+    layout_ff = cfg.get("layout_mode") == "freeform"
+    mg0 = cfg.get("mcq_grid") or {}
+    left_fit = float(mg0.get("left_mm", content_left_mm())) if layout_ff else content_left_mm()
+    fit1 = max_questions_fit_below_identity(
+        ph_mm, cols, id_h, cfg, pw_mm=pw_mm, left_mm=left_fit,
+    )
+    if fit1 < q_count:
+        return True
+    bottom_safe = (
+        ph_mm
+        - float(L_BASE["margin"])
+        - float(L_BASE["footer_h"])
+        - float(MIN_GRID_ABOVE_FOOTER_MM)
+        - float(SAFE_CONTENT_INSET_MM)
+    )
+    bb = mcq_content_bottom_mm(cfg, pw_mm, ph_mm, force_single_sheet_grid=True)
+    return bb is not None and float(bb) > bottom_safe + 0.12
 
 
 def identity_x(mm_offset_from_content_left: float) -> float:
@@ -225,12 +434,104 @@ def config_with_identity_matched_to_mcq(cfg: dict[str, Any], bd_mcq: float, towe
     return out
 
 
+def effective_layout_config(
+    cfg: dict[str, Any],
+    pw_mm: float | None = None,
+    ph_mm: float | None = None,
+) -> dict[str, Any]:
+    """
+    Audit / normalize / identity_height ölçüləri PDF generator-da çəkiləcəyi ölçülərlə
+    eyni olsun deyə `config_with_identity_matched_to_mcq`-i həmin anchor üzərində tətbiq edir.
+
+    Şaquli (DİM tower) MCQ rejimi + `identity_match_mcq_bubbles=True`-də şəxsiyyət
+    hərf/rəqəm baloncuqlarının diametri MCQ balonuna uyğunlaşır. Bu cfg üzərində
+    `_field_height_mm` / `_field_width_mm` çağırılanda PDF-də gerçəkdən çəkilən boyu
+    görür → yalançı «footer-ə daşır / kəsişir» xəbərdarlıqları aradan qalxır.
+
+    Mühüm xüsusiyyət: `dict(cfg)` ilə şallow kopyadır, ona görə `identity_fields` siyahısı
+    eyni obyektdir (mutasiya hər iki yerdə görünür). Bu, normalize-in sahə x/y-larını
+    təzə eff cfg üzərində ölçməsi və eyni anda raw cfg-də x/y dəyişməsi üçün vacibdir.
+    """
+    cfg = cfg or {}
+    if not identity_enabled(cfg):
+        return cfg
+    if mcq_options_horizontal(cfg):
+        return cfg
+    if not bool(cfg.get("identity_match_mcq_bubbles", True)):
+        return cfg
+
+    if pw_mm is None or ph_mm is None:
+        pw_x, ph_x = page_dimensions_mm(cfg)
+        if pw_mm is None:
+            pw_mm = pw_x
+        if ph_mm is None:
+            ph_mm = ph_x
+
+    q_count = max(1, int(cfg.get("question_count", 50)))
+    cols = max(1, min(6, int(cfg.get("columns_count", 2))))
+
+    # PDF generator ilə eyni anchor seçimi: iki səhifəlidirsə MCQ 2-ci səhifədədir
+    # və `bd_f` 2-ci səhifədə tam zonaya uyğunlaşır.
+    two_page = answer_sheet_two_page_required(cfg, pw_mm, ph_mm)
+    if two_page:
+        gt_anchor = identity_zone_top_mm() + float(L_BASE["sep_v"])
+        left_anchor = content_left_mm()
+    else:
+        cfg_h = dict(cfg)
+        pc = cfg.get("participant_code") or cfg.get("sheet_code")
+        if pc:
+            cfg_h["participant_code"] = str(pc)
+        id_h = identity_height_mm(cfg_h)
+        if cfg.get("layout_mode") == "freeform":
+            mg0 = cfg.get("mcq_grid") or {}
+            gt_anchor = freeform_mcq_grid_top_anchor_mm(mg0, id_h, cfg)
+            left_anchor = float(mg0.get("left_mm", content_left_mm()))
+        else:
+            gt_anchor = identity_zone_top_mm() + id_h + float(L_BASE["sep_v"])
+            left_anchor = content_left_mm()
+
+    bd_f, _vg_f, _hg_f, nc_f = resolve_mcq_spacing(
+        ph_mm, cols, q_count, gt_anchor, cfg, pw_mm=pw_mm, left_mm=left_anchor,
+    )
+    return config_with_identity_matched_to_mcq(cfg, bd_f, nc_f > 0.0)
+
+
 def digit_col_height_mm_from_metrics(met: dict[str, float]) -> float:
     return 9.0 * met["digit_vgap"] + met["digit_d"]
 
 
-def _letter_block_height_mm(n_rows: int) -> float:
-    return 5.0 + 6.0 + n_rows * ID_LETTER_VGAP + 5.0
+# Üfüqi hərf — digit_groups / vertical_letters ilə eyni başlıq + boşluq ritmi
+HORIZONTAL_LETTERS_HEADER_MM = 4.8
+HORIZONTAL_LETTERS_TOP_GAP_MM = 0.8
+HORIZONTAL_LETTERS_BOTTOM_TAIL_MM = 1.5
+HORIZONTAL_LETTERS_HANDWRITE_ROW_EXTRA_MM = 0.5
+HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM = 11.0
+
+
+def horizontal_letters_body_top_mm() -> float:
+    """Başlıq zolağı + alt boşluq — birinci sətir buradan başlayır."""
+    return HORIZONTAL_LETTERS_HEADER_MM + HORIZONTAL_LETTERS_TOP_GAP_MM
+
+
+def horizontal_letter_row_pitch_mm(
+    field: dict[str, Any],
+    met: dict[str, float],
+    cfg: dict[str, Any] | None = None,
+) -> float:
+    """Sətir mərkəzləri arası (klassik: letter_vgap; yazı+kodlama: hw+gap+balon+boşluq)."""
+    cfg = cfg or {}
+    if field.get("row_layout") == "handwrite_coding":
+        hw_h = float(field.get("handwrite_h_mm", cfg.get("identity_handwrite_h_mm", 5.0)))
+        hw_gap = float(field.get("handwrite_gap_mm", cfg.get("identity_handwrite_gap_mm", 1.4)))
+        ld = float(met["letter_d"])
+        return hw_h + hw_gap + ld + HORIZONTAL_LETTERS_HANDWRITE_ROW_EXTRA_MM
+    return float(met["letter_vgap"])
+
+
+def _letter_block_height_mm(n_rows: int, met: dict[str, float] | None = None) -> float:
+    m = met or {"letter_vgap": ID_LETTER_VGAP}
+    body_top = horizontal_letters_body_top_mm()
+    return body_top + n_rows * float(m["letter_vgap"]) + HORIZONTAL_LETTERS_BOTTOM_TAIL_MM
 
 
 def horizontal_letter_block_height_mm(
@@ -239,15 +540,10 @@ def horizontal_letter_block_height_mm(
     met: dict[str, float],
     cfg: dict[str, Any] | None = None,
 ) -> float:
-    """horizontal_letters — klassik və ya yazı+kodlama."""
-    cfg = cfg or {}
-    if field.get("row_layout") == "handwrite_coding":
-        hw_h = float(field.get("handwrite_h_mm", cfg.get("identity_handwrite_h_mm", 5.0)))
-        hw_gap = float(field.get("handwrite_gap_mm", cfg.get("identity_handwrite_gap_mm", 1.4)))
-        ld = met["letter_d"]
-        row_pitch = hw_h + hw_gap + ld + 1.5
-        return 5.0 + 6.0 + n_rows * row_pitch + 5.0
-    return _letter_block_height_mm(n_rows)
+    """horizontal_letters — klassik və ya yazı+kodlama (tam blok hündürlüyü, mm)."""
+    body_top = horizontal_letters_body_top_mm()
+    pitch = horizontal_letter_row_pitch_mm(field, met, cfg)
+    return body_top + n_rows * pitch + HORIZONTAL_LETTERS_BOTTOM_TAIL_MM
 
 
 def identity_height_mm(cfg: dict[str, Any]) -> float:
@@ -275,9 +571,9 @@ def identity_metrics_mm(cfg: dict[str, Any]) -> dict[str, Any]:
     y += 14.0 + code_extra
 
     y_ad = y
-    y += _letter_block_height_mm(p["name_rows"])
+    y += _letter_block_height_mm(p["name_rows"], identity_draw_metrics(cfg))
     y_sn = y
-    y += _letter_block_height_mm(p["surname_rows"])
+    y += _letter_block_height_mm(p["surname_rows"], identity_draw_metrics(cfg))
     y_fn = y
 
     return {
@@ -293,12 +589,12 @@ def identity_metrics_mm(cfg: dict[str, Any]) -> dict[str, Any]:
 
 def letter_row_center_mm(block_top_mm: float, row_index: int) -> float:
     """AD/SOYAD/ATA blokunda bir hərf sətirinin mərkəz Y-si (mm, yuxarıdan)."""
-    ct = block_top_mm + 5.0 + 6.0 + ID_LETTER_D / 2.0
+    ct = block_top_mm + horizontal_letters_body_top_mm() + ID_LETTER_D / 2.0
     return ct + row_index * ID_LETTER_VGAP
 
 
 def letter_row_center_mm_with_metrics(block_top_mm: float, row_index: int, met: dict[str, float]) -> float:
-    ct = block_top_mm + 5.0 + 6.0 + met["letter_d"] / 2.0
+    ct = block_top_mm + horizontal_letters_body_top_mm() + met["letter_d"] / 2.0
     return ct + row_index * met["letter_vgap"]
 
 
@@ -315,8 +611,8 @@ def letter_row_bubble_center_mm(
         hw_h = float(field.get("handwrite_h_mm", cfg.get("identity_handwrite_h_mm", 5.0)))
         hw_gap = float(field.get("handwrite_gap_mm", cfg.get("identity_handwrite_gap_mm", 1.4)))
         ld = met["letter_d"]
-        row_pitch = hw_h + hw_gap + ld + 1.5
-        row0 = block_top_mm + 5.0 + 6.0
+        row_pitch = horizontal_letter_row_pitch_mm(field, met, cfg)
+        row0 = block_top_mm + horizontal_letters_body_top_mm()
         y_row_top = row0 + row_index * row_pitch
         return y_row_top + hw_h + hw_gap + ld / 2.0
     return letter_row_center_mm_with_metrics(block_top_mm, row_index, met)
@@ -330,10 +626,11 @@ def letter_row_first_bubble_x_mm(
 ) -> float:
     cfg = cfg or {}
     ld = met["letter_d"]
+    label_left = HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM
     if field.get("row_layout") == "handwrite_coding":
         hw_w = float(field.get("handwrite_w_mm", cfg.get("identity_handwrite_w_mm", 13.0)))
-        return field_left_mm + 11.0 + hw_w + 2.0 + ld / 2.0
-    return field_left_mm + 11.0 + ld / 2.0
+        return field_left_mm + label_left + hw_w + 2.0 + ld / 2.0
+    return field_left_mm + label_left + ld / 2.0
 
 
 def mcq_options_horizontal(cfg: dict[str, Any] | None) -> bool:
@@ -521,7 +818,11 @@ def max_questions_fit_below_identity(
     """Şəxsiyyət + başlıqdan sonra bir səhifədə neçə MCQ sığır."""
     cfg = cfg or {}
     lb = L_BASE
-    gt = identity_zone_top_mm() + identity_h_mm + lb["sep_v"]
+    mg0 = cfg.get("mcq_grid") or {}
+    if cfg.get("layout_mode") == "freeform":
+        gt = freeform_mcq_grid_top_anchor_mm(mg0, float(identity_h_mm), cfg)
+    else:
+        gt = identity_zone_top_mm() + float(identity_h_mm) + float(lb["sep_v"])
     gb = ph_mm - lb["margin"] - lb["footer_h"]
     pw = float(pw_mm) if pw_mm is not None else 210.0
     left = float(left_mm) if left_mm is not None else content_left_mm()
@@ -712,6 +1013,53 @@ def compute_mcquestion_blocks_with_gt(
     return blocks, gt_mm, gb
 
 
+def horizontal_option_pitch_mm(cfg: dict[str, Any] | None, *, bubble_d_mm: float | None = None) -> float:
+    """
+    Üfüqi A–E üçün mərkəz–mərkəz aralıq (mm).
+
+    `mcq_hgap_mm` həm tower sütun boşluğu (~3.35), həm üfüqi variant pitch (~7.5) üçün
+    eyni açardır; tower defoltu üfüqidə balonları üst-üstə salır — remapping + min pitch.
+    """
+    cfg = cfg or {}
+    lb = L_BASE
+    bd = float(bubble_d_mm if bubble_d_mm is not None else cfg.get("mcq_bubble_d_mm", lb["bubble_d"]))
+    bd = max(2.8, min(8.5, bd))
+    raw = cfg.get("mcq_hgap_mm")
+    if raw is None:
+        h = float(lb["hgap"])
+    else:
+        h = float(raw)
+        # Tipik tower strip (~3.35) və ya balondan kiçik pitch → üfüqi defolt
+        if h + 1e-6 < bd:
+            h = float(lb["hgap"])
+    min_pitch = bd + 0.5
+    return max(min_pitch, min(12.0, h))
+
+
+def fit_horizontal_row_pitch(
+    col_w_mm: float,
+    options: int,
+    bubble_d_mm: float,
+    hgap_mm: float,
+    *,
+    q_num_w_mm: float | None = None,
+) -> float:
+    """Sütun eninə sığmayan üfüqi variant pitch-ini kiçildir (min = Ø + 0.5)."""
+    lb = L_BASE
+    opts = max(1, int(options))
+    bd = max(2.8, float(bubble_d_mm))
+    hg = float(hgap_mm)
+    qnw = float(q_num_w_mm if q_num_w_mm is not None else lb["q_num_w"])
+    pad = 1.5
+    if opts <= 1:
+        return hg
+    needed = qnw + (opts - 1) * hg + bd + pad
+    if needed <= col_w_mm + 1e-6:
+        return hg
+    max_hg = (col_w_mm - qnw - bd - pad) / (opts - 1)
+    return max(bd + 0.5, min(hg, max_hg))
+
+
 def resolve_mcq_spacing(
     ph_mm: float,
     cols: int,
@@ -732,14 +1080,11 @@ def resolve_mcq_spacing(
     if auto is None:
         auto = True
 
-    def _hg_horizontal() -> float:
-        h = float(cfg.get("mcq_hgap_mm", lb["hgap"]))
-        return max(3.2, min(12.0, h))
-
     left = float(left_mm) if left_mm is not None else content_left_mm()
+    options = max(2, min(5, int(cfg.get("options_per_question", 5))))
+    avail_w = max(10.0, pw_mm - left - lb["margin"])
 
     if mcq_options_horizontal(cfg):
-        hg = _hg_horizontal()
         if bool(auto):
             bd, vg = solve_mcq_spacing_single_page(ph_mm, cols, q_count, gt_mm)
         else:
@@ -747,12 +1092,13 @@ def resolve_mcq_spacing(
             vg = float(cfg.get("mcq_vgap_mm", lb["vgap"]))
             bd = max(2.8, min(8.5, bd))
             vg = max(3.0, min(14.0, vg))
+        hg = horizontal_option_pitch_mm(cfg, bubble_d_mm=bd)
+        col_w = avail_w / max(1, int(cols))
+        hg = fit_horizontal_row_pitch(col_w, options, bd, hg)
         return bd, vg, hg, 0.0
 
     hg = mcq_tower_strip_gap_mm(cfg)
 
-    options = max(2, min(5, int(cfg.get("options_per_question", 5))))
-    avail_w = max(10.0, pw_mm - left - lb["margin"])
     if bool(auto):
         bd, vg, num_cell = solve_mcq_tower_spacing_single_page(
             ph_mm, avail_w, q_count, options, gt_mm, cfg,

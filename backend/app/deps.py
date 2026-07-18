@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.database import get_db
 from app.models.entities import Course, CourseOperator, Exam, ScanSession, User, UserRole
+from app.services.auth_security import is_token_denylisted
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 settings = get_settings()
@@ -23,11 +24,20 @@ async def get_current_user(
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
         user_id = int(payload.get("sub"))
+        jti = payload.get("jti")
+        if jti is not None and is_token_denylisted(str(jti)):
+            raise credentials_exception
+        impersonated_by_raw = payload.get("impersonated_by")
+        impersonated_by: int | None = None
+        if impersonated_by_raw is not None:
+            impersonated_by = int(impersonated_by_raw)
     except (JWTError, TypeError, ValueError):
         raise credentials_exception
     user = await db.scalar(select(User).where(User.id == user_id))
     if user is None:
         raise credentials_exception
+    # Ephemeral request context (not a DB column)
+    user.impersonated_by = impersonated_by  # type: ignore[attr-defined]
     return user
 
 
@@ -101,11 +111,19 @@ async def get_exam_or_404(exam_id: int, db: AsyncSession) -> Exam:
     return exam
 
 
+async def _can_access_courseless_exam(exam: Exam, user: User) -> bool:
+    if user.role == UserRole.ADMIN:
+        return True
+    if user.role == UserRole.MANAGER and exam.created_by_id == user.id:
+        return True
+    return False
+
+
 async def ensure_exam_access(exam_id: int, user: User, db: AsyncSession) -> Exam:
     exam = await get_exam_or_404(exam_id, db)
     if exam.course_id is None:
-        if user.role != UserRole.ADMIN:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ümumi imtahan — yalnız administrator")
+        if not await _can_access_courseless_exam(exam, user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ümumi imtahan — yalnız yaradıcı və ya administrator")
         return exam
     await ensure_course_access(exam.course_id, user, db)
     return exam
@@ -114,10 +132,19 @@ async def ensure_exam_access(exam_id: int, user: User, db: AsyncSession) -> Exam
 async def ensure_exam_write(exam_id: int, user: User, db: AsyncSession) -> Exam:
     exam = await get_exam_or_404(exam_id, db)
     if exam.course_id is None:
-        if user.role != UserRole.ADMIN:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ümumi imtahan — yalnız administrator")
+        if not await _can_access_courseless_exam(exam, user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Ümumi imtahan — yalnız yaradıcı və ya administrator")
         return exam
     await ensure_course_write(exam.course_id, user, db)
+    return exam
+
+
+async def ensure_exam_content_write(exam_id: int, user: User, db: AsyncSession) -> Exam:
+    """Yazı icazəsi + bitmiş imtahan kilidi (skan üçün ensure_exam_write istifadə edin)."""
+    from app.services.exam_lifecycle import assert_exam_content_editable
+
+    exam = await ensure_exam_write(exam_id, user, db)
+    assert_exam_content_editable(exam)
     return exam
 
 
@@ -133,6 +160,8 @@ async def ensure_scan_session_access(session_id: int, user: User, db: AsyncSessi
     exam = await get_exam_or_404(session.exam_id, db)
     if exam.course_id is None:
         if user.role == UserRole.ADMIN:
+            return session
+        if user.role == UserRole.MANAGER and exam.created_by_id == user.id:
             return session
         if user.role == UserRole.OPERATOR and session.operator_id == user.id:
             return session

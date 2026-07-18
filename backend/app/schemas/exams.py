@@ -21,7 +21,7 @@ class ExamTicketBundledCreate(BaseModel):
 
 
 class ExamCreate(BaseModel):
-    """course_id=None — ümumi imtahan (yalnız administrator); qapaqda sistem logosu."""
+    """course_id=None — ümumi (kurssuz) imtahan; admin və ya menecer yarada bilər."""
     course_id: int | None = None
     title: str
     description: str | None = None
@@ -33,10 +33,27 @@ class ExamCreate(BaseModel):
     is_active: bool = True
     grading_config: dict = Field(default_factory=dict)
     grading_policy: dict = Field(default_factory=dict)
-    scheduled_at: datetime | None = None
+    scheduled_at: datetime
+    ends_at: datetime
     seat_quota: int | None = Field(default=None, ge=1)
+    resale_enabled: bool = False
+    delivery_mode: str = Field(default="in_person", max_length=16)
+    venue: str | None = Field(default=None, max_length=255)
+    city: str | None = Field(default=None, max_length=128)
+    list_price_amount: float = Field(ge=0, default=0)
+    list_price_currency: str = Field(default="AZN", max_length=8)
     bundled_ticket: ExamTicketBundledCreate | None = None
     answer_sheet_preset_id: int | None = None
+    exam_category: str = Field(
+        default="custom",
+        max_length=32,
+        description="buraxilis | blok | sinif | qebul | custom",
+    )
+    scoring_profile_id: int | None = None
+    use_dim_preset: bool = Field(
+        default=False,
+        description="DİM standartı: 4 variant, mənfi bal off, differential xallar grading_policy-də",
+    )
 
 
 class ExamUpdate(BaseModel):
@@ -51,8 +68,17 @@ class ExamUpdate(BaseModel):
     grading_config: dict | None = None
     grading_policy: dict | None = None
     scheduled_at: datetime | None = None
+    ends_at: datetime | None = None
     seat_quota: int | None = Field(default=None, ge=1)
+    resale_enabled: bool | None = None
+    delivery_mode: str | None = Field(default=None, max_length=16)
+    venue: str | None = Field(default=None, max_length=255)
+    city: str | None = Field(default=None, max_length=128)
+    list_price_amount: float | None = Field(default=None, ge=0)
+    list_price_currency: str | None = Field(default=None, max_length=8)
     answer_sheet_preset_id: int | None = None
+    exam_category: str | None = Field(default=None, max_length=32)
+    scoring_profile_id: int | None = None
 
 
 class ExamOut(ORMModel):
@@ -67,12 +93,25 @@ class ExamOut(ORMModel):
     negative_ratio: float
     grading_config: dict
     grading_policy: dict
+    exam_category: str = "custom"
+    scoring_profile_id: int | None = None
     scheduled_at: datetime | None = None
+    ends_at: datetime | None = None
     seat_quota: int | None = None
+    resale_enabled: bool = False
+    delivery_mode: str = "in_person"
+    venue: str | None = None
+    city: str | None = None
+    list_price_amount: float = 0
+    list_price_currency: str = "AZN"
     created_at: datetime
     is_active: bool
     answer_sheet_preset_id: int | None = None
+    created_by_id: int | None = None
     answer_sheet_preset: AnswerSheetPresetBrief | None = None
+    lifecycle_status: str = "draft"
+    is_locked: bool = False
+    effective_ends_at: datetime | None = None
 
 
 class ExamListRowOut(ExamOut):
@@ -99,3 +138,46 @@ class AnswerKeyItem(BaseModel):
     question_number: int
     correct_answer: str
     points: float = 1.0
+
+
+class ExamDashboardResultRowOut(BaseModel):
+    rank: int | None = None
+    student_id: int
+    student_number: str | None = None
+    student_full_name: str | None = None
+    score: float | None = None
+    max_score: float | None = None
+    percent: float
+    status: str = "ok"
+
+
+class ExamDashboardOpsOut(BaseModel):
+    seat_quota: int | None = None
+    participation: int = 0
+    attendance_rate: float | None = None
+    scan_rows: int = 0
+    unresolved_sheets: int = 0
+    manual_review: int = 0
+    error_sheets: int = 0
+    ok_sheets: int = 0
+    scan_sessions_total: int = 0
+    venue: str | None = None
+    city: str | None = None
+
+
+class ExamDashboardOut(BaseModel):
+    exam_id: int
+    title: str
+    course_id: int | None = None
+    course_name: str | None = None
+    question_count: int
+    scheduled_at: datetime | None = None
+    ends_at: datetime | None = None
+    effective_ends_at: datetime | None = None
+    lifecycle_status: str
+    is_locked: bool
+    ops: ExamDashboardOpsOut
+    summary: dict
+    status_breakdown: dict[str, int]
+    results: list[ExamDashboardResultRowOut]
+    insights: list[dict] = Field(default_factory=list)

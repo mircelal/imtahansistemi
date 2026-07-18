@@ -9,9 +9,49 @@ from app.services.scan_reading_payload import (
     READING_VERSION,
     build_identity_key_labels,
     build_scan_reading_dict,
+    compose_card_identity,
     parse_omr_qr_payload,
     split_detected_answers,
 )
+
+
+def test_compose_card_identity_from_omr_fields():
+    raw = {
+        "id_ad01": "B",
+        "id_ad02": "A",
+        "id_ad03": "Ş",
+        "id_sn01": "A",
+        "id_sn02": "B",
+        "id_sn03": "A",
+        "id_fn01": "A",
+        "id_fn02": "U",
+        "id_fn03": "A",
+        "id_student_code1": "1",
+        "id_student_code2": "3",
+        "id_student_code3": "2",
+        "id_student_code4": "2",
+        "id_student_code5": "1",
+        "id_student_code6": "4",
+        "id_sch1": "2",
+        "id_sch2": "1",
+        "id_sch3": "1",
+        "id_cl1": "1",
+        "id_cl2": "0",
+        "id_var": "D",
+        "id_lang": "Fr",
+        "q1": "B",
+    }
+    card = compose_card_identity(raw)
+    assert card["student_code"] == "132214"
+    assert card["first_name"] == "BAŞ"
+    assert card["last_name"] == "ABA"
+    assert card["father_name"] == "AUA"
+    assert card["full_name"] == "BAŞ ABA AUA"
+    assert card["school"] == "211"
+    assert card["class"] == "10"
+    assert card["variant"] == "D"
+    assert card["language"] == "Fr"
+    assert "q1" not in card
 
 
 def test_parse_omr_qr_v1_and_extras():

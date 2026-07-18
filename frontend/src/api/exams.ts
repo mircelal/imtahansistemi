@@ -14,14 +14,26 @@ export type Exam = {
   negative_ratio: number;
   grading_config: Record<string, unknown>;
   grading_policy: Record<string, unknown>;
+  exam_category?: string;
+  scoring_profile_id?: number | null;
   scheduled_at: string | null;
+  ends_at?: string | null;
   seat_quota: number | null;
+  resale_enabled?: boolean;
+  delivery_mode?: string;
+  venue?: string | null;
+  city?: string | null;
   created_at: string;
   is_active: boolean;
+  lifecycle_status?: "draft" | "scheduled" | "live" | "ended" | string;
+  is_locked?: boolean;
+  effective_ends_at?: string | null;
   /** İmtahanlar siyahısı (GET /api/exams/) */
   questions_registered?: number;
   answer_key_rows?: number;
   confirmed_sheet_templates?: number;
+  list_price_amount?: number;
+  list_price_currency?: string;
 };
 
 export async function listExams(courseId?: number) {
@@ -75,12 +87,37 @@ export async function createExam(payload: {
   negative_marking: boolean;
   negative_ratio: number;
   is_active: boolean;
-    scheduled_at?: string | null;
+    scheduled_at: string;
+    ends_at: string;
     seat_quota?: number | null;
+    resale_enabled?: boolean;
+    delivery_mode?: string;
+    venue?: string | null;
+    city?: string | null;
     bundled_ticket?: ExamTicketBundled | null;
     answer_sheet_preset_id?: number | null;
+    list_price_amount?: number;
+    list_price_currency?: string;
+    use_dim_preset?: boolean;
+    exam_category?: string;
+    scoring_profile_id?: number | null;
 }) {
   const { data } = await api.post<Exam>("/api/exams/", payload);
+  return data;
+}
+
+export async function applyDimExamPreset(examId: number, forceQuestionCount = false) {
+  const { data } = await api.post<{
+    message: string;
+    options_per_question: number;
+    negative_marking: boolean;
+    question_count: number;
+    questions_updated: number;
+    answer_keys_updated: number;
+    grading_policy: Record<string, unknown>;
+  }>(`/api/exams/${examId}/apply-dim-preset`, null, {
+    params: { force_question_count: forceQuestionCount },
+  });
   return data;
 }
 
@@ -98,6 +135,33 @@ export async function getExam(examId: number) {
   return data;
 }
 
+export type ExamReadinessStep = {
+  id: string;
+  label: string;
+  complete: boolean;
+  detail?: string | null;
+};
+
+export type ExamReadiness = {
+  exam_id: number;
+  ready_for_scan: boolean;
+  ready_for_results: boolean;
+  steps: ExamReadinessStep[];
+  missing: string[];
+  counts: {
+    questions_registered: number;
+    answer_key_rows: number;
+    confirmed_sheet_templates: number;
+    course_students: number;
+    question_count: number;
+  };
+};
+
+export async function getExamReadiness(examId: number) {
+  const { data } = await api.get<ExamReadiness>(`/api/exams/${examId}/readiness`);
+  return data;
+}
+
 export async function updateExam(
   examId: number,
   payload: Partial<{
@@ -112,8 +176,15 @@ export async function updateExam(
     grading_config: Record<string, unknown>;
     grading_policy: Record<string, unknown>;
     scheduled_at: string | null;
+    ends_at: string | null;
     seat_quota: number | null;
+    resale_enabled: boolean;
+    delivery_mode: string;
+    venue: string | null;
+    city: string | null;
     answer_sheet_preset_id: number | null;
+    list_price_amount: number;
+    list_price_currency: string;
   }>
 ) {
   const { data } = await api.put<Exam>(`/api/exams/${examId}`, payload);
@@ -144,13 +215,22 @@ function downloadBlob(data: Blob, filename: string) {
 
 export async function downloadExamBookletCover(
   examId: number,
-  params?: { subtitle?: string; line1?: string; line2?: string; institution?: string },
+  params?: {
+    subtitle?: string;
+    line1?: string;
+    line2?: string;
+    institution?: string;
+    exam_code?: string;
+    variant?: string;
+    duration_minutes?: number;
+  },
 ) {
   const res = await api.get(`/api/exams/${examId}/documents/booklet-cover`, {
     params: params ?? {},
     responseType: "blob",
   });
-  downloadBlob(res.data, `imtahan-${examId}-kitabc-qapaq.pdf`);
+  const v = params?.variant?.toUpperCase() ?? "A";
+  downloadBlob(res.data, `imtahan-${examId}-v${v}-kitabc-qapaq.pdf`);
 }
 
 export async function downloadExamQuestionBooklet(
@@ -160,11 +240,107 @@ export async function downloadExamQuestionBooklet(
     cover_line1?: string;
     cover_line2?: string;
     cover_institution?: string;
+    exam_code?: string;
+    variant?: string;
+    duration_minutes?: number;
   },
 ) {
   const res = await api.get(`/api/exams/${examId}/documents/question-booklet`, {
     params: params ?? {},
     responseType: "blob",
   });
-  downloadBlob(res.data, `imtahan-${examId}-sual-kitabcasi.pdf`);
+  const v = params?.variant?.toUpperCase() ?? "A";
+  downloadBlob(res.data, `imtahan-${examId}-v${v}-sual-kitabcasi.pdf`);
+}
+
+export async function downloadExamQuestionBookletDocx(
+  examId: number,
+  params?: {
+    cover_subtitle?: string;
+    cover_line1?: string;
+    cover_line2?: string;
+    cover_institution?: string;
+    exam_code?: string;
+    variant?: string;
+    duration_minutes?: number;
+  },
+) {
+  const res = await api.get(`/api/exams/${examId}/documents/question-booklet.docx`, {
+    params: params ?? {},
+    responseType: "blob",
+  });
+  const v = params?.variant?.toUpperCase() ?? "A";
+  downloadBlob(res.data, `imtahan-${examId}-v${v}-sual-kitabcasi.docx`);
+}
+
+export type ExamBookletAudit = {
+  booklet_config: Record<string, unknown>;
+  dim_booklet_layout_mm_reference: Record<string, unknown>;
+  print_checklist: string[];
+  layout_warnings: string[];
+  publishable: boolean;
+};
+
+export async function getExamBookletAudit(examId: number, variant = "A") {
+  const { data } = await api.get<ExamBookletAudit>(`/api/exams/${examId}/booklet-audit`, {
+    params: { variant },
+    });
+  return data;
+}
+
+export type ExamDashboard = {
+  exam_id: number;
+  title: string;
+  course_id: number | null;
+  course_name: string | null;
+  question_count: number;
+  scheduled_at: string | null;
+  ends_at: string | null;
+  effective_ends_at: string | null;
+  lifecycle_status: string;
+  is_locked: boolean;
+  ops: {
+    seat_quota: number | null;
+    participation: number;
+    attendance_rate: number | null;
+    scan_rows: number;
+    unresolved_sheets: number;
+    manual_review: number;
+    error_sheets: number;
+    ok_sheets: number;
+    scan_sessions_total: number;
+    venue: string | null;
+    city: string | null;
+  };
+  summary: {
+    average: number;
+    minimum: number;
+    maximum: number;
+    median_score?: number;
+    average_percent: number | null;
+    median_percent: number | null;
+    pass_rate: number | null;
+    pass_threshold_percent?: number;
+    participation: number;
+    unique_students: number;
+    scan_rows: number;
+    percent_histogram?: Array<{ from: number; to: number; count: number }>;
+  };
+  status_breakdown: Record<string, number>;
+  results: Array<{
+    rank: number | null;
+    student_id: number;
+    student_number: string | null;
+    student_full_name: string | null;
+    score: number | null;
+    max_score: number | null;
+    percent: number;
+    status: string;
+  }>;
+  insights: Array<{ key: string; title: string; message: string; tone: string }>;
+};
+
+export async function getExamDashboard(examId: number) {
+  const { data } = await api.get<ExamDashboard>(`/api/exams/${examId}/dashboard`);
+  return data;
 }

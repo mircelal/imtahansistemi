@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import axios from "axios";
 import { bootstrapAdmin, bootstrapStatus, login, me } from "../../api/auth";
 import { getPublicSettings, publicLogoPath } from "../../api/settings";
+import PoweredByMirTech from "../../components/PoweredByMirTech";
 import { useAuthStore } from "../../store/authStore";
 
 type LoginForm = { email: string; password: string; full_name?: string };
@@ -154,6 +155,7 @@ export default function LoginPage() {
       </div>
 
       <p className="relative mt-8 text-center text-xs text-slate-500">Giriş məlumatlarınızı təhlükəsiz saxlayın</p>
+      <PoweredByMirTech variant="login" className="relative mt-4" />
     </div>
   );
 }

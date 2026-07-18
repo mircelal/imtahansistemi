@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AnswerSheetGenerateRequest(BaseModel):
@@ -46,6 +46,28 @@ class AnswerSheetGenerateResponse(BaseModel):
     pdf_path: str
     sheet_uuid: str
     download_url: str
+    layout_warnings: list[str] = Field(default_factory=list)
+
+
+class AnswerSheetAuditResponse(BaseModel):
+    paper: str
+    page_mm: list[float]
+    content_right_mm: float
+    safe_bottom_mm: float
+    layout_warnings: list[str]
+    print_checklist: list[str]
+    font_status: dict[str, Any] | None = None
+    dim_layout_mm_reference: dict[str, Any] | None = Field(
+        default=None,
+        description="DİM mm istinadı (L_BASE / timing) — dizayner sinxron yoxlaması üçün.",
+    )
+    two_page_required: bool = False
+    effective_single_page_layout: bool = True
+    publishable: bool = True
+    effective_template_config: dict[str, Any] | None = Field(
+        default=None,
+        description="PDF generasiyası üçün merge+enrich+normalize sonrası konfiq (logo bytes istisna).",
+    )
 
 
 class SheetLookupResponse(BaseModel):

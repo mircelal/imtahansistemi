@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useForm } from "react-hook-form";
 import axios from "axios";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   deleteLogo,
   getAdminSettings,
@@ -9,6 +9,10 @@ import {
   updateAdminSettings,
   uploadLogo
 } from "../../api/settings";
+import { getPaymentSettings, updatePaymentSettings } from "../../api/payments";
+import Button from "../../components/ui/Button";
+import Card from "../../components/ui/Card";
+import PageHeader from "../../components/ui/PageHeader";
 
 type FormValues = { system_name: string };
 
@@ -59,14 +63,41 @@ export default function AdminSettingsPage() {
 
   const hasLogo = settingsQuery.data?.has_logo ?? false;
 
-  return (
-    <div className="mx-auto max-w-2xl space-y-8">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900">Sistem ayarları</h1>
-        <p className="mt-1 text-slate-600">Brauzerdə görünən ad və loqo. Dəyişikliklər dərhal tətbiq olunur.</p>
-      </div>
+  const payQ = useQuery({ queryKey: ["settings", "payments"], queryFn: getPaymentSettings });
+  const [payDriver, setPayDriver] = useState("mock");
+  const [walletOn, setWalletOn] = useState(true);
+  const [merchantHint, setMerchantHint] = useState("");
 
-      <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
+  useEffect(() => {
+    if (payQ.data) {
+      setPayDriver(payQ.data.active_driver);
+      setWalletOn(payQ.data.wallet_enabled);
+      const mid = payQ.data.config?.merchant_display;
+      setMerchantHint(typeof mid === "string" ? mid : "");
+    }
+  }, [payQ.data]);
+
+  const payMut = useMutation({
+    mutationFn: () =>
+      updatePaymentSettings({
+        active_driver: payDriver,
+        wallet_enabled: walletOn,
+        config: merchantHint.trim() ? { merchant_display: merchantHint.trim() } : {},
+      }),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["settings", "payments"] });
+    },
+  });
+
+  return (
+    <div className="page-container">
+      <PageHeader
+        title="Sistem ayarları"
+        subtitle="Brauzerdə görünən ad, loqo və ödəniş. Dəyişikliklər dərhal tətbiq olunur."
+      />
+
+      <div className="grid gap-8 lg:grid-cols-2">
+      <Card>
         <h2 className="text-lg font-semibold text-slate-900">Ümumi</h2>
         <form className="mt-4 space-y-4" onSubmit={handleSubmit((v) => saveMut.mutate({ system_name: v.system_name }))}>
           <div>
@@ -77,18 +108,14 @@ export default function AdminSettingsPage() {
               {...register("system_name", { required: true })}
             />
           </div>
-          <button
-            type="submit"
-            disabled={saveMut.isPending || settingsQuery.isLoading}
-            className="rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white shadow hover:bg-violet-700 disabled:opacity-50"
-          >
+          <Button type="submit" disabled={saveMut.isPending || settingsQuery.isLoading}>
             {saveMut.isPending ? "Saxlanılır…" : "Saxla"}
-          </button>
+          </Button>
         </form>
         {saveMut.isError ? <p className="mt-3 text-sm text-red-600">{errMsg(saveMut.error)}</p> : null}
-      </section>
+      </Card>
 
-      <section className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm">
+      <Card>
         <h2 className="text-lg font-semibold text-slate-900">Logo</h2>
         <p className="mt-1 text-sm text-slate-600">PNG, JPEG və ya WEBP, ən çox 2 MB. Tövsiyə: şəffaf fon, təxminən 200–400 px hündürlük.</p>
 
@@ -129,7 +156,61 @@ export default function AdminSettingsPage() {
         </div>
         {logoUploadMut.isError ? <p className="mt-3 text-sm text-red-600">{errMsg(logoUploadMut.error)}</p> : null}
         {logoDeleteMut.isError ? <p className="mt-3 text-sm text-red-600">{errMsg(logoDeleteMut.error)}</p> : null}
-      </section>
+      </Card>
+
+      <Card className="lg:col-span-2">
+        <h2 className="text-lg font-semibold text-slate-900">Ödəniş</h2>
+        <p className="mt-1 text-sm text-slate-600">
+          Aktiv driver seçin. Secret açarlar yalnız server .env-dədir (Payriff). Mock — test/E2E; Offline — yalnız kassa.
+        </p>
+        {payQ.isLoading ? (
+          <p className="mt-4 text-sm text-slate-500">Yüklənir…</p>
+        ) : (
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Aktiv driver</label>
+              <select
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                value={payDriver}
+                onChange={(e) => setPayDriver(e.target.value)}
+              >
+                {(payQ.data?.drivers ?? ["offline", "mock", "payriff"]).map((d) => (
+                  <option key={d} value={d}>
+                    {d}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-slate-700">Merchant (görünən)</label>
+              <input
+                className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                placeholder="İstəyə bağlı etiket"
+                value={merchantHint}
+                onChange={(e) => setMerchantHint(e.target.value)}
+              />
+            </div>
+            <label className="flex items-end gap-2 pb-2 text-sm text-slate-700">
+              <input type="checkbox" checked={walletOn} onChange={(e) => setWalletOn(e.target.checked)} />
+              Online balans artımı (UI)
+            </label>
+          </div>
+        )}
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <Button type="button" disabled={payMut.isPending || payQ.isLoading} onClick={() => payMut.mutate()}>
+            {payMut.isPending ? "Saxlanılır…" : "Ödəniş ayarlarını saxla"}
+          </Button>
+          {payQ.data ? (
+            <p className="text-xs text-slate-500">
+              Test: Payriff {payQ.data.payriff_configured ? "hazır" : "credential yox"} · Mock{" "}
+              {payQ.data.mock_available ? "aktiv ola bilər" : "—"}
+            </p>
+          ) : null}
+        </div>
+        {payMut.isError ? <p className="mt-3 text-sm text-red-600">{errMsg(payMut.error)}</p> : null}
+        {payMut.isSuccess ? <p className="mt-3 text-sm text-emerald-700">Saxlanıldı.</p> : null}
+      </Card>
+      </div>
     </div>
   );
 }

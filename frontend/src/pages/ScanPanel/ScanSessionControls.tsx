@@ -1,41 +1,69 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 import { listOperators } from "../../api/auth";
 import { listExams } from "../../api/exams";
-import { createScanSession, listScanSessions } from "../../api/scans";
+import { createScanSession, ensureScanSession, listScanSessions } from "../../api/scans";
 import { useAuthStore } from "../../store/authStore";
+import { formatDateTimeShort } from "../../utils/dateFormat";
 
 type Props = {
   examFilter: number | null;
   sessionId: number | null;
-  onSessionChange: (id: number | null) => void;
+  onSessionChange: (id: number | null, meta?: { status?: string }) => void;
 };
+
+function sessionStatusAz(status: string): string {
+  switch (status) {
+    case "pending":
+      return "yükləmə gözləyir";
+    case "processing":
+      return "emal olunur";
+    case "done":
+      return "bitib";
+    case "error":
+      return "xəta";
+    default:
+      return status;
+  }
+}
 
 export default function ScanSessionControls({ examFilter, sessionId, onSessionChange }: Props) {
   const user = useAuthStore((s) => s.user);
   const canManageSessions = user?.role === "admin" || user?.role === "manager";
+  const canNewBatch = user != null && user.role !== "student";
   const autoPickedRef = useRef(false);
+  const queryClient = useQueryClient();
 
-  const sessionsQuery = useQuery({ queryKey: ["scan-sessions"], queryFn: listScanSessions });
+  const sessionsQuery = useQuery({
+    queryKey: ["scan-sessions", examFilter],
+    queryFn: () => listScanSessions(examFilter ?? undefined),
+  });
   const examsQuery = useQuery({ queryKey: ["exams"], queryFn: () => listExams() });
   const operatorsQuery = useQuery({
     queryKey: ["operators"],
     queryFn: listOperators,
-    enabled: canManageSessions
+    enabled: canManageSessions,
   });
 
   const sessions = sessionsQuery.data ?? [];
+  const filteredSessions = examFilter != null ? sessions.filter((s) => s.exam_id === examFilter) : sessions;
+  const selected = filteredSessions.find((s) => s.id === sessionId) ?? null;
 
   useEffect(() => {
-    if (autoPickedRef.current || sessionId != null || !sessions.length) return;
-    if (examFilter) {
-      const match = sessions.find((s) => s.exam_id === examFilter);
-      if (match) {
-        autoPickedRef.current = true;
-        onSessionChange(match.id);
-      }
-    }
-  }, [sessions, examFilter, sessionId, onSessionChange]);
+    if (examFilter != null) return;
+    if (autoPickedRef.current || sessionId != null || !filteredSessions.length) return;
+    autoPickedRef.current = true;
+    onSessionChange(filteredSessions[0]!.id, { status: filteredSessions[0]!.status });
+  }, [examFilter, filteredSessions, sessionId, onSessionChange]);
+
+  const newBatchMut = useMutation({
+    mutationFn: () => ensureScanSession(examFilter!, true),
+    onSuccess: async (row) => {
+      await queryClient.invalidateQueries({ queryKey: ["scan-sessions", examFilter] });
+      onSessionChange(row.id, { status: row.status });
+      autoPickedRef.current = true;
+    },
+  });
 
   const createFormDefaults = () => {
     const ops = operatorsQuery.data ?? [];
@@ -46,7 +74,7 @@ export default function ScanSessionControls({ examFilter, sessionId, onSessionCh
       0;
     return {
       exam_id: examFilter ?? examsQuery.data?.[0]?.id ?? 0,
-      operator_id: user?.role === "operator" ? user.id : preferred
+      operator_id: user?.role === "operator" ? user.id : preferred,
     };
   };
 
@@ -62,34 +90,47 @@ export default function ScanSessionControls({ examFilter, sessionId, onSessionCh
     if (!exam_id || !operator_id) return;
     const row = await createScanSession({ exam_id, operator_id });
     sessionsQuery.refetch();
-    onSessionChange(row.id);
+    onSessionChange(row.id, { status: row.status });
     autoPickedRef.current = true;
   };
 
+  const defaults = createFormDefaults();
+
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h3 className="text-lg font-semibold text-slate-900">Skan oturumu</h3>
+      <h3 className="text-lg font-semibold text-slate-900">
+        {examFilter != null ? "Əvvəlki yoxlamalar (partiyalar)" : "Skan partiyası"}
+      </h3>
       <p className="mt-1 text-sm text-slate-600">
-        Oturum imtahana bağlıdır; yüklənən hər şəkil həmin imtahanın cavab açarı və cavab kartı şablonu ilə
-        OMR xidmətində yoxlanılır.
+        {examFilter != null
+          ? "Klassik imtahan kimi: bitmiş partiyanın nəticələri saxlanır. Yeni kartlar üçün ayrı partiya açın."
+          : "Skan partiyası — bir imtahan üçün yüklənən şəkillər toplusudur. İmtahan səhifəsindən gəlsəniz, partiya avtomatik açılır."}
       </p>
 
-      <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
-        <label className="flex min-w-[240px] flex-1 flex-col text-sm font-medium text-slate-700">
-          Aktiv oturum
+      <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-end">
+        <label className="flex min-w-[260px] flex-1 flex-col text-sm font-medium text-slate-700">
+          Partiya
           <select
             className="mt-1 rounded-md border border-slate-300 px-3 py-2 font-normal"
             value={sessionId ?? ""}
             onChange={(e) => {
               const v = e.target.value;
-              onSessionChange(v === "" ? null : Number(v));
+              if (v === "") {
+                onSessionChange(null);
+                return;
+              }
+              const id = Number(v);
+              const row = filteredSessions.find((s) => s.id === id);
+              onSessionChange(id, { status: row?.status });
             }}
           >
-            <option value="">— seçin —</option>
-            {sessions.map((s) => (
+            <option value="">— partiya seçin —</option>
+            {filteredSessions.map((s) => (
               <option key={s.id} value={s.id}>
-                №{s.id} · {s.exam_title ?? `İmtahan ${s.exam_id}`} · {s.operator_full_name ?? s.operator_id}{" "}
-                · {s.status}
+                №{s.id} · {s.processed_images}/{s.total_images} skan · {sessionStatusAz(s.status)}
+                {s.created_at ? ` · ${formatDateTimeShort(s.created_at)}` : ""}
+                {examFilter == null ? ` · ${s.operator_full_name ?? s.operator_id}` : ""}
+                {examFilter == null && s.exam_title ? ` · ${s.exam_title}` : ""}
               </option>
             ))}
           </select>
@@ -102,25 +143,53 @@ export default function ScanSessionControls({ examFilter, sessionId, onSessionCh
         >
           Yenilə
         </button>
+        {examFilter != null && canNewBatch && (
+          <button
+            type="button"
+            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
+            disabled={newBatchMut.isPending}
+            onClick={() => newBatchMut.mutate()}
+          >
+            {newBatchMut.isPending ? "Açılır…" : "Yeni partiya"}
+          </button>
+        )}
       </div>
-      {sessionsQuery.isError && (
-        <p className="mt-2 text-sm text-red-600">Oturum siyahısı yüklənmədi.</p>
+
+      {selected && (selected.status === "done" || selected.status === "error") && (
+        <p className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50/90 px-3 py-2 text-sm text-emerald-950">
+          Bu partiya {selected.status === "done" ? "bitib" : "xəta ilə bitib"} — yoxlanılmış cavablar aşağıda
+          saxlanır. Əlavə kart yükləmək üçün <strong>Yeni partiya</strong> basın.
+        </p>
       )}
 
-      {canManageSessions && (
+      {examFilter != null && filteredSessions.length === 0 && !sessionsQuery.isLoading && (
+        <p className="mt-2 text-sm text-slate-600">Bu imtahan üçün hələ skan partiyası yoxdur — yuxarıda avtomatik yaradılır.</p>
+      )}
+
+      {sessionsQuery.isError && (
+        <p className="mt-2 text-sm text-red-600">Partiya siyahısı yüklənmədi.</p>
+      )}
+      {newBatchMut.isError && (
+        <p className="mt-2 text-sm text-red-600">Yeni partiya açıla bilmədi.</p>
+      )}
+
+      {canManageSessions && examFilter == null && (
         <form
-          key={`new-scan-${operatorsQuery.isSuccess}-${operatorsQuery.data?.length ?? 0}-${operatorsQuery.isError ? "e" : "ok"}`}
+          key={`new-scan-${defaults.exam_id}-${defaults.operator_id}-all`}
           className="mt-6 border-t border-slate-100 pt-4"
           onSubmit={handleCreate}
         >
-          <h4 className="text-sm font-semibold text-slate-800">Yeni oturum</h4>
+          <h4 className="text-sm font-semibold text-slate-800">Yeni partiya (menecer)</h4>
+          <p className="mt-1 text-xs text-slate-500">
+            Köhnə nəticələr saxlanılır. Yeni yükləmə üçün ayrı partiya yaradın.
+          </p>
           <div className="mt-3 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
             <label className="flex flex-col text-sm">
               İmtahan
               <select
                 name="exam_id"
                 className="mt-1 min-w-[200px] rounded-md border border-slate-300 px-3 py-2"
-                defaultValue={createFormDefaults().exam_id || ""}
+                defaultValue={defaults.exam_id || ""}
                 required
               >
                 {(examsQuery.data ?? []).map((ex) => (
@@ -135,7 +204,7 @@ export default function ScanSessionControls({ examFilter, sessionId, onSessionCh
               <select
                 name="operator_id"
                 className="mt-1 min-w-[220px] rounded-md border border-slate-300 px-3 py-2"
-                defaultValue={createFormDefaults().operator_id || ""}
+                defaultValue={defaults.operator_id || ""}
                 required
                 disabled={operatorsQuery.isLoading || operatorsQuery.isError}
               >
@@ -151,29 +220,10 @@ export default function ScanSessionControls({ examFilter, sessionId, onSessionCh
               className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
               disabled={operatorsQuery.isLoading || !operatorsQuery.data?.length}
             >
-              Oturum yarat
+              Partiya yarat
             </button>
           </div>
-          {operatorsQuery.isLoading && (
-            <p className="mt-2 text-xs text-slate-600">İcraçı siyahısı yüklənir…</p>
-          )}
-          {operatorsQuery.isError && (
-            <p className="mt-2 text-xs text-red-600">
-              İcraçı siyahısı alınmadı (icazə və ya şəbəkə). Səhifəni yeniləyin və ya administratorla əlaqə saxlayın.
-            </p>
-          )}
-          {!operatorsQuery.isLoading && !operatorsQuery.isError && !operatorsQuery.data?.length && (
-            <p className="mt-2 text-xs text-amber-700">
-              Heç bir istifadəçi tapılmadı. Admin panelində ən azı bir administrator və ya menecer olmalıdır.
-            </p>
-          )}
         </form>
-      )}
-
-      {!canManageSessions && (
-        <p className="mt-4 border-t border-slate-100 pt-3 text-xs text-slate-500">
-          Yeni oturum yalnız menecer və ya administrator yarada bilər. Sizə təyin edilmiş oturumu yuxarıdan seçin.
-        </p>
       )}
     </section>
   );

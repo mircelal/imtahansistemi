@@ -1,5 +1,7 @@
 import { api } from "./client";
 
+export type QuestionType = "mcq" | "tf" | "grid_in" | "essay";
+
 export type Question = {
   id: number;
   exam_id: number;
@@ -9,7 +11,7 @@ export type Question = {
   subject_short_code: string | null;
   difficulty: string | null;
   order_index: number;
-  qtype: "mcq" | "tf";
+  qtype: QuestionType;
   stem: string;
   options: unknown;
   points: number;
@@ -26,7 +28,7 @@ export async function createQuestion(
   examId: number,
   payload: {
     order_index: number;
-    qtype: "mcq" | "tf";
+    qtype: QuestionType;
     stem: string;
     points?: number;
     options?: unknown;
@@ -43,6 +45,17 @@ export async function addQuestionFromBank(examId: number, payload: { bank_questi
   return data;
 }
 
+export async function addQuestionsFromBankBulk(
+  examId: number,
+  payload: { bank_question_ids: number[]; start_order_index?: number },
+) {
+  const { data } = await api.post<{ imported: number; skipped: number; errors: string[] }>(
+    `/api/exams/${examId}/questions/from-bank/bulk`,
+    payload,
+  );
+  return data;
+}
+
 export async function deleteQuestion(examId: number, questionId: number) {
   await api.delete(`/api/exams/${examId}/questions/${questionId}`);
 }
@@ -55,4 +68,27 @@ export async function importQuestionsCsv(examId: number, file: File) {
     form
   );
   return data;
+}
+
+export async function importQuestionsDocx(examId: number, file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  const { data } = await api.post<{ imported: number; skipped: number }>(
+    `/api/exams/${examId}/questions/import-docx`,
+    form,
+  );
+  return data;
+}
+
+export function qtypeLabel(qtype: string): string {
+  switch (qtype) {
+    case "tf":
+      return "D/Y";
+    case "grid_in":
+      return "Açıq (grid)";
+    case "essay":
+      return "Essay";
+    default:
+      return "MT";
+  }
 }

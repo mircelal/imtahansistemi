@@ -16,6 +16,12 @@ def _font_paths() -> tuple[str | None, str | None]:
         bld = os.path.join(env, "DejaVuSans-Bold.ttf")
         if os.path.isfile(reg):
             return reg, bld if os.path.isfile(bld) else reg
+    # Repo / app daxilində bündl edilmiş font
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    bundled = os.path.join(app_dir, "assets", "fonts", "DejaVuSans.ttf")
+    bundled_b = os.path.join(app_dir, "assets", "fonts", "DejaVuSans-Bold.ttf")
+    if os.path.isfile(bundled):
+        return bundled, bundled_b if os.path.isfile(bundled_b) else bundled
     base = "/usr/share/fonts/truetype/dejavu"
     reg = os.path.join(base, "DejaVuSans.ttf")
     bld = os.path.join(base, "DejaVuSans-Bold.ttf")
@@ -43,3 +49,13 @@ def register_pdf_fonts() -> tuple[str, str]:
         return "AzSans", "AzSans-Bold"
     _done = True
     return "Helvetica", "Helvetica-Bold"
+
+
+def pdf_font_embed_status() -> dict[str, str | bool]:
+    """Çap checklist: TTF tapılıbsa ReportLab «AzSans» ilə embed olunur."""
+    reg, bld = _font_paths()
+    return {
+        "ttf_normal_found": bool(reg),
+        "ttf_bold_found": bool(bld),
+        "mode": "AzSans_TTF" if reg else "Helvetica_fallback",
+    }

@@ -1,0 +1,69 @@
+# Cloudflare / public domain + Tunnel (https://bilik.sayt.cam)
+# İşə salma:
+#   docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up --build -d
+# Tunnel yeniləndikdən sonra (vacib — ikisi birlikdə):
+#   docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml up -d --force-recreate cloudflared tunnel-bridge
+#
+# XƏBƏRDARLIQ: Windows-da ayrıca cloudflared.exe (Laragon/sistem xidməti) EYNİ token ilə
+# işləməsin — Cloudflare sorğuları ölü localhost:3002 origin-ə düşər (502/520).
+# Zero Trust → Tunnel → Public Hostname: http://gateway:80 (tövsiyə) və ya https://localhost:3002 + tunnel-bridge.
+
+services:
+  gateway:
+    image: nginx:alpine
+    restart: unless-stopped
+    expose:
+      - "80"
+    ports:
+      # Yerli test: http://127.0.0.1:3003 (3002 cloudflared/tunnel-bridge TLS üçündür)
+      - "127.0.0.1:3003:80"
+    volumes:
+      - ./nginx/gateway.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
+
+  # Cloudflare panelində origin https://localhost:3002 olduqda — cloudflared ilə eyni şəbəkə adasında TLS köprü.
+  tunnel-bridge:
+    image: nginx:alpine
+    restart: unless-stopped
+    network_mode: service:cloudflared
+    volumes:
+      - ./nginx/tunnel-bridge.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./cloudflared/certs:/etc/nginx/certs:ro
+    depends_on:
+      cloudflared:
+        condition: service_started
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yml run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    volumes:
+      - ./cloudflared/config.yml:/etc/cloudflared/config.yml:ro
+    depends_on:
+      gateway:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        VITE_API_BASE_URL: ""
+    expose:
+      - "80"
+    ports: !reset []
+    environment: !reset []
+    volumes: !reset []
+
+  backend:
+    ports: !reset []
+
+  omr-service:
+    ports: !reset []
+
+  minio:
+    ports: !reset []

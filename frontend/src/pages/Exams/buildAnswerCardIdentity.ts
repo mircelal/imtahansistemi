@@ -4,8 +4,14 @@
  * altında şagird kodu / məktəb / sinif və qrup–variant–bölmə və s.
  */
 
+import { IDENTITY_STACK_GAP_MM, identityZoneTopMmRef, LAYOUT_CONTENT_LEFT_MM } from "../../constants/sheetLayoutSpec";
 import { DEFAULT_SHEET_CONFIG } from "../AnswerSheetDesigner/hooks/useSheetConfig";
-import { estimateBlockHeightMm, estimateBlockWidthMm, type LayoutField } from "../AnswerSheetDesigner/layoutBlockModel";
+import {
+  defaultDimMcqMatchInfo,
+  estimateBlockHeightMm,
+  estimateBlockWidthMm,
+  type LayoutField,
+} from "../AnswerSheetDesigner/layoutBlockModel";
 
 export type AnswerCardIdentitySelection = {
   student_code: boolean;
@@ -49,42 +55,28 @@ export const DIM_VL_COLS_FN = 6;
 export const DIM_NAME_ROWS = 4;
 export const DIM_COLUMN_LETTERS_COUNT = 14;
 
-const IDENTITY_X_MM = 19.0;
+const IDENTITY_X_MM = LAYOUT_CONTENT_LEFT_MM;
+/** Üfüqi: AD | SOYAD | ATA sütunları arası */
 const FIELD_STACK_GAP_MM = 3.0;
-/** `layoutBlockModel.identityZoneTopMmRef` + 10 ilə sinxron */
-const IDENTITY_BLOCK_START_Y_MM = 26.5;
+/** PDF `identity_zone_top_mm + 3 + 7` ilə sinxron (şəxsiyyət bloklarının birinci sətri) */
+const IDENTITY_BLOCK_START_Y_MM = identityZoneTopMmRef() + 10;
+/** Şaquli hərflərə DİM tipli sıxlıq pitch-i; PDF generator həm də bu sahə-səviyyəli açarı oxuyur */
+const VERTICAL_LETTERS_BUBBLE_PITCH_MM = 3.0;
+
+/** Bütün estimasiyalar üçün MCQ-match info — PDF-də gerçəkdən çəkilən boyu görmək üçün */
+const MCQ_MATCH = defaultDimMcqMatchInfo(DEFAULT_SHEET_CONFIG);
 
 function colPitchMm(): number {
   const c = DEFAULT_SHEET_CONFIG;
   return Math.max(c.identity_letter_d_mm + 0.12, c.identity_letter_hgap_mm);
 }
 
-/** Bir sıra kompakt digit_groups + başlıq üçün təxmini mm */
-function compactDigitBandHeightMm(twoRows: boolean): number {
-  const ch = 9.0 * 4.15 + 4.0;
-  return ch + (twoRows ? ch + 8.0 : 6.0) + 4.8;
+function fieldHeightForOverlay(f: Record<string, unknown>): number {
+  return estimateBlockHeightMm(f as unknown as LayoutField, DEFAULT_SHEET_CONFIG, MCQ_MATCH);
 }
 
-function fieldHeightForOverlay(f: Record<string, unknown>): number {
-  const k = f.kind as string;
-  if (k === "vertical_letters") {
-    return estimateBlockHeightMm(f as unknown as LayoutField, DEFAULT_SHEET_CONFIG);
-  }
-  if (k === "horizontal_letters") {
-    const rows = Number(f.rows ?? 4);
-    const hw_h = 5.0;
-    const hw_gap = 1.4;
-    const ld = 3.05;
-    const rowPitch = hw_h + hw_gap + ld + 1.5;
-    return 5.0 + 6.0 + rows * rowPitch + 5.0;
-  }
-  if (k === "digit_groups") {
-    const gr = f.groups as unknown[] | undefined;
-    return compactDigitBandHeightMm((gr?.length ?? 0) >= 3);
-  }
-  if (k === "mcq_groups") return 22.0;
-  if (k === "mcq") return 16.0;
-  return 24.0;
+function fieldWidthForOverlay(f: Record<string, unknown>): number {
+  return estimateBlockWidthMm(f as unknown as LayoutField, DEFAULT_SHEET_CONFIG, MCQ_MATCH);
 }
 
 export function buildIdentityFieldsFromSelection(s: AnswerCardIdentitySelection): Record<string, unknown>[] {
@@ -106,15 +98,16 @@ export function buildIdentityFieldsFromSelection(s: AnswerCardIdentitySelection)
       label: spec.label,
       columns: spec.cols,
       col_pitch_mm: pitch,
+      bubble_pitch_mm: VERTICAL_LETTERS_BUBBLE_PITCH_MM,
       x_mm: xRun,
       y_mm: yCursor,
     };
     fields.push(b);
     maxNameH = Math.max(maxNameH, fieldHeightForOverlay(b));
-    xRun += estimateBlockWidthMm(b as unknown as LayoutField, DEFAULT_SHEET_CONFIG) + FIELD_STACK_GAP_MM;
+    xRun += fieldWidthForOverlay(b) + FIELD_STACK_GAP_MM;
   }
   if (nameSpecs.length > 0) {
-    yCursor += maxNameH + FIELD_STACK_GAP_MM;
+    yCursor += maxNameH + IDENTITY_STACK_GAP_MM;
   }
 
   const primaryDigits: { id: string; label: string; count: number }[] = [];
@@ -137,49 +130,73 @@ export function buildIdentityFieldsFromSelection(s: AnswerCardIdentitySelection)
       row.layout = "two_rows";
     }
     fields.push(row);
-    yCursor += fieldHeightForOverlay(row) + FIELD_STACK_GAP_MM;
+    yCursor += fieldHeightForOverlay(row) + IDENTITY_STACK_GAP_MM;
   }
 
   if (s.phone) {
-    fields.push({
+    const phoneRow: Record<string, unknown> = {
       kind: "digit_groups",
       compact: true,
       x_mm: IDENTITY_X_MM,
       y_mm: yCursor,
       groups: [{ id: "ph", label: "Əlaqə nömrəsi", count: 9 }],
-    });
-    yCursor += compactDigitBandHeightMm(false) + FIELD_STACK_GAP_MM;
+    };
+    fields.push(phoneRow);
+    yCursor += fieldHeightForOverlay(phoneRow) + IDENTITY_STACK_GAP_MM;
   }
 
   const mcqGroups: { id: string; label: string; options: string[] }[] = [];
   if (s.group) mcqGroups.push({ id: "grp", label: "Qrup", options: ["1", "2", "3", "4", "5"] });
   if (s.variant) mcqGroups.push({ id: "var", label: "Variant", options: ["A", "B", "C", "D"] });
   if (s.section) mcqGroups.push({ id: "sec", label: "Bölmə", options: ["Az", "RU", "GÜ"] });
+  let mcqRowY = yCursor;
+  let mcqRowH = 0;
   if (mcqGroups.length > 0) {
-    fields.push({
+    const mqRow: Record<string, unknown> = {
       kind: "mcq_groups",
       x_mm: IDENTITY_X_MM,
       y_mm: yCursor,
       groups: mcqGroups,
-    });
-    yCursor += 22.0 + FIELD_STACK_GAP_MM;
+    };
+    fields.push(mqRow);
+    mcqRowY = yCursor;
+    mcqRowH = fieldHeightForOverlay(mqRow);
+    yCursor += mcqRowH + IDENTITY_STACK_GAP_MM;
   }
 
   if (s.foreign_lang) {
-    fields.push({
+    const langField: Record<string, unknown> = {
       kind: "mcq",
       id: "lang",
       label: "Xarici dil",
       x_mm: IDENTITY_X_MM,
       y_mm: yCursor,
       options: ["In", "Ru", "Al", "Fr", "Dr"],
-    });
+    };
+    // mcq_groups varsa, foreign_lang-ı eyni sətirdə yan-yana qoyuruq (yMax böyütməsin)
+    if (mcqGroups.length > 0) {
+      const mqRow = fields[fields.length - 1];
+      const mqW = fieldWidthForOverlay(mqRow);
+      const langW = fieldWidthForOverlay(langField);
+      const proposedX = IDENTITY_X_MM + mqW + 4.0;
+      const rightMaxA4 = 210 - 12 - 2.5;
+      if (proposedX + langW <= rightMaxA4) {
+        langField.x_mm = proposedX;
+        langField.y_mm = mcqRowY;
+        // yCursor-u geri çəkmirik — sonrakı sahə artıq mcq_groups altından başlayacaq
+        yCursor = mcqRowY + Math.max(mcqRowH, fieldHeightForOverlay(langField)) + IDENTITY_STACK_GAP_MM;
+      }
+    }
+    fields.push(langField);
   }
 
   return fields;
 }
 
-export function buildAnswerSheetIdentityOverlay(s: AnswerCardIdentitySelection): Record<string, unknown> {
+export function buildAnswerSheetIdentityOverlay(
+  s: AnswerCardIdentitySelection,
+  paperSize: "A4" | "A3" | "A4L" | "A3L" = "A4",
+): Record<string, unknown> {
   let identity_fields = buildIdentityFieldsFromSelection(s);
   if (identity_fields.length === 0) {
     identity_fields = buildIdentityFieldsFromSelection(defaultAnswerCardIdentity());
@@ -192,8 +209,10 @@ export function buildAnswerSheetIdentityOverlay(s: AnswerCardIdentitySelection):
     yMax = Math.max(yMax, y + h);
   }
 
-  /** Şəbəkə şəxsiyyət zonasından dərhal sonra başlasın (DİM tipli sıxlıq üçün sabit 188 mm floor istifadə etmə). */
-  const mcqTop = Math.min(248.0, Math.max(yMax + 10.0, 92.0));
+  // Şəbəkə şəxsiyyət bloklarının altından `MCQ_IDENTITY_SEP_MM` (~10mm) ayrıldıqdan sonra
+  // başlasın. Backend `apply_layout_publish_guards` lazım olsa iki səhifə açır;
+  // burada yalnız ağıllı başlanğıc dəyəri qoyuruq. A4-də absolute maksimum ~274.25mm.
+  const mcqTop = Math.min(274.25, Math.max(yMax + 10.0, 92.0));
 
   return {
     layout_mode: "freeform",
@@ -204,6 +223,7 @@ export function buildAnswerSheetIdentityOverlay(s: AnswerCardIdentitySelection):
     identity_sn_rows: DIM_NAME_ROWS,
     identity_fn_rows: DIM_NAME_ROWS,
     single_page_layout: true,
+    paper_size: paperSize,
     mcq_grid: { top_mm: mcqTop },
   };
 }

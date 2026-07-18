@@ -19,5 +19,6 @@ The greenfield **Node + Express + react-pdf** monorepo option was **rejected** (
 
 ## Next Steps
 
-- If OMR two-page scanning is required, the worker/processor should be extended to a pipeline that merges both pages.
+- ~~If OMR two-page scanning is required, the worker/processor should be extended to a pipeline that merges both pages.~~ **Done:** `omr_two_page_stitched` + worker stitch.
+- **Open questions (2026-07):** `QuestionType.GRID_IN` / `ESSAY`; cavab kartında `open_blocks`; A3 qatlanan format `sheet_format: a3_duplex_fold` (4 A4 panel).
 - Annex API names are not 1:1 with Express; functional equivalents are kept in FastAPI routers.

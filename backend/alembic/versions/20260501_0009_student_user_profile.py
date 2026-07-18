@@ -16,7 +16,7 @@ depends_on = None
 def upgrade() -> None:
     conn = op.get_bind()
     if conn.dialect.name == "postgresql":
-        op.execute(sa.text("ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'student'"))
+        op.execute(sa.text("ALTER TYPE userrole ADD VALUE IF NOT EXISTS 'STUDENT'"))
 
     op.add_column(
         "users",

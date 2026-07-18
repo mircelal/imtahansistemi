@@ -2,6 +2,9 @@
 .env
 *.env.local
 
+# Cloudflare tunnel local TLS (generated)
+cloudflared/certs/*.pem
+
 # Node
 node_modules/
 dist/

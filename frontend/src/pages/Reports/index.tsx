@@ -1,113 +1,114 @@
-import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
-import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api } from "../../api/client";
-
-type Summary = {
-  average: number;
-  minimum: number;
-  maximum: number;
-  std_dev: number;
-  participation: number;
-  histogram: { from: number; to: number; count: number }[];
-};
-
-async function fetchSummary(examId: number) {
-  const { data } = await api.get<Summary>(`/api/reports/exams/${examId}/summary`);
-  return data;
-}
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
+import { downloadReportExport, fetchExamReportDetail, fetchReportsOverview } from "../../api/reports";
+import PageHeader from "../../components/ui/PageHeader";
+import ReportsExamDetailPanel from "./components/ReportsExamDetailPanel";
+import ReportsExamList from "./components/ReportsExamList";
+import ReportsOverviewKpis from "./components/ReportsOverviewKpis";
 
 export default function ReportsPage() {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const fromUrl = Number(searchParams.get("exam") || "0");
-  const [examId, setExamId] = useState(fromUrl > 0 ? fromUrl : 1);
+  const [examId, setExamId] = useState<number | null>(fromUrl > 0 ? fromUrl : null);
+  const autoPickedRef = useRef(false);
 
-  useEffect(() => {
-    if (fromUrl > 0) setExamId(fromUrl);
-  }, [fromUrl]);
-  const summaryQ = useQuery({
-    queryKey: ["report-summary", examId],
-    queryFn: () => fetchSummary(examId),
-    enabled: examId > 0
+  const overviewQ = useQuery({
+    queryKey: ["reports-overview"],
+    queryFn: fetchReportsOverview,
+    staleTime: 30_000,
   });
 
-  const chartData =
-    summaryQ.data?.histogram.map((b, i) => ({
-      name: `${b.from.toFixed(0)}–${b.to.toFixed(0)}`,
-      count: b.count,
-      key: i
-    })) ?? [];
+  useEffect(() => {
+    if (fromUrl > 0) {
+      setExamId(fromUrl);
+      return;
+    }
+    if (autoPickedRef.current || overviewQ.isLoading || !overviewQ.data) return;
+    const suggested = overviewQ.data.totals.suggested_exam_id;
+    if (suggested) {
+      autoPickedRef.current = true;
+      setExamId(suggested);
+      const next = new URLSearchParams(searchParams);
+      next.set("exam", String(suggested));
+      setSearchParams(next, { replace: true });
+    }
+  }, [fromUrl, overviewQ.data, overviewQ.isLoading, searchParams, setSearchParams]);
 
-  const download = async (kind: "pdf" | "excel") => {
-    const res = await api.get(`/api/reports/exams/${examId}/export/${kind}`, { responseType: "blob" });
-    const blob = new Blob([res.data]);
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `imtahan-${examId}.${kind === "excel" ? "xlsx" : "pdf"}`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  const selectExam = useCallback(
+    (id: number) => {
+      setExamId(id);
+      const next = new URLSearchParams(searchParams);
+      next.set("exam", String(id));
+      setSearchParams(next, { replace: true });
+    },
+    [searchParams, setSearchParams],
+  );
+
+  const detailQ = useQuery({
+    queryKey: ["report-detail", examId],
+    queryFn: () => fetchExamReportDetail(examId!),
+    enabled: examId != null && examId > 0,
+    staleTime: 20_000,
+  });
+
+  const exportMut = useMutation({
+    mutationFn: (kind: "pdf" | "excel") => downloadReportExport(examId!, kind),
+  });
+
+  const overview = overviewQ.data;
+  const exams = overview?.exams ?? [];
 
   return (
-    <div className="mx-auto max-w-4xl space-y-6">
-      <h1 className="text-2xl font-bold text-slate-900">Hesabatlar</h1>
+    <div className="page-container-wide space-y-5">
+      <PageHeader
+        title="Nəticələr və analitika"
+        subtitle="İmtahan performansı, sual analizi, reyting və export — sektor standartı hesabat paneli."
+      />
 
-      <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <label className="mb-2 block text-sm font-medium text-slate-700">İmtahan ID</label>
-        <div className="flex flex-wrap gap-2">
-          <input
-            type="number"
-            className="w-32 rounded-md border border-slate-300 px-3 py-2"
-            value={examId}
-            min={1}
-            onChange={(e) => setExamId(Number(e.target.value))}
-          />
+      {overviewQ.isLoading ? (
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="h-24 animate-pulse rounded-2xl bg-slate-100" />
+          ))}
         </div>
-      </section>
+      ) : overview ? (
+        <ReportsOverviewKpis totals={overview.totals} />
+      ) : null}
 
-      {summaryQ.isLoading && <p className="text-slate-600">Yüklənir...</p>}
-      {summaryQ.data && (
-        <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-          <h2 className="mb-2 text-lg font-semibold">Ümumi göstəricilər</h2>
-          <p className="text-sm text-slate-600">
-            İştirak: {summaryQ.data.participation} · Orta: {summaryQ.data.average.toFixed(2)} · Min:{" "}
-            {summaryQ.data.minimum.toFixed(2)} · Max: {summaryQ.data.maximum.toFixed(2)} · Std:{" "}
-            {summaryQ.data.std_dev.toFixed(2)}
-          </p>
-          {chartData.length > 0 && (
-            <div className="mt-4 h-64 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartData}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
-                  <YAxis allowDecimals={false} />
-                  <Tooltip />
-                  <Bar dataKey="count" fill="#4f46e5" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          )}
-        </section>
+      {overviewQ.isError && (
+        <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900">
+          Hesabat xülasəsi yüklənmədi. Səhifəni yeniləyin.
+        </div>
       )}
 
-      <section className="flex flex-wrap gap-3 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <button
-          type="button"
-          className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800"
-          onClick={() => download("excel")}
-        >
-          Excel yüklə
-        </button>
-        <button
-          type="button"
-          className="rounded-md border border-slate-300 px-4 py-2 text-sm font-medium text-slate-800 hover:bg-slate-50"
-          onClick={() => download("pdf")}
-        >
-          PDF yüklə
-        </button>
-      </section>
+      {exams.length === 0 && !overviewQ.isLoading ? (
+        <div className="rounded-2xl border border-dashed border-slate-300 bg-gradient-to-br from-slate-50 to-indigo-50/30 p-10 text-center">
+          <h2 className="text-lg font-semibold text-slate-900">Hələ imtahan yoxdur</h2>
+          <p className="mt-2 text-sm text-slate-600">İlk imtahanı yaradın, cavab kartlarını skan edin — hesabatlar avtomatik dolacaq.</p>
+          <div className="mt-5 flex flex-wrap justify-center gap-3">
+            <Link to="/exams" className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700">
+              İmtahan yarat
+            </Link>
+            <Link to="/scan" className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium hover:bg-slate-50">
+              Skana keç
+            </Link>
+          </div>
+        </div>
+      ) : (
+        <div className="grid gap-4 lg:grid-cols-[minmax(240px,280px)_1fr] lg:items-start">
+          <div className="lg:sticky lg:top-4 lg:max-h-[calc(100vh-8rem)]">
+            <ReportsExamList exams={exams} selectedId={examId} onSelect={selectExam} />
+          </div>
+          <ReportsExamDetailPanel
+            detail={detailQ.data}
+            loading={detailQ.isLoading && examId != null}
+            examId={examId ?? 0}
+            onExport={(kind) => exportMut.mutate(kind)}
+            exporting={exportMut.isPending}
+          />
+        </div>
+      )}
     </div>
   );
 }

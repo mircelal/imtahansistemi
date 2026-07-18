@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 from app.schemas.common import ORMModel
 
@@ -13,7 +13,8 @@ class LoginRequest(BaseModel):
 class BootstrapAdminRequest(BaseModel):
     email: EmailStr
     full_name: str
-    password: str
+    password: str = Field(min_length=8)
+    setup_token: str | None = None
 
 
 class TokenResponse(BaseModel):

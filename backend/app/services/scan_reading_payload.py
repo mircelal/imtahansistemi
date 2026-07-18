@@ -72,6 +72,52 @@ def split_detected_answers(raw: dict[str, Any] | None) -> tuple[dict[str, Any], 
     return meta, identity, mcq
 
 
+def _join_detected_chars(
+    detected: dict[str, Any],
+    *,
+    prefix: str,
+    count: int,
+    zfill: int | None,
+) -> str:
+    chars: list[str] = []
+    for i in range(1, count + 1):
+        key = f"id_{prefix}{i:0{zfill}d}" if zfill else f"id_{prefix}{i}"
+        v = str(detected.get(key) or "").strip()
+        if v:
+            chars.append(v)
+    return "".join(chars)
+
+
+def compose_card_identity(detected: dict[str, Any] | None) -> dict[str, str]:
+    """
+    OMR `id_*` sahələrindən insanoxunan kart şəxsiyyəti.
+    DB-də şagird olmasa belə skan nəticəsində göstərilir.
+    """
+    det = detected or {}
+    first = _join_detected_chars(det, prefix="ad", count=7, zfill=2)
+    last = _join_detected_chars(det, prefix="sn", count=8, zfill=2)
+    father = _join_detected_chars(det, prefix="fn", count=6, zfill=2)
+    code = _join_detected_chars(det, prefix="student_code", count=6, zfill=None)
+    school = _join_detected_chars(det, prefix="sch", count=3, zfill=None)
+    klass = _join_detected_chars(det, prefix="cl", count=2, zfill=None)
+    name_parts = [p for p in (first, last, father) if p]
+    full_name = " ".join(name_parts)
+    out: dict[str, str] = {
+        "student_code": code,
+        "first_name": first,
+        "last_name": last,
+        "father_name": father,
+        "full_name": full_name,
+        "school": school,
+        "class": klass,
+        "variant": str(det.get("id_var") or "").strip(),
+        "group": str(det.get("id_grp") or "").strip(),
+        "section": str(det.get("id_sec") or "").strip(),
+        "language": str(det.get("id_lang") or "").strip(),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
 def build_identity_key_labels(template_config: dict[str, Any] | None) -> dict[str, str]:
     """
     OMR sütun adı (id_*) → insan oxunuşlu etiket (şablon identity_fields əsasında).
@@ -186,6 +232,7 @@ def build_scan_reading_dict(
     if answer_keys:
         effective_answer_key = build_effective_answer_key(answer_keys, sheet_key_raw)
 
+    identity_summary = compose_card_identity(raw)
     out: dict[str, Any] = {
         "version": READING_VERSION,
         "scan_result_id": result.id,
@@ -201,6 +248,7 @@ def build_scan_reading_dict(
         "processed_at": result.processed_at.isoformat() if result.processed_at else None,
         "field_labels": field_labels,
         "identity": identity,
+        "identity_summary": identity_summary,
         "mcq": dict(sorted(mcq.items(), key=lambda kv: int(re.sub(r"\D", "", kv[0]) or 0))),
         "meta": meta,
         "raw_detected": raw,

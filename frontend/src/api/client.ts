@@ -1,18 +1,15 @@
 import axios from "axios";
 
 /**
- * Boş / təyin edilməyibsə: DEV mühitində nisbi URL (/api → Vite proxy).
- * Əks halda birbaşa backend ünvanı (məs. Docker üçün .env-də http://localhost:8000).
+ * Boş / təyin edilməyibsə: nisbi URL (/api → eyni origin nginx gateway və ya Vite proxy).
+ * Ayrıca backend hostu lazımdırsa .env-də VITE_API_BASE_URL təyin edin.
  */
 function resolveBaseURL(): string {
   const raw = import.meta.env.VITE_API_BASE_URL;
   if (raw != null && String(raw).trim() !== "") {
     return String(raw).trim().replace(/\/$/, "");
   }
-  if (import.meta.env.DEV) {
-    return "";
-  }
-  return "http://localhost:8000";
+  return "";
 }
 
 export const api = axios.create({

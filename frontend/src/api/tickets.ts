@@ -13,6 +13,11 @@ export type ExamTicket = {
   ends_at: string | null;
   is_active: boolean;
   created_at: string;
+  confirmed_count?: number;
+  remaining_quota?: number | null;
+  sale_status?: string;
+  exam_title?: string | null;
+  exam_scope?: string | null;
 };
 
 export type TicketOrder = {
@@ -27,8 +32,10 @@ export type TicketOrder = {
   created_at: string;
 };
 
-export async function listCourseTickets(courseId: number) {
-  const { data } = await api.get<ExamTicket[]>(`/api/courses/${courseId}/tickets`);
+export async function listCourseTickets(courseId: number, examId?: number) {
+  const { data } = await api.get<ExamTicket[]>(`/api/courses/${courseId}/tickets`, {
+    params: examId != null ? { exam_id: examId } : undefined
+  });
   return data;
 }
 
@@ -47,6 +54,24 @@ export async function createTicket(
   }
 ) {
   const { data } = await api.post<ExamTicket>(`/api/courses/${courseId}/tickets`, payload);
+  return data;
+}
+
+export async function updateTicket(
+  ticketId: number,
+  payload: Partial<{
+    title: string;
+    description: string | null;
+    price_amount: number;
+    currency: string;
+    quota: number | null;
+    starts_at: string | null;
+    ends_at: string | null;
+    is_active: boolean;
+    exam_id: number | null;
+  }>
+) {
+  const { data } = await api.put<ExamTicket>(`/api/tickets/${ticketId}`, payload);
   return data;
 }
 

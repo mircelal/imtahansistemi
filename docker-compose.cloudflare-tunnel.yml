@@ -1,0 +1,17 @@
+# Cloudflare Tunnel (Laragon/Windows-da 80 portu məşğul olanda ən rahat yol).
+# 1) Cloudflare Zero Trust → Networks → Tunnels → Create tunnel
+# 2) Docker connector seçin, tokeni kopyalayın
+# 3) Public Hostname: sizin-domain.com → http://gateway:80
+# 4) .env: CLOUDFLARE_TUNNEL_TOKEN=eyJ...
+# 5) docker compose -f docker-compose.yml -f docker-compose.cloudflare.yml --profile tunnel up -d --build
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      gateway:
+        condition: service_started
+    profiles:
+      - tunnel

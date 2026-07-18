@@ -17,4 +17,8 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    # Uzun OMR task-ları — ehtiyatda çox iş toplamamaq
+    worker_prefetch_multiplier=1,
 )

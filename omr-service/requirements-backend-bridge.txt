@@ -1,0 +1,4 @@
+# get_omr_template (app.services.pdf_generator) üçün — PDF ilə eyni OMR şablonu
+reportlab==4.4.0
+qrcode[pil]==8.2
+pymupdf==1.25.5

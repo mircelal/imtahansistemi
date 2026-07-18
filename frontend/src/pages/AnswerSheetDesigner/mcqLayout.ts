@@ -1,9 +1,20 @@
 /**
  * MCQ şəbəkəsi ölçüləri — backend dim_sheet_layout.py ilə eyni məntiq.
  */
-import type { SheetConfig } from "./hooks/useSheetConfig";
+import {
+  LAYOUT_CONTENT_LEFT_MM,
+  layoutContentRightMaxMm,
+  MIN_FREE_FORM_MCQ_RESERVE_MM,
+  MIN_GRID_ABOVE_FOOTER_MM,
+  SAFE_CONTENT_INSET_MM,
+} from "../../constants/sheetLayoutSpec";
+import type { McqSection, SheetConfig } from "./hooks/useSheetConfig";
 import type { LayoutField } from "./layoutBlockModel";
-import { estimateFreeformIdentityHeightMm } from "./layoutBlockModel";
+import {
+  estimateFreeformIdentityHeightMm,
+  identityFieldsBottomMm,
+  resolveMcqGridTopAnchorMm,
+} from "./layoutBlockModel";
 
 const L = {
   margin: 12.0,
@@ -18,7 +29,7 @@ const L = {
   /** Şaquli MCQ: mcq_hgap_mm yoxdursa (backend L_BASE ilə eyni) */
   mcq_tower_strip_gap: 3.35,
   /** Backend L_BASE.mcq_tower_opt_min_clear_mm — şaquli variant dairələri üst-üstə düşməsin */
-  mcq_tower_opt_min_clear_mm: 1.0,
+  mcq_tower_opt_min_clear_mm: 1.05,
 };
 
 /** Şəxsiyyət bitənə qədər MCQ-yə boşluq — dim_sheet_layout L_BASE.sep_v ilə sinxron */
@@ -60,7 +71,12 @@ export function towerNumLabelBoxWidthMm(stripPitchMm: number, numCellMm: number)
 }
 
 export function contentLeftMm(): number {
-  return L.margin + TIMING;
+  return LAYOUT_CONTENT_LEFT_MM;
+}
+
+/** Məzmun üçün sağ təhlükəsiz sərhəd (mm) — layout_audit `right_max` ilə eyni */
+export function contentRightMaxMm(pageWidthMm: number): number {
+  return layoutContentRightMaxMm(pageWidthMm);
 }
 
 export function paperDimensionsMm(paper: SheetConfig["paper_size"]): { w: number; h: number } {
@@ -346,8 +362,32 @@ export function solveMcqSpacingSinglePage(
   return [Math.max(4.0, bd), vgap];
 }
 
-function clampMcqHgapMm(h: number): number {
-  return Math.max(3.2, Math.min(12.0, h));
+/** Üfüqi variant pitch: tower strip (~3.35) qarışmasın; min = Ø + 0.5. */
+export function horizontalOptionPitchMm(cfg: SheetConfig, bubbleDMm?: number): number {
+  const bd = Math.max(2.8, Math.min(8.5, bubbleDMm ?? cfg.mcq_bubble_d_mm ?? L.bubble_d));
+  const raw = cfg.mcq_hgap_mm;
+  let h = raw == null || !Number.isFinite(raw) ? L.hgap : Number(raw);
+  if (h + 1e-6 < bd) {
+    h = L.hgap;
+  }
+  return Math.max(bd + 0.5, Math.min(12.0, h));
+}
+
+export function fitHorizontalRowPitch(
+  colWMm: number,
+  options: number,
+  bubbleDMm: number,
+  hgapMm: number,
+  qNumWMm = L.q_num_w,
+): number {
+  const opts = Math.max(1, options);
+  const bd = Math.max(2.8, bubbleDMm);
+  const pad = 1.5;
+  if (opts <= 1) return hgapMm;
+  const needed = qNumWMm + (opts - 1) * hgapMm + bd + pad;
+  if (needed <= colWMm + 1e-6) return hgapMm;
+  const maxHg = (colWMm - qNumWMm - bd - pad) / (opts - 1);
+  return Math.max(bd + 0.5, Math.min(hgapMm, maxHg));
 }
 
 /** Backend `resolve_mcq_spacing`: (bubbleD, vgap, hgap, numCell). numCell>0 → DIM şaquli sütunlar. */
@@ -366,14 +406,17 @@ export function resolveMcqSpacing(
   const availW = Math.max(10.0, pwMm - left - L.margin);
 
   if (mcqOptionsHorizontal(cfg)) {
-    const hgH = cfg.mcq_hgap_mm ?? L.hgap;
-    const hg = clampMcqHgapMm(Number.isFinite(hgH) ? hgH : L.hgap);
+    let bd: number;
+    let vg: number;
     if (auto) {
-      const [bd, vg] = solveMcqSpacingSinglePage(phMm, cols, qCount, gtMm);
-      return [bd, vg, hg, 0];
+      [bd, vg] = solveMcqSpacingSinglePage(phMm, cols, qCount, gtMm);
+    } else {
+      bd = Math.max(2.8, Math.min(8.5, cfg.mcq_bubble_d_mm));
+      vg = Math.max(3.0, Math.min(14.0, cfg.mcq_vgap_mm));
     }
-    const bd = Math.max(2.8, Math.min(8.5, cfg.mcq_bubble_d_mm));
-    const vg = Math.max(3.0, Math.min(14.0, cfg.mcq_vgap_mm));
+    let hg = horizontalOptionPitchMm(cfg, bd);
+    const colW = availW / Math.max(1, cols);
+    hg = fitHorizontalRowPitch(colW, options, bd, hg);
     return [bd, vg, hg, 0];
   }
 
@@ -395,6 +438,9 @@ export type McqColumnBlock = {
   col_w: number;
   fbx: number;
   fby: number;
+  _bd?: number;
+  _vg?: number;
+  _hg?: number;
 };
 
 export type McqTowerRowBlock = {
@@ -414,10 +460,234 @@ export type McqTowerRowBlock = {
   first_by_mm: number;
 };
 
-export type McqBlock = McqColumnBlock | McqTowerRowBlock;
+export type McqSectionTitleBlock = {
+  layout: "mcq_section_title";
+  title: string;
+  y_mm: number;
+  left_mm: number;
+  width_mm: number;
+  section_index: number;
+};
+
+export type McqBlock = McqColumnBlock | McqTowerRowBlock | McqSectionTitleBlock;
 
 export function isTowerRowBlock(b: McqBlock): b is McqTowerRowBlock {
   return (b as McqTowerRowBlock).layout === "mcq_tower_row";
+}
+
+export function isSectionTitleBlock(b: McqBlock): b is McqSectionTitleBlock {
+  return (b as McqSectionTitleBlock).layout === "mcq_section_title";
+}
+
+export function isColumnBlock(b: McqBlock): b is McqColumnBlock {
+  return !isTowerRowBlock(b) && !isSectionTitleBlock(b);
+}
+
+export const MCQ_SECTION_TITLE_H_MM = 6.2;
+export const MCQ_SECTION_GAP_MM = 3.5;
+
+export function resolveMcqSections(cfg: SheetConfig): McqSection[] {
+  if (cfg.mcq_sections?.length) return cfg.mcq_sections;
+  const q = Math.max(1, cfg.question_count);
+  return [{ title: "", from_q: 1, to_q: q, columns_count: cfg.columns_count }];
+}
+
+/** Çoxbölməli və ya başlıqlı fənn blokları — PDF/OMR/audit ilə eyni qayda. */
+export function mcqSectionsUseStacked(cfg: SheetConfig): boolean {
+  const secs = resolveMcqSections(cfg);
+  return secs.length > 1 || secs.some((s) => String(s.title ?? "").trim().length > 0);
+}
+
+/** Fənn başlıqları olduqda ümumi CAVABLAR zolağını gizlət (təkrar başlıq olmasın). */
+export function shouldShowMcqGridLabel(cfg: SheetConfig): boolean {
+  if (!mcqSectionsUseStacked(cfg)) return true;
+  return !resolveMcqSections(cfg).some((s) => String(s.title ?? "").trim().length > 0);
+}
+
+function sectionAnchorMm(
+  sec: McqSection,
+  sectionIndex: number,
+  gtAnchor: number,
+  leftAnchor: number,
+  stackTopMm: number,
+): { topMm: number; leftMm: number } {
+  const topRaw = sec.top_mm;
+  const leftRaw = sec.left_mm;
+  const topMm =
+    topRaw != null && Number.isFinite(topRaw)
+      ? topRaw
+      : sectionIndex === 0
+        ? gtAnchor
+        : stackTopMm;
+  const leftMm = leftRaw != null && Number.isFinite(leftRaw) ? leftRaw : leftAnchor;
+  return { topMm, leftMm };
+}
+
+function sectionBottomTowerMm(blocks: McqTowerRowBlock[], optN: number): number {
+  let bottom = 0;
+  for (const blk of blocks) {
+    const rowH = blk.num_cell_mm + blk.pad_below_num + (optN - 1) * blk.opt_vgap + blk.bd;
+    bottom = Math.max(bottom, blk.row_y0_mm + rowH);
+  }
+  return bottom;
+}
+
+function mcqBlocksHorizontalSpanMm(blocks: McqBlock[], leftAnchor: number): number {
+  let right = leftAnchor;
+  for (const b of blocks) {
+    if (isTowerRowBlock(b)) {
+      const bandW = b.qs.length * b.strip_pitch_mm;
+      right = Math.max(right, b.row_left_mm + bandW);
+    } else if (isColumnBlock(b) && b.qs.length) {
+      right = Math.max(right, b.col_x + b.col_w);
+    }
+  }
+  return Math.max(0, right - leftAnchor);
+}
+
+function mcqSectionTitleWidthMm(
+  title: string,
+  sectionBlocks: McqBlock[],
+  leftAnchor: number,
+  pwMm: number,
+): number {
+  const span = mcqBlocksHorizontalSpanMm(sectionBlocks, leftAnchor);
+  const textW = Math.max(18, 4 + title.trim().length * 1.65);
+  const pageW = Math.max(40, pwMm - leftAnchor - L.margin);
+  return Math.min(pageW, Math.max(18, textW, span + 2));
+}
+
+/** Cavab şəbəkəsi sürüklənən başlığının eni — sual sütunlarının faktiki span-ı, tam səhifə yox */
+export function mcqGridHandleWidthMm(
+  label: string,
+  region: McqRegionBounds,
+  pwMm: number,
+): number {
+  const dataBlocks = region.blocks.filter((b) => !isSectionTitleBlock(b));
+  const left = region.leftMm;
+  const span = dataBlocks.length ? mcqBlocksHorizontalSpanMm(dataBlocks, left) : region.widthMm;
+  const textW = Math.max(18, 4 + String(label || "CAVABLAR").trim().length * 1.65);
+  const pageW = Math.max(40, pwMm - left - L.margin);
+  return Math.min(pageW, Math.max(18, textW, span + 2, Math.min(region.widthMm + 1.5, pageW)));
+}
+
+function computeStackedMcqBlocks(
+  cfg: SheetConfig,
+  pwMm: number,
+  phMm: number,
+  gtAnchor: number,
+  leftAnchor: number,
+): { blocks: McqBlock[]; gt: number; gb: number; bd: number; vg: number; hg: number; nc: number } {
+  const sections = resolveMcqSections(cfg);
+  const optN = cfg.options_per_question;
+  const defaultCols = cfg.columns_count;
+  const gb = phMm - L.margin - L.footer_h;
+  const all: McqBlock[] = [];
+  let gtCursor = gtAnchor;
+  let bd = 6;
+  let vg = 8;
+  let hg = 7.5;
+  let nc = 0;
+
+  for (let si = 0; si < sections.length; si++) {
+    const sec = sections[si];
+    const fq = sec.from_q;
+    const tq = sec.to_q;
+    const n = Math.max(0, tq - fq + 1);
+    if (n <= 0) continue;
+    const cols = sec.columns_count ?? defaultCols;
+    const title = String(sec.title ?? "").trim();
+    const { topMm: secTop, leftMm: secLeft } = sectionAnchorMm(sec, si, gtAnchor, leftAnchor, gtCursor);
+    let blockGt = secTop;
+
+    if (title) {
+      const titleH = MCQ_SECTION_TITLE_H_MM + L.grid_top_pad * 0.35;
+      blockGt = secTop + titleH;
+    }
+
+    const [bdSec, vgSec, hgSec, ncSec] = resolveMcqSpacing(phMm, cols, n, blockGt, cfg, pwMm, secLeft);
+    bd = bdSec;
+    vg = vgSec;
+    hg = hgSec;
+    nc = ncSec;
+
+    let sectionBlocks: McqBlock[] = [];
+    if (ncSec > 0) {
+      const { blocks } = computeMcquestionTowerRows(
+        pwMm, phMm, n, blockGt, secLeft, bdSec, vgSec, hgSec, ncSec, optN, cfg,
+      );
+      sectionBlocks = blocks.map((b) => ({ ...b, qs: b.qs.map((q) => fq + q - 1) }));
+    } else {
+      const { blocks } = computeMcquestionBlocksWithGt(
+        pwMm, phMm, cols, n, blockGt, secLeft, bdSec, vgSec, hgSec,
+      );
+      sectionBlocks = blocks.map((b) => ({ ...b, qs: b.qs.map((q) => fq + q - 1) }));
+    }
+
+    if (title) {
+      all.push({
+        layout: "mcq_section_title",
+        title,
+        y_mm: secTop,
+        left_mm: secLeft,
+        width_mm: mcqSectionTitleWidthMm(title, sectionBlocks, secLeft, pwMm),
+        section_index: si,
+      });
+    }
+
+    all.push(...sectionBlocks);
+
+    if (ncSec > 0) {
+      const secBottom = sectionBottomTowerMm(sectionBlocks.filter(isTowerRowBlock), optN);
+      if (secBottom > gtCursor) gtCursor = secBottom + MCQ_SECTION_GAP_MM;
+    } else {
+      let secBottom = blockGt;
+      for (const b of sectionBlocks) {
+        if (!isColumnBlock(b)) continue;
+        const per = b.qs.length;
+        secBottom = Math.max(secBottom, b.fby + (per - 1) * vgSec + bdSec / 2);
+      }
+      gtCursor = secBottom + MCQ_SECTION_GAP_MM;
+    }
+  }
+
+  return { blocks: all, gt: gtAnchor, gb, bd, vg, hg, nc };
+}
+
+export function buildMcqSectionsFromGrading(
+  grading: Record<string, unknown> | undefined | null,
+  defaultCols: SheetConfig["columns_count"],
+): McqSection[] | undefined {
+  if (!grading) return undefined;
+  const blocks = grading.question_blocks;
+  const subjects = grading.subjects;
+  if (!Array.isArray(blocks) || !blocks.length) return undefined;
+  const names = new Map<string, string>();
+  if (Array.isArray(subjects)) {
+    for (const s of subjects) {
+      if (s && typeof s === "object") {
+        const r = s as Record<string, unknown>;
+        const code = String(r.code ?? "").trim();
+        if (code) names.set(code, String(r.name ?? code).trim() || code);
+      }
+    }
+  }
+  const out: McqSection[] = [];
+  for (const row of blocks) {
+    if (!row || typeof row !== "object") continue;
+    const b = row as Record<string, unknown>;
+    const fq = Number(b.from_q);
+    const tq = Number(b.to_q);
+    if (!Number.isFinite(fq) || !Number.isFinite(tq) || fq < 1 || tq < fq) continue;
+    const sc = String(b.subject_code ?? "").trim();
+    const title = sc ? names.get(sc) ?? sc : `Sual ${fq}–${tq}`;
+    const sec: McqSection = { title, from_q: fq, to_q: tq };
+    const cc = Number(b.columns_count);
+    if (Number.isFinite(cc) && cc >= 1) sec.columns_count = Math.min(6, cc) as SheetConfig["columns_count"];
+    else sec.columns_count = defaultCols;
+    out.push(sec);
+  }
+  return out.length ? out : undefined;
 }
 
 export function computeMcquestionBlocksWithGt(
@@ -429,7 +699,7 @@ export function computeMcquestionBlocksWithGt(
   leftMm: number,
   bubbleD: number,
   vgap: number,
-  _hgap: number,
+  hgap: number,
 ): { blocks: McqColumnBlock[]; gt: number; gb: number } {
   let left = leftMm;
   let availW = pwMm - left - L.margin;
@@ -454,6 +724,9 @@ export function computeMcquestionBlocksWithGt(
       col_w: colW,
       fbx: firstBx,
       fby: firstBy,
+      _bd: bubbleD,
+      _vg: vgap,
+      _hg: hgap,
     });
   }
   return { blocks, gt: gtMm, gb };
@@ -543,15 +816,72 @@ export function computeMcqRegionForFreeform(
   mcqLeftMm: number,
 ): McqRegionBounds {
   const { w: pwMm, h: phMm } = paperDimensionsMm(cfg.paper_size);
-  const cols = cfg.columns_count;
   const qCount = Math.max(1, cfg.question_count);
-  const idH = estimateFreeformIdentityHeightMm(fields, cfg, 0, mcqTopMm);
-  const defaultGt = identityZoneTopMm() + idH + L.sep_v;
-  const gtAnchor =
-    !Number.isFinite(mcqTopMm) || mcqTopMm <= 0 ? defaultGt : Math.max(defaultGt, mcqTopMm);
+  const gtAnchor = resolveMcqGridTopAnchorMm(mcqTopMm, fields, cfg);
   const leftAnchor = Number.isFinite(mcqLeftMm) ? mcqLeftMm : contentLeftMm();
-  const [bd, vg, hg, nc] = resolveMcqSpacing(phMm, cols, qCount, gtAnchor, cfg, pwMm, leftAnchor);
   const optN = cfg.options_per_question;
+
+  const secs = resolveMcqSections(cfg);
+  const useStacked = mcqSectionsUseStacked(cfg);
+
+  if (useStacked) {
+    const { blocks, gt, gb, bd, vg, hg, nc } = computeStackedMcqBlocks(
+      cfg, pwMm, phMm, gtAnchor, leftAnchor,
+    );
+    if (nc > 0) {
+      const region = boundsFromTowerRows(
+        blocks.filter(isTowerRowBlock),
+        gt,
+        gb,
+        bd,
+        vg,
+        hg,
+        optN,
+        leftAnchor,
+        gtAnchor,
+      );
+      return { ...region, blocks };
+    }
+    let minX = Infinity;
+    let maxX = 0;
+    let minY = Infinity;
+    let maxY = 0;
+    for (const b of blocks) {
+      if (isSectionTitleBlock(b)) {
+        minX = Math.min(minX, b.left_mm);
+        maxX = Math.max(maxX, b.left_mm + b.width_mm);
+        minY = Math.min(minY, b.y_mm);
+        maxY = Math.max(maxY, b.y_mm + MCQ_SECTION_TITLE_H_MM);
+        continue;
+      }
+      if (!isColumnBlock(b)) continue;
+      minX = Math.min(minX, b.col_x);
+      const rowRight = b.fbx + (optN - 1) * hg + bd / 2 + 2;
+      maxX = Math.max(maxX, rowRight, b.col_x + b.col_w);
+      const n = b.qs.length;
+      minY = Math.min(minY, b.fby - bd / 2);
+      maxY = Math.max(maxY, b.fby + (n - 1) * vg + bd / 2);
+    }
+    return {
+      leftMm: Number.isFinite(minX) ? minX : leftAnchor,
+      topMm: Number.isFinite(minY) ? minY : gtAnchor,
+      widthMm: Math.max(40, maxX - minX),
+      heightMm: Math.max(20, maxY - minY),
+      gtMm: gt,
+      gbMm: gb,
+      bubbleDMm: bd,
+      vgapMm: vg,
+      hgapMm: hg,
+      qNumWMm: L.q_num_w,
+      gridTopPadMm: L.grid_top_pad,
+      optionsPerQuestion: optN,
+      blocks,
+      mcqLayout: "columns",
+    };
+  }
+
+  const cols = cfg.columns_count;
+  const [bd, vg, hg, nc] = resolveMcqSpacing(phMm, cols, qCount, gtAnchor, cfg, pwMm, leftAnchor);
 
   if (nc > 0) {
     const { blocks, gt, gb } = computeMcquestionTowerRows(
@@ -631,28 +961,174 @@ export function computeMcqRegionForFreeform(
   };
 }
 
+function gridBottomFromBlocks(
+  blocks: McqBlock[],
+  gtAnchor: number,
+  options: number,
+  bd: number,
+  vg: number,
+  padBelowNum: number,
+): number {
+  let bottom = gtAnchor;
+  for (const blk of blocks) {
+    if (isTowerRowBlock(blk)) {
+      const rowH = blk.num_cell_mm + padBelowNum + (options - 1) * blk.opt_vgap + blk.bd;
+      bottom = Math.max(bottom, blk.row_y0_mm + rowH);
+    } else if (isColumnBlock(blk)) {
+      const per = blk.qs.length;
+      if (per <= 0) continue;
+      const lastC = blk.fby + (per - 1) * vg;
+      bottom = Math.max(bottom, lastC + bd / 2.0);
+    }
+  }
+  return bottom;
+}
+
+/** Backend `mcq_content_bottom_mm` — MCQ şəbəkəsinin ən aşağı kənarı (mm). */
+export function mcqContentBottomMm(
+  cfg: SheetConfig,
+  fields: LayoutField[],
+  pwMm: number,
+  phMm: number,
+  forceSingleSheetGrid = false,
+  mcqTopMm = 0,
+  mcqLeftMm?: number,
+): number | null {
+  const qCount = Math.max(1, cfg.question_count);
+  const options = Math.max(2, Math.min(5, cfg.options_per_question));
+  const cols = Math.max(1, Math.min(6, cfg.columns_count));
+  const leftFit = mcqLeftMm ?? contentLeftMm();
+  const idH = estimateFreeformIdentityHeightMm(
+    fields,
+    cfg,
+    0,
+    mcqTopMm > 0 ? mcqTopMm : undefined,
+  );
+  const twoPage = forceSingleSheetGrid
+    ? false
+    : answerSheetTwoPageRequired(cfg, fields, leftFit, mcqTopMm);
+
+  const runGrid = (gtAnchor: number, leftAnchor: number): number => {
+    const [bd, vg, hg, nc] = resolveMcqSpacing(phMm, cols, qCount, gtAnchor, cfg, pwMm, leftAnchor);
+    const padBelowNum = cfg.mcq_num_to_bubbles_pad_mm ?? 0.48;
+    let blocks: McqBlock[];
+    if (nc > 0) {
+      ({ blocks } = computeMcquestionTowerRows(
+        pwMm, phMm, qCount, gtAnchor, leftAnchor, bd, vg, hg, nc, options, cfg,
+      ));
+    } else {
+      ({ blocks } = computeMcquestionBlocksWithGt(
+        pwMm, phMm, cols, qCount, gtAnchor, leftAnchor, bd, vg, hg,
+      ));
+    }
+    return gridBottomFromBlocks(blocks, gtAnchor, options, bd, vg, padBelowNum);
+  };
+
+  if (twoPage) {
+    const gtP2 = identityZoneTopMm() + L.sep_v;
+    return runGrid(gtP2, contentLeftMm());
+  }
+
+  const gtAnchor = resolveMcqGridTopAnchorMm(mcqTopMm, fields, cfg);
+  return runGrid(gtAnchor, leftFit);
+}
+
+/** Backend `answer_sheet_two_page_required` — PDF/audit ilə eyni qayda. */
+export function answerSheetTwoPageRequired(
+  cfg: SheetConfig,
+  fields: LayoutField[],
+  mcqLeftMm?: number,
+  mcqTopMm = 0,
+): boolean {
+  const { w: pwMm, h: phMm } = paperDimensionsMm(cfg.paper_size);
+  const cols = Math.max(1, Math.min(6, cfg.columns_count));
+  const qCount = Math.max(1, cfg.question_count);
+  const left = mcqLeftMm ?? contentLeftMm();
+  const zoneTop = identityZoneTopMm();
+  const idH = Math.max(14, identityFieldsBottomMm(fields, cfg) - zoneTop);
+  const fit1 = maxQuestionsFitBelowIdentity(phMm, cols, idH, cfg, pwMm, left);
+  if (fit1 < qCount) return true;
+  const bottomSafe =
+    phMm - L.margin - L.footer_h - MIN_GRID_ABOVE_FOOTER_MM - SAFE_CONTENT_INSET_MM;
+  const bb = mcqContentBottomMm(cfg, fields, pwMm, phMm, true, mcqTopMm, left);
+  return bb !== null && bb > bottomSafe + 0.12;
+}
+
 export function shouldUseTwoPages(
   cfg: SheetConfig,
   fields: LayoutField[],
   mcqLeftMm?: number,
+  mcqTopMm = 0,
 ): boolean {
-  if (cfg.single_page_layout !== false) return false;
-  const { w: pwMm, h: phMm } = paperDimensionsMm(cfg.paper_size);
-  const idH = estimateFreeformIdentityHeightMm(fields, cfg);
-  const left = mcqLeftMm ?? contentLeftMm();
-  const fit = maxQuestionsFitBelowIdentity(phMm, cfg.columns_count, idH, cfg, pwMm, left);
-  return fit < cfg.question_count;
+  return answerSheetTwoPageRequired(cfg, fields, mcqLeftMm, mcqTopMm);
 }
 
 /** PDF 2-ci səhifə: yalnız başlıq + sual şəbəkəsi (şəxsiyyət yoxdur). */
 export function computeMcqRegionSecondPage(cfg: SheetConfig): McqRegionBounds {
   const { w: pwMm, h: phMm } = paperDimensionsMm(cfg.paper_size);
-  const cols = cfg.columns_count;
-  const qCount = Math.max(1, cfg.question_count);
   const gtAnchor = identityZoneTopMm() + L.sep_v;
   const leftAnchor = contentLeftMm();
-  const [bd, vg, hg, nc] = resolveMcqSpacing(phMm, cols, qCount, gtAnchor, cfg, pwMm, leftAnchor);
   const optN = cfg.options_per_question;
+
+  if (mcqSectionsUseStacked(cfg)) {
+    const { blocks, gt, gb, bd, vg, hg, nc } = computeStackedMcqBlocks(
+      cfg, pwMm, phMm, gtAnchor, leftAnchor,
+    );
+    if (nc > 0) {
+      const region = boundsFromTowerRows(
+        blocks.filter(isTowerRowBlock),
+        gt,
+        gb,
+        bd,
+        vg,
+        hg,
+        optN,
+        leftAnchor,
+        gtAnchor,
+      );
+      return { ...region, blocks };
+    }
+    let minX = Infinity;
+    let maxX = 0;
+    let minY = Infinity;
+    let maxY = 0;
+    for (const b of blocks) {
+      if (isSectionTitleBlock(b)) {
+        minX = Math.min(minX, b.left_mm);
+        maxX = Math.max(maxX, b.left_mm + b.width_mm);
+        minY = Math.min(minY, b.y_mm);
+        maxY = Math.max(maxY, b.y_mm + MCQ_SECTION_TITLE_H_MM);
+        continue;
+      }
+      if (!isColumnBlock(b)) continue;
+      minX = Math.min(minX, b.col_x);
+      const rowRight = b.fbx + (optN - 1) * hg + bd / 2 + 2;
+      maxX = Math.max(maxX, rowRight, b.col_x + b.col_w);
+      const n = b.qs.length;
+      minY = Math.min(minY, b.fby - bd / 2);
+      maxY = Math.max(maxY, b.fby + (n - 1) * vg + bd / 2);
+    }
+    return {
+      leftMm: Number.isFinite(minX) ? minX : leftAnchor,
+      topMm: Number.isFinite(minY) ? minY : gtAnchor,
+      widthMm: Math.max(40, maxX - minX),
+      heightMm: Math.max(20, maxY - minY),
+      gtMm: gt,
+      gbMm: gb,
+      bubbleDMm: bd,
+      vgapMm: vg,
+      hgapMm: hg,
+      qNumWMm: L.q_num_w,
+      gridTopPadMm: L.grid_top_pad,
+      optionsPerQuestion: optN,
+      blocks,
+      mcqLayout: "columns",
+    };
+  }
+
+  const cols = cfg.columns_count;
+  const qCount = Math.max(1, cfg.question_count);
+  const [bd, vg, hg, nc] = resolveMcqSpacing(phMm, cols, qCount, gtAnchor, cfg, pwMm, leftAnchor);
 
   if (nc > 0) {
     const { blocks, gt, gb } = computeMcquestionTowerRows(

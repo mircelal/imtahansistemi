@@ -7,33 +7,72 @@ import {
   useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
-import type { SheetConfig } from "./hooks/useSheetConfig";
+import type { McqSection, SheetConfig } from "./hooks/useSheetConfig";
 import type { LayoutField } from "./layoutBlockModel";
 import {
   FIELD_HEADER_BAR_MM,
+  HORIZONTAL_LETTERS_BOTTOM_TAIL_MM,
+  HORIZONTAL_LETTERS_HANDWRITE_ROW_EXTRA_MM,
+  HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM,
+  HORIZONTAL_LETTERS_TOP_GAP_MM,
   MCQ_GRID_DRAG_ID,
+  mcqSectionDragId,
+  parseMcqSectionDragIndex,
+  applyIdentityMcqBubbleSync,
+  clampFieldPositionAvoidingOverlap,
+  digitGroupRowChunks,
   estimateBlockHeightMm,
   estimateBlockWidthMm,
-  estimateFreeformIdentityHeightMm,
+  minMcqGridTopAnchorMm,
+  mcqSingleBlockWidthMm,
   verticalLettersHandwriteSquareSideMm,
   verticalLettersRowPitchMm,
   type McqGridPos,
+  type McqMatchInfo,
 } from "./layoutBlockModel";
 import {
   type McqRegionBounds,
+  type McqSectionTitleBlock,
   computeMcqRegionForFreeform,
   computeMcqRegionSecondPage,
   contentLeftMm,
+  contentRightMaxMm,
+  mcqGridHandleWidthMm,
   towerNumLabelBoxWidthMm,
   fiducialCornerCenterFromEdgeMm,
   fiducialOuterBottomFromPageTopMm,
   headerMagentaHorizontalInsetMm,
   headerMagentaTopFromPageTopMm,
   identityZoneTopMm,
+  isSectionTitleBlock,
+  isColumnBlock,
   isTowerRowBlock,
+  MCQ_SECTION_TITLE_H_MM,
+  mcqSectionsUseStacked,
   paperDimensionsMm,
-  sheetSepBelowIdentityMm,
+  resolveMcqSections,
+  shouldShowMcqGridLabel,
 } from "./mcqLayout";
+import {
+  FACE_PANEL_MAP,
+  PANEL_META,
+  foldPanelRange,
+  isA3DuplexFold,
+  panelHasIdentity,
+  panelViewConfig,
+} from "./a3FoldLayout";
+import type { OpenBlock } from "./hooks/useSheetConfig";
+import {
+  GRID_IN_BUBBLE_D_MM,
+  GRID_IN_COL_GAP_MM,
+  GRID_IN_HANDWRITE_H_MM,
+  GRID_IN_LABEL_H_MM,
+  GRID_IN_VGAP_MM,
+  gridInBubbleValues,
+  openBlockDragId,
+  openBlockSizeMm,
+  parseOpenBlockDragIndex,
+} from "./openBlockGeometry";
 
 const PX_MM = 2.65;
 /** PDF `L_BASE["header_h"]` ilə sinxron (~30% alçaq) */
@@ -48,25 +87,11 @@ const TIMING_TRACK_MM = 7.0;
 const FIDUCIAL_INSET_MM = 0.7;
 const FIDUCIAL_RO_MM = 3.0;
 
-function applyIdentityMcqBubbleSync(cfg: SheetConfig, region: McqRegionBounds): SheetConfig {
-  if (region.mcqLayout !== "towers" || cfg.identity_match_mcq_bubbles === false) return cfg;
-  const bdMcq = region.bubbleDMm;
-  const ld0 = cfg.identity_letter_d_mm;
-  const dd0 = cfg.identity_digit_d_mm;
-  if (ld0 <= 0 || dd0 <= 0) return cfg;
-  const fl = bdMcq / ld0;
-  const fd = bdMcq / dd0;
-  const dcolTight = Math.max(0.28, Math.min(4.2, cfg.identity_digit_col_gap_mm * fd * 0.62, bdMcq * 0.18));
-  return {
-    ...cfg,
-    identity_letter_d_mm: bdMcq,
-    identity_digit_d_mm: bdMcq,
-    identity_letter_hgap_mm: Math.max(bdMcq + 0.1, Math.max(2.2, Math.min(14, cfg.identity_letter_hgap_mm * fl))),
-    identity_letter_vgap_mm: Math.max(2.5, Math.min(16, cfg.identity_letter_vgap_mm * fl)),
-    identity_digit_vgap_mm: Math.max(bdMcq - 0.26, Math.max(2.42, Math.min(16, cfg.identity_digit_vgap_mm * fd))),
-    identity_digit_col_gap_mm: dcolTight,
-  };
+/** MCQ region-dan McqMatchInfo qurur (kanvas → estimasiya köprüsü). */
+function mcqMatchInfoFromRegion(region: McqRegionBounds): McqMatchInfo {
+  return { bdMcq: region.bubbleDMm, isTower: region.mcqLayout === "towers" };
 }
+
 type FieldDragHandleBinding = Pick<ReturnType<typeof useDraggable>, "listeners" | "attributes">;
 
 /** PDF `AZ_LATIN` ilə eyni sıra */
@@ -81,11 +106,21 @@ function px(mm: number) {
   return mm * PX_MM;
 }
 
+/** Kanvas `scale()` tətbiq olunanda dnd-kit delta-sını mm-ə çevirir */
+function dragDeltaToMm(deltaPx: number, scale: number): number {
+  return deltaPx / PX_MM / Math.max(0.01, scale);
+}
+
+function dragTransformCss(transform: { x: number; y: number } | null, scale: number): string | undefined {
+  if (!transform) return undefined;
+  return `translate3d(${transform.x / scale}px, ${transform.y / scale}px, 0)`;
+}
+
 function clamp(n: number, lo: number, hi: number) {
   return Math.min(hi, Math.max(lo, n));
 }
 
-/** DİM-stilli balaca bubble */
+/** DİM-stilli balaca bubble — PDF `_draw_bubble` ilə vizual uyğun mərkəzləmə */
 function Bubble({
   dMm,
   label,
@@ -96,10 +131,11 @@ function Bubble({
   fsPx?: number;
 }) {
   const s = px(dMm);
-  const fs = fsPx ?? Math.max(4.5, s * 0.42);
+  const fs = fsPx ?? Math.max(4.5, s * 0.38);
+  const nudgeY = s * 0.045;
   return (
     <div
-      className="flex shrink-0 items-center justify-center rounded-full"
+      className="grid shrink-0 place-items-center rounded-full"
       style={{
         width: s,
         height: s,
@@ -107,6 +143,7 @@ function Bubble({
         background: C_MAG_LT,
         border: `0.4px solid ${C_MAG_ST}`,
         boxSizing: "border-box",
+        lineHeight: 1,
       }}
     >
       {label ? (
@@ -115,11 +152,10 @@ function Bubble({
             color: C_MAG_ST,
             fontWeight: 600,
             lineHeight: 1,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: s,
-            height: s,
+            textAlign: "center",
+            display: "block",
+            transform: `translateY(${nudgeY}px)`,
+            letterSpacing: label.length > 2 ? -0.03 * fs : 0,
           }}
         >
           {label}
@@ -257,20 +293,32 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
   if (field.kind === "digits") {
     const cnt = Number(field.count ?? 6);
     const pitch = dcol + dd;
-    const totalW = 2 + cnt * pitch + dd + 2;
+    const colW = dd;
+    const totalW = estimateBlockWidthMm(field, cfg);
     const barH = FIELD_HEADER_BAR_MM;
+    const bubbleStep = Math.max(dd + 0.08, dvg);
 
     return (
       <div style={{ width: px(totalW) }}>
-        <HeaderBar label={String(field.label ?? "")} widthPx={px(totalW)} heightPx={px(barH)} dragHandle={dragHandle} />
+        <HeaderBar
+          label={String(field.label ?? "")}
+          widthPx={px(totalW)}
+          heightPx={px(barH)}
+          compactTitle
+          dragHandle={dragHandle}
+        />
         <div
           className="flex"
           style={{
             gap: px(dcol),
             paddingLeft: px(2),
+            paddingRight: px(2),
             paddingTop: px(1.5),
+            paddingBottom: px(1),
             background: "white",
             border: `0.5px solid ${C_MAG_ST}33`,
+            borderTop: "none",
+            boxSizing: "border-box",
           }}
         >
           {Array.from({ length: cnt }, (_, ci) => (
@@ -278,21 +326,12 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
               key={ci}
               className="flex flex-col items-center"
               style={{
-                gap: px(Math.max(0.12, dvg - dd)),
-                borderLeft: ci > 0 ? `0.5px solid ${C_MAG_ST}22` : undefined,
-                paddingLeft: ci > 0 ? px(0.5) : 0,
+                width: px(colW),
+                gap: px(Math.max(0, bubbleStep - dd)),
               }}
             >
               {Array.from({ length: 10 }, (_, di) => (
-                <div
-                  key={di}
-                  style={{
-                    borderBottom: di < 9 ? `0.35px solid ${C_MAG_ST}14` : undefined,
-                    paddingBottom: px(0.2),
-                  }}
-                >
-                  <Bubble dMm={dd} label={String(di)} fsPx={px(dd) * 0.38} />
-                </div>
+                <Bubble key={di} dMm={dd} label={String(di)} fsPx={px(dd) * 0.38} />
               ))}
             </div>
           ))}
@@ -301,54 +340,53 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
     );
   }
 
-  /* ─── SEÇİM QRUPLARI (mcq_groups) ─── */
+  /* ─── SEÇİM QRUPLARI (mcq_groups) — hər qrup ayrı maqenta başlıq + mərkəzlənmiş balonlar ─── */
   if (field.kind === "mcq_groups") {
-    const groups = (field.groups as Array<{ label?: string; options?: string[] }> | undefined) ?? [];
+    const groups = (field.groups as Array<{ id?: string; label?: string; options?: string[] }> | undefined) ?? [];
     const wMm = estimateBlockWidthMm(field, cfg);
+    const interGap = 3;
+    let firstHdr = true;
     return (
-      <div style={{ width: px(wMm) }}>
-        <HeaderBar
-          label={String(field.label ?? "Seçimlər")}
-          widthPx={px(wMm)}
-          heightPx={px(FIELD_HEADER_BAR_MM)}
-          compactTitle
-          dragHandle={dragHandle}
-        />
-        <div
-          className="flex flex-wrap items-start"
-          style={{
-            gap: px(3),
-            padding: `${px(1)} ${px(2)} ${px(1.5)}`,
-            background: "white",
-            border: `0.5px solid ${C_MAG_ST}33`,
-            borderTop: "none",
-          }}
-        >
-          {groups.map((g, i) => {
-            const opts = (g.options ?? ["A", "B"]).map(String);
-            return (
-              <div key={i} className="flex flex-col items-start" style={{ gap: px(1) }}>
-                <span
-                  style={{
-                    fontSize: px(2.5),
-                    fontWeight: 600,
-                    color: C_MAG,
-                    letterSpacing: 0.24,
-                    textTransform: "uppercase",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {String(g.label ?? "")}
-                </span>
-                <div className="flex items-center" style={{ gap: px(Math.max(0.08, cfg.identity_letter_hgap_mm - ld)) }}>
-                  {opts.map((lab, j) => (
-                    <Bubble key={j} dMm={ld} label={lab} fsPx={px(ld) * 0.38} />
-                  ))}
-                </div>
+      <div className="flex flex-nowrap items-end" style={{ width: px(wMm), gap: px(interGap) }}>
+        {groups.map((g, gi) => {
+          const opts = (g.options ?? ["A", "B"]).map(String);
+          const bubbleGap = Math.max(0.08, lhg - ld);
+          const pseudo: LayoutField = {
+            ...field,
+            kind: "mcq",
+            label: String(g.label ?? ""),
+            options: opts,
+          };
+          const groupW = mcqSingleBlockWidthMm(pseudo, cfg);
+          const dh = firstHdr ? dragHandle : undefined;
+          firstHdr = false;
+          return (
+            <div key={String(g.id ?? gi)} style={{ width: px(groupW), flexShrink: 0 }}>
+              <HeaderBar
+                label={String(g.label ?? "").replace(/:\s*$/, "") || "Seçim"}
+                widthPx={px(groupW)}
+                heightPx={px(FIELD_HEADER_BAR_MM)}
+                compactTitle
+                dragHandle={dh}
+              />
+              <div
+                className="flex justify-center"
+                style={{
+                  gap: px(bubbleGap),
+                  padding: `${px(1.2)} ${px(1.5)} ${px(1.5)}`,
+                  background: "white",
+                  border: `0.5px solid ${C_MAG_ST}33`,
+                  borderTop: "none",
+                  boxSizing: "border-box",
+                }}
+              >
+                {opts.map((lab, j) => (
+                  <Bubble key={j} dMm={ld} label={lab} fsPx={px(ld) * 0.38} />
+                ))}
               </div>
-            );
-          })}
-        </div>
+            </div>
+          );
+        })}
       </div>
     );
   }
@@ -360,9 +398,13 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
     const hwW = Number(field.handwrite_w_mm ?? cfg.identity_handwrite_w_mm);
     const hwH = Number(field.handwrite_h_mm ?? cfg.identity_handwrite_h_mm);
     const hwG = Number(field.handwrite_gap_mm ?? cfg.identity_handwrite_gap_mm);
+    const nLetters = Math.max(1, Math.min(AZ_LATIN.length, Number(field.letters_count ?? AZ_LATIN.length)));
+    const labelLeft = HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM;
     const totalW = hwMode
-      ? 11 + hwW + 2 + (31 * lhg + ld) + 6
-      : 11 + (31 * lhg + ld) + 6;
+      ? labelLeft + hwW + 2 + ((nLetters - 1) * lhg + ld) + 6
+      : labelLeft + ((nLetters - 1) * lhg + ld) + 6;
+    const rowPitch = hwMode ? hwH + hwG + ld + HORIZONTAL_LETTERS_HANDWRITE_ROW_EXTRA_MM : lvg;
+    const bodyH = nrows * rowPitch + HORIZONTAL_LETTERS_BOTTOM_TAIL_MM;
     const barH = FIELD_HEADER_BAR_MM;
 
     return (
@@ -371,11 +413,14 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
         <div
           className="flex flex-col"
           style={{
-            gap: px(hwMode ? hwH + hwG + ld + 0.5 : Math.max(0.15, lvg - ld)),
             paddingLeft: px(1.5),
-            paddingTop: px(1.5),
+            paddingTop: px(HORIZONTAL_LETTERS_TOP_GAP_MM),
+            paddingBottom: px(HORIZONTAL_LETTERS_BOTTOM_TAIL_MM),
             background: "white",
             border: `0.5px solid ${C_MAG_ST}33`,
+            borderTop: "none",
+            boxSizing: "border-box",
+            minHeight: px(bodyH),
           }}
         >
           {Array.from({ length: nrows }, (_, ri) => (
@@ -383,6 +428,7 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
               key={ri}
               className="flex items-center"
               style={{
+                height: px(rowPitch),
                 gap: px(1),
                 background: ri % 2 === 0 ? "rgba(253,240,246,0.35)" : "#fff",
                 borderBottom: ri < nrows - 1 ? `0.5px solid ${C_MAG_ST}20` : undefined,
@@ -390,8 +436,7 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
                 marginRight: px(-1),
                 paddingLeft: px(1),
                 paddingRight: px(1),
-                paddingTop: px(0.4),
-                paddingBottom: px(0.4),
+                boxSizing: "border-box",
               }}
             >
               <span
@@ -422,7 +467,7 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
                 className="flex min-w-0 flex-1 items-center overflow-hidden"
                 style={{ gap: px(Math.max(0.08, lhg - ld)) }}
               >
-                {AZ_LATIN.split("").map((ch, li) => (
+                {AZ_LATIN.slice(0, nLetters).split("").map((ch, li) => (
                   <Bubble key={li} dMm={ld} label={ch} fsPx={px(ld) * 0.38} />
                 ))}
               </div>
@@ -433,51 +478,107 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
     );
   }
 
-  /* ─── RƏQƏM QRUPLARI (digit_groups) ─── */
+  /* ─── RƏQƏM QRUPLARI — AD/SOYAD üslubu: maqenta başlıq, (opsional) əl yazısı kvadratı, sonra 0–9 ─── */
   if (field.kind === "digit_groups") {
-    const groups = (field.groups as Array<{ id?: string; label?: string; count?: number }> | undefined) ?? [];
     const compact = Boolean(field.compact ?? cfg.identity_digit_compact);
-    const labelW = compact ? 13 : 26;
+    const groupTail = compact ? 3.5 : 10;
     const wMm = estimateBlockWidthMm(field, cfg);
+    const pitch = dcol + dd;
+    const dgHdr = FIELD_HEADER_BAR_MM;
+    const topGap = 0.8;
+    const showHw = Boolean(
+      (field as unknown as { handwrite_box?: unknown }).handwrite_box
+        ?? (cfg as unknown as { identity_digit_handwrite_box?: unknown }).identity_digit_handwrite_box,
+    );
+    const sqTop = showHw
+      ? verticalLettersHandwriteSquareSideMm(dd, Math.max(dd + 0.12, pitch), undefined)
+      : 0;
+    const rows = digitGroupRowChunks(field);
+    let firstHdr = true;
     return (
       <div style={{ width: px(wMm) }}>
-        <HeaderBar
-          label={String(field.label ?? "Rəqəm qrupları")}
-          widthPx={px(wMm)}
-          heightPx={px(FIELD_HEADER_BAR_MM)}
-          compactTitle
-          dragHandle={dragHandle}
-        />
-        <div
-          className="flex flex-wrap items-end"
-          style={{
-            gap: px(4),
-            padding: `${px(1)} ${px(2)} ${px(1.5)}`,
-            background: "white",
-            border: `0.5px solid ${C_MAG_ST}33`,
-            borderTop: "none",
-          }}
-        >
-          {groups.map((g) => {
-            const cnt = Number(g.count ?? 1);
-            return (
-              <div key={String(g.id ?? g.label)} className="flex flex-col items-start" style={{ gap: px(1) }}>
-                <span style={{ fontSize: px(2.5), fontWeight: 600, color: C_MAG, width: px(labelW), whiteSpace: "nowrap" }}>
-                  {String(g.label ?? "")}:
-                </span>
-                <div className="flex" style={{ gap: px(dcol) }}>
-                  {Array.from({ length: cnt }, (_, ci) => (
-                    <div key={ci} className="flex flex-col items-center" style={{ gap: px(dvg - dd) }}>
-                      {Array.from({ length: 10 }, (_, di) => (
-                        <Bubble key={di} dMm={dd} label={String(di)} />
-                      ))}
-                    </div>
-                  ))}
+        {rows.map((rowGroups, ri) => {
+          const rowGapAfter = compact ? 4 : ri === 0 ? 5 : 6;
+          return (
+          <div
+            key={ri}
+            className="flex flex-wrap items-end"
+            style={{
+              gap: px(4),
+              marginBottom: ri < rows.length - 1 ? px(rowGapAfter) : 0,
+            }}
+          >
+            {rowGroups.map((g, gi) => {
+              const cnt = Number(g.count ?? 1);
+              const groupW = 2 + cnt * pitch + 1;
+              const dh = firstHdr ? dragHandle : undefined;
+              firstHdr = false;
+              return (
+                <div
+                  key={String(g.id ?? g.label)}
+                  className="flex flex-col items-start"
+                  style={{
+                    width: px(groupW),
+                    marginRight: gi < rowGroups.length - 1 ? px(groupTail) : 0,
+                  }}
+                >
+                  <HeaderBar
+                    label={String(g.label ?? "").replace(/:\s*$/, "") || "Kod"}
+                    widthPx={px(groupW)}
+                    heightPx={px(dgHdr)}
+                    compactTitle
+                    dragHandle={dh}
+                  />
+                  <div
+                    className="flex"
+                    style={{
+                      paddingLeft: px(2),
+                      paddingTop: px(topGap),
+                      width: px(groupW),
+                      background: "white",
+                      border: `0.5px solid ${C_MAG_ST}33`,
+                      borderTop: "none",
+                      boxSizing: "border-box",
+                    }}
+                  >
+                    {Array.from({ length: cnt }, (_, ci) => (
+                      <div
+                        key={ci}
+                        className="flex shrink-0 flex-col items-center"
+                        style={{
+                          width: px(pitch),
+                          gap: px(Math.max(0.12, dvg - dd)),
+                          background: ci % 2 === 0 ? "rgba(253, 232, 243, 0.95)" : "#ffffff",
+                          borderRight: ci < cnt - 1 ? `0.35px solid ${C_MAG_ST}20` : undefined,
+                          paddingTop: px(0.35),
+                          paddingBottom: px(0.35),
+                        }}
+                      >
+                        {showHw ? (
+                          <div
+                            className="shrink-0 rounded-sm bg-white"
+                            style={{
+                              width: px(sqTop),
+                              height: px(sqTop),
+                              border: `0.45px solid ${C_MAG_ST}`,
+                              boxSizing: "border-box",
+                              marginBottom: px(0.5),
+                            }}
+                          />
+                        ) : null}
+                        {Array.from({ length: 10 }, (_, di) => (
+                          <div key={di} className="flex justify-center">
+                            <Bubble dMm={dd} label={String(di)} fsPx={px(dd) * 0.38} />
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            );
-          })}
-        </div>
+              );
+            })}
+          </div>
+        );})}
       </div>
     );
   }
@@ -485,7 +586,8 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
   /* ─── TƏK SEÇİM (mcq) ─── */
   if (field.kind === "mcq") {
     const opts = (field.options as string[] | undefined)?.map(String) ?? ["A", "B", "C", "D"];
-    const wMm = estimateBlockWidthMm(field, cfg);
+    const bubbleGap = Math.max(0.08, lhg - ld);
+    const wMm = mcqSingleBlockWidthMm(field, cfg);
     return (
       <div style={{ width: px(wMm) }}>
         <HeaderBar
@@ -496,16 +598,16 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
           dragHandle={dragHandle}
         />
         <div
-          className="flex flex-col items-start"
+          className="flex justify-center"
           style={{
-            gap: px(1),
-            padding: `${px(1)} ${px(2)} ${px(1.5)}`,
+            padding: `${px(1.2)} ${px(1.5)} ${px(1.5)}`,
             background: "white",
             border: `0.5px solid ${C_MAG_ST}33`,
             borderTop: "none",
+            boxSizing: "border-box",
           }}
         >
-          <div className="flex items-center" style={{ gap: px(Math.max(0.08, cfg.identity_letter_hgap_mm - ld)) }}>
+          <div className="flex items-center justify-center" style={{ gap: px(bubbleGap) }}>
             {opts.map((lab, j) => (
               <Bubble key={j} dMm={ld} label={lab} fsPx={px(ld) * 0.38} />
             ))}
@@ -544,6 +646,55 @@ function BlockWysiwyg({ field, cfg, dragHandle }: { field: LayoutField; cfg: She
     );
   }
 
+  /* ─── BƏYANNAMƏ + İMZA ─── */
+  if (field.kind === "declaration") {
+    const wMm = estimateBlockWidthMm(field, cfg);
+    const bodyH = Number(field.box_h_mm ?? 28);
+    const text = String(field.text ?? "Mən bu cavab kartındakı məlumatların düzgünlüyünü təsdiq edirəm.");
+    const sig = String(field.signature_label ?? "İmza");
+    return (
+      <div style={{ width: px(wMm) }}>
+        <HeaderBar
+          label={String(field.label ?? "Bəyannamə")}
+          widthPx={px(wMm)}
+          heightPx={px(FIELD_HEADER_BAR_MM)}
+          compactTitle
+          dragHandle={dragHandle}
+        />
+        <div
+          style={{
+            height: px(bodyH),
+            border: `1px solid ${C_MAG_ST}80`,
+            borderTop: "none",
+            borderRadius: "0 0 3px 3px",
+            padding: `${px(2)}px ${px(3)}px`,
+            background: "#fff",
+            display: "flex",
+            flexDirection: "column",
+            justifyContent: "space-between",
+            boxSizing: "border-box",
+          }}
+        >
+          <p style={{ margin: 0, fontSize: px(2.4), lineHeight: 1.35, color: "#334155" }}>{text}</p>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "flex-end",
+              justifyContent: "flex-end",
+              gap: px(2),
+              borderTop: "1px solid #cbd5e1",
+              paddingTop: px(1.5),
+              marginTop: px(2),
+            }}
+          >
+            <span style={{ fontSize: px(2.2), color: "#64748b" }}>{sig}:</span>
+            <div style={{ width: px(40), borderBottom: "1px solid #334155", height: px(4) }} />
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return <span style={{ fontSize: 10, color: "#94a3b8" }}>{field.kind}</span>;
 }
 
@@ -553,12 +704,14 @@ function DraggableBlock({
   selected,
   onSelect,
   readOnly,
+  scale,
 }: {
   field: LayoutField;
   sheetConfig: SheetConfig;
   selected: boolean;
   onSelect: () => void;
   readOnly?: boolean;
+  scale: number;
 }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: field.blockId,
@@ -576,7 +729,7 @@ function DraggableBlock({
     top,
     width: wPx,
     minHeight: hPx,
-    transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
+    transform: dragTransformCss(transform, scale),
     zIndex: isDragging ? 50 : selected ? 20 : 10,
     opacity: isDragging ? 0.9 : 1,
   };
@@ -607,7 +760,13 @@ function DraggableBlock({
 }
 
 /** PDF-dəki kimi tam sual şəbəkəsi — digər sahələr kimi WYSIWYG */
-function McqGridWysiwyg({ region }: { region: McqRegionBounds }) {
+function McqGridWysiwyg({
+  region,
+  hideSectionTitles = false,
+}: {
+  region: McqRegionBounds;
+  hideSectionTitles?: boolean;
+}) {
   if (!region.blocks.length) {
     return (
       <div
@@ -627,8 +786,6 @@ function McqGridWysiwyg({ region }: { region: McqRegionBounds }) {
   const bd = region.bubbleDMm;
   const vg = region.vgapMm;
   const hg = region.hgapMm;
-  const gt = region.gtMm;
-  const gb = region.gbMm;
   const qnw = region.qNumWMm;
   const gtp = region.gridTopPadMm;
   const opts = "ABCDE".slice(0, region.optionsPerQuestion).split("");
@@ -636,7 +793,27 @@ function McqGridWysiwyg({ region }: { region: McqRegionBounds }) {
   if (region.mcqLayout === "towers") {
     return (
       <>
-        {region.blocks.map((b) => {
+        {region.blocks.map((b, idx) => {
+          if (isSectionTitleBlock(b)) {
+            if (hideSectionTitles) return null;
+            return (
+              <div
+                key={`sec-${idx}-${b.title}`}
+                className="pointer-events-none absolute z-[7] flex items-center overflow-hidden"
+                style={{
+                  left: b.left_mm * PX_MM,
+                  top: b.y_mm * PX_MM,
+                  width: b.width_mm * PX_MM,
+                  height: MCQ_SECTION_TITLE_H_MM * PX_MM,
+                  background: C_MAG,
+                  borderRadius: "2px 2px 0 0",
+                  padding: `0 ${px(2)}`,
+                }}
+              >
+                <span style={{ color: "#fff", fontSize: px(2.6), fontWeight: 600 }}>{b.title}</span>
+              </div>
+            );
+          }
           if (!isTowerRowBlock(b)) return null;
           const rowH = b.num_cell_mm + b.pad_below_num + (opts.length - 1) * b.opt_vgap + b.bd;
           const bandW = b.qs.length * b.strip_pitch_mm;
@@ -715,85 +892,138 @@ function McqGridWysiwyg({ region }: { region: McqRegionBounds }) {
 
   return (
     <>
-      {region.blocks.map((b) => {
-        if (isTowerRowBlock(b)) return null;
-        const colH = (gb - gt) * PX_MM;
+      {region.blocks.map((b, idx) => {
+        if (isSectionTitleBlock(b)) {
+          if (hideSectionTitles) return null;
+          return (
+            <div
+              key={`sec-col-${idx}`}
+              className="pointer-events-none absolute z-[7] flex items-center overflow-hidden"
+              style={{
+                left: b.left_mm * PX_MM,
+                top: b.y_mm * PX_MM,
+                width: b.width_mm * PX_MM,
+                height: MCQ_SECTION_TITLE_H_MM * PX_MM,
+                background: C_MAG,
+                borderRadius: "2px 2px 0 0",
+                padding: `0 ${px(2)}`,
+              }}
+            >
+              <span style={{ color: "#fff", fontSize: px(2.6), fontWeight: 600 }}>{b.title}</span>
+            </div>
+          );
+        }
+        if (!isColumnBlock(b)) return null;
+        const bdUse = b._bd ?? bd;
+        const vgUse = b._vg ?? vg;
+        const hgUse = b._hg ?? hg;
+        const nQ = b.qs.length;
+        const gridTopMm = b.fby - bdUse / 2 - gtp;
+        const gridBotMm = b.fby + Math.max(0, nQ - 1) * vgUse + bdUse / 2 + 1.0;
+        const colH = Math.max(4, gridBotMm - gridTopMm) * PX_MM;
+        const hdrHMm = 5.5;
+        const hdrLabel = `Sual ${b.qs[0]}–${b.qs[b.qs.length - 1]}`;
+        const bubbleSpan =
+          opts.length > 0 ? qnw + 2 + (opts.length - 1) * hgUse + bdUse : b.col_w * 0.5;
+        const hdrWmm = Math.min(b.col_w, Math.max(bubbleSpan, qnw + 6, hdrLabel.length * 1.2 + 6));
         return (
           <div
             key={`mcq-${b.qs[0]}-${b.qs[b.qs.length - 1]}`}
-            className="pointer-events-none absolute z-[6] overflow-hidden"
+            className="pointer-events-none absolute z-[6]"
             style={{
               left: b.col_x * PX_MM,
-              top: gt * PX_MM,
+              top: (gridTopMm - hdrHMm) * PX_MM,
               width: b.col_w * PX_MM,
-              height: colH,
+              height: colH + hdrHMm * PX_MM,
               boxSizing: "border-box",
-              border: `0.45px solid ${C_MAG_ST}55`,
-              borderRadius: 2,
-              background: "rgba(255,252,254,0.96)",
             }}
           >
+            {/* PDF: magenta başlıq şəbəkənin ÜSTÜNDƏ */}
             <div
               className="flex items-center justify-center font-bold uppercase"
               style={{
-                height: px(5.5),
+                width: px(hdrWmm),
+                maxWidth: "100%",
+                margin: "0 auto",
+                height: px(hdrHMm),
                 background: C_MAG,
                 color: "#fff",
-                fontSize: Math.max(5, px(2.6)),
+                fontSize: Math.max(5, px(2.4)),
                 letterSpacing: 0.3,
+                borderRadius: "2px 2px 0 0",
               }}
             >
-              Sual {b.qs[0]}–{b.qs[b.qs.length - 1]}
+              {hdrLabel}
             </div>
             <div
-              className="flex items-end justify-start"
+              className="relative overflow-hidden"
               style={{
-                height: px(gtp + 2.5),
-                paddingLeft: px(1),
-                paddingRight: px(1),
-                background: "#fff",
-                borderBottom: `0.35px solid ${C_MAG_ST}18`,
+                height: colH,
+                boxSizing: "border-box",
+                border: `0.45px solid ${C_MAG_ST}55`,
+                borderRadius: "0 0 2px 2px",
+                background: "rgba(255,252,254,0.96)",
               }}
             >
-              <div style={{ width: px(qnw) }} />
-              {opts.map((lab) => (
-                <div key={lab} className="flex items-center justify-center" style={{ width: px(hg) }}>
-                  <span style={{ fontSize: px(2.4), fontWeight: 700, color: C_MAG_ST }}>{lab}</span>
-                </div>
-              ))}
-            </div>
-            <div>
-              {b.qs.map((qnum, i) => (
-                <div
-                  key={qnum}
-                  className="flex items-center"
+              {opts.map((lab, j) => (
+                <span
+                  key={lab}
+                  className="absolute font-bold uppercase"
                   style={{
-                    height: px(vg),
-                    background: i % 2 === 0 ? "rgba(253,240,246,0.28)" : "#fff",
-                    borderBottom: i < b.qs.length - 1 ? `0.45px solid #e8dfe4` : undefined,
+                    left: px(b.fbx + j * hgUse - b.col_x),
+                    top: px(gtp - 0.5 - 1.8),
+                    transform: "translateX(-50%)",
+                    fontSize: px(2.4),
+                    color: C_MAG_ST,
                   }}
                 >
-                  <span
-                    style={{
-                      width: px(qnw),
-                      paddingLeft: px(1.5),
-                      fontSize: px(2.5),
-                      fontWeight: 700,
-                      color: "#1e293b",
-                      flexShrink: 0,
-                    }}
-                  >
-                    {String(qnum).padStart(3, "0")}.
-                  </span>
-                  <div className="flex items-center">
+                  {lab}
+                </span>
+              ))}
+              {b.qs.map((qnum, i) => {
+                const cy = b.fby + i * vgUse - gridTopMm;
+                return (
+                  <div key={qnum} className="absolute inset-x-0" style={{ top: 0, height: 0 }}>
+                    <span
+                      className="absolute"
+                      style={{
+                        left: px(1.5),
+                        top: px(cy - 1.2),
+                        width: px(qnw),
+                        fontSize: px(2.5),
+                        fontWeight: 700,
+                        color: "#1e293b",
+                      }}
+                    >
+                      {String(qnum).padStart(3, "0")}.
+                    </span>
                     {opts.map((lab, j) => (
-                      <div key={lab} className="flex items-center justify-center" style={{ width: px(hg) }}>
-                        <Bubble dMm={bd} label={lab} fsPx={px(bd) * 0.4} />
+                      <div
+                        key={lab}
+                        className="absolute"
+                        style={{
+                          left: px(b.fbx + j * hgUse - bdUse / 2 - b.col_x),
+                          top: px(cy - bdUse / 2),
+                        }}
+                      >
+                        <Bubble dMm={bdUse} label={lab} fsPx={px(bdUse) * 0.4} />
                       </div>
                     ))}
+                    {i < b.qs.length - 1 ? (
+                      <div
+                        className="absolute"
+                        style={{
+                          left: px(1),
+                          right: px(1),
+                          top: px(cy + bdUse / 2 + 1.2),
+                          height: 0.45,
+                          background: "#e8dfe4",
+                        }}
+                      />
+                    ) : null}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         );
@@ -802,59 +1032,164 @@ function McqGridWysiwyg({ region }: { region: McqRegionBounds }) {
   );
 }
 
-function DraggableMcqMarker({
+
+function DraggableMcqGridHandle({
   mcq,
+  region,
+  minTopMm,
+  sheetConfig,
+  pwMm,
+  selected,
+  onSelect,
+  readOnly,
+  scale,
+}: {
+  mcq: McqGridPos;
+  region: McqRegionBounds;
+  minTopMm: number;
+  sheetConfig: SheetConfig;
+  pwMm: number;
+  selected: boolean;
+  onSelect: () => void;
+  readOnly?: boolean;
+  scale: number;
+}) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: MCQ_GRID_DRAG_ID,
+    disabled: Boolean(readOnly),
+  });
+  const anchorTopMm = mcq.top_mm <= 0 ? minTopMm : Math.max(mcq.top_mm, minTopMm);
+  const label = String(sheetConfig.mcq_grid_label ?? "CAVABLAR").trim() || "CAVABLAR";
+  const hdrW = mcqGridHandleWidthMm(label, region, pwMm);
+  const hdrH = FIELD_HEADER_BAR_MM;
+  const leftMm = region.leftMm;
+  const topMm = anchorTopMm - hdrH;
+  const dragBind: FieldDragHandleBinding = { attributes, listeners };
+
+  return (
+    <>
+      {selected && region.blocks.length > 0 ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute rounded-sm"
+          style={{
+            left: region.leftMm * PX_MM,
+            top: region.topMm * PX_MM,
+            width: Math.max(hdrW, region.widthMm) * PX_MM,
+            height: region.heightMm * PX_MM,
+            boxShadow: "0 0 0 1.5px rgba(192,23,106,0.45)",
+            zIndex: 7,
+          }}
+        />
+      ) : null}
+      <div
+        ref={setNodeRef}
+        style={{
+          position: "absolute",
+          left: leftMm * PX_MM,
+          top: topMm * PX_MM,
+          width: px(hdrW),
+          transform: dragTransformCss(transform, scale),
+          zIndex: isDragging ? 50 : selected ? 28 : 22,
+          opacity: isDragging ? 0.92 : 1,
+        }}
+        className={`touch-none overflow-hidden rounded-sm transition-shadow ${
+          selected
+            ? "shadow-[0_0_0_2px_#c0176a,0_4px_16px_rgba(192,23,106,0.22)]"
+            : "shadow-[0_0_0_1px_#e9c2d8] hover:shadow-[0_0_0_1.5px_#c0176a60]"
+        }`}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!readOnly) onSelect();
+        }}
+      >
+        <HeaderBar
+          label={label}
+          widthPx={px(hdrW)}
+          heightPx={px(hdrH)}
+          compactTitle
+          dragHandle={(readOnly ? { attributes: {}, listeners: {} } : dragBind) as FieldDragHandleBinding}
+        />
+      </div>
+    </>
+  );
+}
+
+function DraggableMcqSectionHandle({
+  block,
+  region,
   minTopMm,
   selected,
   onSelect,
   readOnly,
+  scale,
 }: {
-  mcq: McqGridPos;
-  /** Şəxsiyyət zonası bitəndən sonra — PDF `gt_anchor` minimumu ilə eyni */
+  block: McqSectionTitleBlock;
+  region: McqRegionBounds;
   minTopMm: number;
   selected: boolean;
   onSelect: () => void;
   readOnly?: boolean;
+  scale: number;
 }) {
-  const { attributes, listeners, setNodeRef, transform } = useDraggable({
-    id: MCQ_GRID_DRAG_ID,
+  const dragId = mcqSectionDragId(block.section_index);
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: dragId,
     disabled: Boolean(readOnly),
   });
-  const topMm = mcq.top_mm <= 0 ? minTopMm : Math.max(mcq.top_mm, minTopMm);
-  const style: React.CSSProperties = {
-    position: "absolute",
-    left: mcq.left_mm * PX_MM,
-    top: topMm * PX_MM,
-    width: px(40),
-    height: px(6),
-    transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
-    zIndex: selected ? 28 : 26,
-    cursor: readOnly ? "default" : "grab",
-  };
+  const hdrH = MCQ_SECTION_TITLE_H_MM;
+  const leftMm = block.left_mm;
+  const topMm = Math.max(block.y_mm, minTopMm);
+  const hdrW = block.width_mm;
+  const dragBind: FieldDragHandleBinding = { attributes, listeners };
 
   return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      className="touch-none"
-      {...(!readOnly ? listeners : {})}
-      {...(!readOnly ? attributes : {})}
-      onClick={(e) => {
-        e.stopPropagation();
-        if (!readOnly) onSelect();
-      }}
-    >
+    <>
+      {selected ? (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute rounded-sm"
+          style={{
+            left: region.leftMm * PX_MM,
+            top: region.topMm * PX_MM,
+            width: Math.max(hdrW, region.widthMm) * PX_MM,
+            height: region.heightMm * PX_MM,
+            boxShadow: "0 0 0 1.5px rgba(192,23,106,0.45)",
+            zIndex: 7,
+          }}
+        />
+      ) : null}
       <div
-        className="flex h-full items-center justify-center rounded-lg text-[9px] font-semibold"
+        ref={setNodeRef}
         style={{
-          background: selected ? "#f59e0b" : "#fef3c7",
-          border: `1.5px dashed ${selected ? "#d97706" : "#f59e0b"}`,
-          color: "#92400e",
+          position: "absolute",
+          left: leftMm * PX_MM,
+          top: topMm * PX_MM,
+          width: px(hdrW),
+          height: px(hdrH),
+          transform: dragTransformCss(transform, scale),
+          zIndex: isDragging ? 50 : selected ? 28 : 22,
+          opacity: isDragging ? 0.92 : 1,
+        }}
+        className={`touch-none overflow-hidden rounded-sm transition-shadow ${
+          selected
+            ? "shadow-[0_0_0_2px_#c0176a,0_4px_16px_rgba(192,23,106,0.22)]"
+            : "shadow-[0_0_0_1px_#e9c2d8] hover:shadow-[0_0_0_1.5px_#c0176a60]"
+        }`}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!readOnly) onSelect();
         }}
       >
-        ↕ Cavab şəbəkəsi başlanğıcı
+        <HeaderBar
+          label={block.title}
+          widthPx={px(hdrW)}
+          heightPx={px(hdrH)}
+          compactTitle
+          dragHandle={(readOnly ? { attributes: {}, listeners: {} } : dragBind) as FieldDragHandleBinding}
+        />
       </div>
-    </div>
+    </>
   );
 }
 
@@ -868,10 +1203,185 @@ type Props = {
   selectedFieldId: string | null;
   onFieldsChange: (next: LayoutField[]) => void;
   onMcqChange: (next: McqGridPos) => void;
+  onMcqSectionsChange?: (next: McqSection[]) => void;
+  /** Açıq sual bloklarını paneldə yenilə */
+  onOpenBlocksChange?: (next: OpenBlock[]) => void;
   onSelectField: (id: string | null) => void;
   /** Yalnız baxış — sürükləmə və MCQ işarəsini köçürmə söndürülür */
   readOnly?: boolean;
+  zoom: number;
+  /** A3 qatlanan: aktiv panel (1–4) */
+  foldPanel?: number;
+  onFoldPanelChange?: (panel: number) => void;
 };
+
+function FoldFaceSchematic({
+  face,
+  activePanel,
+  onSelectPanel,
+}: {
+  face: 1 | 2;
+  activePanel: number;
+  onSelectPanel: (p: number) => void;
+}) {
+  const [left, right] = FACE_PANEL_MAP[face];
+  return (
+    <div className="mx-auto flex max-w-xl items-stretch gap-0 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
+      {([left, right] as const).map((p, i) => {
+        const meta = PANEL_META[p];
+        const active = p === activePanel;
+        return (
+          <button
+            key={p}
+            type="button"
+            onClick={() => onSelectPanel(p)}
+            className={`relative flex min-h-[72px] flex-1 flex-col items-center justify-center gap-0.5 px-3 py-3 text-center transition ${
+              active ? "bg-[#fde8f3] text-[#9b1257]" : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+            } ${i === 0 ? "border-r border-dashed border-[#c0176a88]" : ""}`}
+          >
+            <span className="text-[11px] font-bold tracking-wide">{meta.short}</span>
+            <span className="text-[10px] leading-tight opacity-80">{meta.side} panel</span>
+            {active ? (
+              <span className="mt-1 rounded-full bg-[#c0176a] px-2 py-0.5 text-[9px] font-semibold text-white">
+                redaktə
+              </span>
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function OpenBlockOverlay({
+  block,
+  index,
+  selected,
+  readOnly,
+  scale,
+  onSelect,
+}: {
+  block: OpenBlock;
+  index: number;
+  selected: boolean;
+  readOnly: boolean;
+  scale: number;
+  onSelect: () => void;
+}) {
+  const dragId = openBlockDragId(block, index);
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
+    id: dragId,
+    disabled: Boolean(readOnly),
+  });
+  const { w, h } = openBlockSizeMm(block);
+  const values = block.kind === "grid_in" ? gridInBubbleValues(block.alphabet) : [];
+  const nCols = Math.max(1, Number(block.answer_length) || 3);
+  const pitch = GRID_IN_BUBBLE_D_MM + GRID_IN_COL_GAP_MM;
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={`absolute cursor-grab active:cursor-grabbing rounded-md border-2 shadow-sm ${
+        selected
+          ? "border-[#c0176a] bg-[#fff5fa] ring-2 ring-[#c0176a55]"
+          : "border-sky-500 bg-sky-50/95"
+      }`}
+      style={{
+        left: px(block.x_mm),
+        top: px(block.y_mm),
+        width: px(w),
+        height: px(h),
+        zIndex: isDragging ? 55 : selected ? 25 : 14,
+        opacity: isDragging ? 0.92 : 1,
+        transform: dragTransformCss(transform, scale),
+      }}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!readOnly) onSelect();
+      }}
+      {...(readOnly ? {} : { ...listeners, ...attributes })}
+      title={`${block.kind === "essay" ? "Esse" : "Grid-in"} · Sual ${block.question_number} — sürükləyin`}
+    >
+      {block.kind === "grid_in" ? (
+        <>
+          <div
+            className="flex items-center justify-center font-bold text-white"
+            style={{
+              height: px(GRID_IN_LABEL_H_MM),
+              background: "#c0176a",
+              fontSize: Math.max(8, px(GRID_IN_LABEL_H_MM) * 0.7),
+            }}
+          >
+            {block.question_number}
+          </div>
+          <div className="flex justify-center gap-0.5 px-0.5" style={{ height: px(GRID_IN_HANDWRITE_H_MM) }}>
+            {Array.from({ length: nCols }).map((_, j) => (
+              <div
+                key={j}
+                className="rounded-[1px] border border-[#9b1257] bg-white"
+                style={{
+                  width: px(GRID_IN_HANDWRITE_H_MM),
+                  height: px(GRID_IN_HANDWRITE_H_MM),
+                }}
+              />
+            ))}
+          </div>
+          <div className="relative mt-0.5 flex justify-center" style={{ gap: px(GRID_IN_COL_GAP_MM) }}>
+            {Array.from({ length: nCols }).map((_, j) => (
+              <div key={j} className="flex flex-col items-center" style={{ gap: px(GRID_IN_VGAP_MM - GRID_IN_BUBBLE_D_MM) }}>
+                {values.slice(0, 10).map((v) => (
+                  <div
+                    key={v}
+                    className="grid place-items-center rounded-full border border-slate-500 text-[5px] text-slate-600"
+                    style={{ width: px(GRID_IN_BUBBLE_D_MM), height: px(GRID_IN_BUBBLE_D_MM) }}
+                  >
+                    {v}
+                  </div>
+                ))}
+                {values.length > 10 ? (
+                  <span className="text-[6px] text-slate-400">+{values.length - 10}</span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="pointer-events-none absolute inset-x-0 top-0 flex justify-center pt-1">
+            <span className="rounded bg-[#c0176a] px-1.5 py-0.5 text-[9px] font-bold text-white">
+              Esse · {block.question_number}
+            </span>
+          </div>
+          <div
+            className="pointer-events-none absolute inset-x-2 bottom-2 top-6 opacity-40"
+            style={{
+              backgroundImage:
+                "repeating-linear-gradient(to bottom, transparent, transparent 7px, #c0176a55 7px, #c0176a55 8px)",
+            }}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+function FoldGuideOverlay({ pwMm, phMm }: { pwMm: number; phMm: number }) {
+  const mid = (pwMm / 2) * PX_MM;
+  return (
+    <div className="pointer-events-none absolute inset-0" style={{ zIndex: 20 }}>
+      <div
+        className="absolute top-0 bottom-0 border-l-2 border-dashed border-[#c0176a99]"
+        style={{ left: mid }}
+      />
+      <span
+        className="absolute rounded bg-[#c0176a] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-white"
+        style={{ left: mid, top: 8 * PX_MM, transform: "translateX(-50%)" }}
+      >
+        qatlama
+      </span>
+    </div>
+  );
+}
 
 function FiducialMark() {
   const sz = (FIDUCIAL_RO_MM * 2 + 0.6) * PX_MM;
@@ -1116,187 +1626,377 @@ export default function FreeformCanvas({
   selectedFieldId,
   onFieldsChange,
   onMcqChange,
+  onMcqSectionsChange,
+  onOpenBlocksChange,
   onSelectField,
   readOnly = false,
+  zoom,
+  foldPanel: foldPanelProp,
+  onFoldPanelChange,
 }: Props) {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
-  const [selMcq, setSelMcq] = React.useState(false);
-  const [zoom, setZoom] = React.useState(75); // percent
-  const clampZoom = React.useCallback((z: number) => Math.round(Math.min(300, Math.max(10, z))), []);
 
-  const { w: PAGE_W_MM, h: PAGE_H_MM } = paperDimensionsMm(sheetConfig.paper_size);
+  const foldMode = isA3DuplexFold(sheetConfig);
+  const [foldPanelLocal, setFoldPanelLocal] = React.useState(1);
+  const foldPanel = foldPanelProp ?? foldPanelLocal;
+  const setFoldPanel = (p: number) => {
+    setFoldPanelLocal(p);
+    onFoldPanelChange?.(p);
+  };
+  const [foldFace, setFoldFace] = React.useState<1 | 2>(1);
+
+  React.useEffect(() => {
+    if (!foldMode) return;
+    const meta = PANEL_META[foldPanel];
+    if (meta) setFoldFace(meta.face);
+  }, [foldMode, foldPanel]);
+
+  const viewConfig = React.useMemo(
+    () => (foldMode ? panelViewConfig(sheetConfig, foldPanel) : sheetConfig),
+    [foldMode, sheetConfig, foldPanel],
+  );
+
+  const showIdentity = !foldMode || panelHasIdentity(sheetConfig, foldPanel);
+  const canvasFields = showIdentity ? fields : [];
+
+  const { w: PAGE_W_MM, h: PAGE_H_MM } = paperDimensionsMm(viewConfig.paper_size);
+  const showMcqGridLabel = shouldShowMcqGridLabel(viewConfig);
+  const useSecondPage = showSecondPage && !foldMode;
 
   const mcqRegion = React.useMemo(
-    () => computeMcqRegionForFreeform(sheetConfig, fields, mcq.top_mm, mcq.left_mm),
-    [sheetConfig, fields, mcq.top_mm, mcq.left_mm],
+    () => computeMcqRegionForFreeform(viewConfig, canvasFields, mcq.top_mm, mcq.left_mm),
+    [viewConfig, canvasFields, mcq.top_mm, mcq.left_mm],
   );
 
-  const minMcqTopMm = React.useMemo(
-    () =>
-      identityZoneTopMm() +
-      estimateFreeformIdentityHeightMm(fields, sheetConfig, 0, mcq.top_mm) +
-      sheetSepBelowIdentityMm(),
-    [fields, sheetConfig, mcq.top_mm],
-  );
+  const p2Region = React.useMemo(() => computeMcqRegionSecondPage(viewConfig), [viewConfig]);
+
+  const activeMcqRegion = useSecondPage ? p2Region : mcqRegion;
+
+  const sectionTitleBlocks = mcqSectionsUseStacked(viewConfig)
+    ? activeMcqRegion.blocks.filter(isSectionTitleBlock)
+    : [];
+  const hideSectionTitles = sectionTitleBlocks.length > 0 && !readOnly;
+
+  const minMcqTopMm = React.useMemo(() => {
+    const mcqMatch = mcqMatchInfoFromRegion(activeMcqRegion);
+    const labelHeadroom = shouldShowMcqGridLabel(viewConfig) ? FIELD_HEADER_BAR_MM : 0;
+    return minMcqGridTopAnchorMm(canvasFields, viewConfig, mcqMatch, labelHeadroom);
+  }, [canvasFields, viewConfig, activeMcqRegion]);
 
   const wysiwygCfg = React.useMemo(
-    () => applyIdentityMcqBubbleSync(sheetConfig, mcqRegion),
-    [sheetConfig, mcqRegion],
+    () => applyIdentityMcqBubbleSync(viewConfig, mcqMatchInfoFromRegion(activeMcqRegion)),
+    [viewConfig, activeMcqRegion],
   );
 
-  const p2Region = React.useMemo(() => computeMcqRegionSecondPage(sheetConfig), [sheetConfig]);
+  const panelOpenBlocks = React.useMemo(() => {
+    const all = sheetConfig.open_blocks ?? [];
+    if (!foldMode) return all.map((b, index) => ({ b, index }));
+    return all
+      .map((b, index) => ({ b, index }))
+      .filter(({ b }) => (b.panel ?? 1) === foldPanel);
+  }, [foldMode, sheetConfig.open_blocks, foldPanel]);
+
+  const otherPanelOpenCount = React.useMemo(() => {
+    if (!foldMode) return 0;
+    return (sheetConfig.open_blocks ?? []).filter((b) => (b.panel ?? 1) !== foldPanel).length;
+  }, [foldMode, sheetConfig.open_blocks, foldPanel]);
+
+  const panelRange = foldMode ? foldPanelRange(sheetConfig, foldPanel) : null;
+  const panelMeta = foldMode ? PANEL_META[foldPanel] : null;
+
+  const scale = zoom / 100;
 
   const onDragEnd = (e: DragEndEvent) => {
-    const dx_mm = e.delta.x / PX_MM;
-    const dy_mm = e.delta.y / PX_MM;
+    const dx_mm = dragDeltaToMm(e.delta.x, scale);
+    const dy_mm = dragDeltaToMm(e.delta.y, scale);
+    const secIdx = parseMcqSectionDragIndex(String(e.active.id));
+    if (secIdx !== null && onMcqSectionsChange) {
+      const sections = [...resolveMcqSections(viewConfig)];
+      const sec = sections[secIdx];
+      if (!sec) return;
+      const titleBlock = activeMcqRegion.blocks.find(
+        (b): b is McqSectionTitleBlock =>
+          isSectionTitleBlock(b) && b.section_index === secIdx,
+      );
+      const curTop = sec.top_mm ?? titleBlock?.y_mm ?? (secIdx === 0 ? mcq.top_mm : minMcqTopMm);
+      const curLeft = sec.left_mm ?? titleBlock?.left_mm ?? mcq.left_mm;
+      const newTop = clamp(curTop + dy_mm, minMcqTopMm, PAGE_H_MM - FOOTER_RESERVE_MM - 20);
+      const newLeft = clamp(curLeft + dx_mm, contentLeftMm(), PAGE_W_MM - 40);
+      sections[secIdx] = { ...sec, top_mm: newTop, left_mm: newLeft };
+      onMcqSectionsChange(sections);
+      if (secIdx === 0) {
+        onMcqChange({ top_mm: newTop, left_mm: newLeft });
+      }
+      return;
+    }
     if (e.active.id === MCQ_GRID_DRAG_ID) {
       onMcqChange({
-        left_mm: clamp(mcq.left_mm + dx_mm, 12, PAGE_W_MM - 40),
-        top_mm: clamp(
-          mcq.top_mm + dy_mm,
-          minMcqTopMm,
-          PAGE_H_MM - FOOTER_RESERVE_MM - 40,
-        ),
+        left_mm: clamp(mcq.left_mm + dx_mm, contentLeftMm(), PAGE_W_MM - 40),
+        top_mm: clamp(mcq.top_mm + dy_mm, minMcqTopMm, PAGE_H_MM - FOOTER_RESERVE_MM - 40),
       });
       return;
     }
+    const openIdx = parseOpenBlockDragIndex(String(e.active.id));
+    if (openIdx != null && onOpenBlocksChange) {
+      const blocks = [...(sheetConfig.open_blocks ?? [])];
+      const b = blocks[openIdx];
+      if (!b) return;
+      const { w, h } = openBlockSizeMm(b);
+      blocks[openIdx] = {
+        ...b,
+        x_mm: clamp(b.x_mm + dx_mm, contentLeftMm(), Math.max(contentLeftMm(), PAGE_W_MM - w - 4)),
+        y_mm: clamp(
+          b.y_mm + dy_mm,
+          identityZoneTopMm() + 2,
+          Math.max(identityZoneTopMm() + 2, PAGE_H_MM - FOOTER_RESERVE_MM - h),
+        ),
+        panel: foldMode ? foldPanel : (b.panel ?? 1),
+      };
+      onOpenBlocksChange(blocks);
+      return;
+    }
     const bid = String(e.active.id);
-    const next = fields.map((f) =>
-      f.blockId === bid
-        ? {
-            ...f,
-            x_mm: clamp(f.x_mm + dx_mm, 10, PAGE_W_MM - 20),
-            y_mm: clamp(
-              f.y_mm + dy_mm,
-              identityZoneTopMm() + 2,
-              PAGE_H_MM - FOOTER_RESERVE_MM - estimateBlockHeightMm(f, wysiwygCfg),
-            ),
-          }
-        : f,
+    const dragged = fields.find((f) => f.blockId === bid);
+    if (!dragged) return;
+    const mcqMatch = mcqMatchInfoFromRegion(activeMcqRegion);
+    const rawX = clamp(
+      dragged.x_mm + dx_mm,
+      contentLeftMm(),
+      Math.max(
+        contentLeftMm(),
+        contentRightMaxMm(PAGE_W_MM) - estimateBlockWidthMm(dragged, wysiwygCfg, mcqMatch),
+      ),
     );
-    onFieldsChange(next);
+    const rawY = clamp(
+      dragged.y_mm + dy_mm,
+      identityZoneTopMm() + 2,
+      PAGE_H_MM - FOOTER_RESERVE_MM - estimateBlockHeightMm(dragged, wysiwygCfg, mcqMatch),
+    );
+    const pos = clampFieldPositionAvoidingOverlap(
+      dragged,
+      rawX,
+      rawY,
+      fields.filter((f) => f.blockId !== bid),
+      wysiwygCfg,
+      mcqMatch,
+    );
+    onFieldsChange(
+      fields.map((f) => (f.blockId === bid ? { ...f, x_mm: pos.x_mm, y_mm: pos.y_mm } : f)),
+    );
   };
 
-  const scale = zoom / 100;
-  const scaledW = PAGE_W_MM * PX_MM * scale;
+  const contentW = PAGE_W_MM * PX_MM;
+  const pageHpx = PAGE_H_MM * PX_MM;
+  const pageCount = useSecondPage ? 2 : 1;
+  const PAGE_LABEL_CHROME_PX = 23;
+  const CANVAS_TOP_PAD_PX = foldMode ? 8 : 20;
+  const PAGE_GAP_PX = 24;
+  const foldChromeH = foldMode ? 118 : 0;
+  const contentH =
+    foldChromeH +
+    CANVAS_TOP_PAD_PX +
+    pageCount * (pageHpx + PAGE_LABEL_CHROME_PX) +
+    (pageCount > 1 ? PAGE_GAP_PX : 0);
+  const scaledW = Math.max(contentW, foldMode ? 560 : contentW) * scale;
+  const scaledH = contentH * scale;
+
+  const pageLabel = foldMode
+    ? `${panelMeta?.short ?? `P${foldPanel}`} · ${panelMeta?.hint ?? ""}`
+    : "1-ci Səhifə";
 
   return (
     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-      <div className="flex flex-col items-center gap-3">
-        {/* Canvas area */}
-        <div style={{ width: scaledW }} className="relative">
+      <div className="flex w-full flex-col items-center">
+        {foldMode ? (
+          <div className="mb-3 w-full max-w-2xl space-y-2 px-2">
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <div className="flex rounded-lg bg-slate-200/80 p-0.5 text-[11px] font-semibold">
+                {([1, 2] as const).map((f) => (
+                  <button
+                    key={f}
+                    type="button"
+                    className={`rounded-md px-3 py-1.5 ${
+                      foldFace === f ? "bg-white text-slate-900 shadow-sm" : "text-slate-600"
+                    }`}
+                    onClick={() => {
+                      setFoldFace(f);
+                      setFoldPanel(FACE_PANEL_MAP[f][1]);
+                    }}
+                  >
+                    Üz {f}
+                  </button>
+                ))}
+              </div>
+              <div className="flex rounded-lg bg-slate-200/80 p-0.5 text-[11px] font-semibold">
+                {[1, 2, 3, 4].map((p) => {
+                  const rng = foldPanelRange(sheetConfig, p);
+                  return (
+                    <button
+                      key={p}
+                      type="button"
+                      className={`rounded-md px-2.5 py-1.5 ${
+                        foldPanel === p ? "bg-[#c0176a] text-white shadow-sm" : "text-slate-600"
+                      }`}
+                      onClick={() => setFoldPanel(p)}
+                      title={PANEL_META[p]?.hint}
+                    >
+                      P{p}
+                      {rng ? <span className="ml-1 opacity-80">{rng.from_q}–{rng.to_q}</span> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <FoldFaceSchematic face={foldFace} activePanel={foldPanel} onSelectPanel={setFoldPanel} />
+            <p className="text-center text-[11px] text-slate-500">
+              Hər panel A4-dür (qatlananda 4 səhifə). Üz sxemində sol/sağ paneli seçib məzmun yerləşdirin.
+              {panelRange
+                ? ` Bu paneldə suallar: ${panelRange.from_q}–${panelRange.to_q}.`
+                : " Bu paneldə MCQ yoxdur."}
+              {!showIdentity ? " Şəxsiyyət sahələri P1-dədir." : ""}
+              {panelOpenBlocks.length > 0
+                ? ` Açıq sual: ${panelOpenBlocks.length} (kanvasda sürükləyin).`
+                : ""}
+              {otherPanelOpenCount > 0
+                ? ` Digər panellərdə ${otherPanelOpenCount} açıq sual — P1–P4 ilə keçin.`
+                : ""}
+            </p>
+          </div>
+        ) : null}
+
+        <div className="relative overflow-hidden" style={{ width: contentW * scale, height: (contentH - foldChromeH) * scale }}>
           <div
             style={{
               transform: `scale(${scale})`,
               transformOrigin: "top left",
-              width: PAGE_W_MM * PX_MM,
+              width: contentW,
+              height: contentH - foldChromeH,
             }}
           >
-            <div className="space-y-6 pt-5">
+            <div className="space-y-6" style={{ paddingTop: CANVAS_TOP_PAD_PX }}>
               <PageArtboard
-                pageLabel="1-ci Səhifə"
+                pageLabel={pageLabel}
                 pwMm={PAGE_W_MM}
                 phMm={PAGE_H_MM}
-                sheetConfig={sheetConfig}
+                sheetConfig={viewConfig}
                 sheetUuidPreview={sheetUuidPreview}
-                onBackgroundClick={() => {
-                  onSelectField(null);
-                  setSelMcq(false);
-                }}
+                onBackgroundClick={() => onSelectField(null)}
               >
-                <McqGridWysiwyg region={mcqRegion} />
-                <DraggableMcqMarker
-                  mcq={mcq}
-                  minTopMm={minMcqTopMm}
-                  selected={selMcq}
-                  readOnly={readOnly}
-                  onSelect={() => {
-                    setSelMcq(true);
-                    onSelectField(null);
-                  }}
-                />
-                {fields.map((f) => (
+                {!useSecondPage ? (
+                  <>
+                    <McqGridWysiwyg region={mcqRegion} hideSectionTitles={hideSectionTitles} />
+                    {showMcqGridLabel ? (
+                      <DraggableMcqGridHandle
+                        mcq={mcq}
+                        region={mcqRegion}
+                        minTopMm={minMcqTopMm}
+                        sheetConfig={viewConfig}
+                        pwMm={PAGE_W_MM}
+                        selected={selectedFieldId === MCQ_GRID_DRAG_ID}
+                        readOnly={readOnly}
+                        scale={scale}
+                        onSelect={() => onSelectField(MCQ_GRID_DRAG_ID)}
+                      />
+                    ) : (
+                      sectionTitleBlocks.map((block) => (
+                        <DraggableMcqSectionHandle
+                          key={mcqSectionDragId(block.section_index)}
+                          block={block}
+                          region={mcqRegion}
+                          minTopMm={minMcqTopMm}
+                          selected={selectedFieldId === mcqSectionDragId(block.section_index)}
+                          readOnly={readOnly}
+                          scale={scale}
+                          onSelect={() => onSelectField(mcqSectionDragId(block.section_index))}
+                        />
+                      ))
+                    )}
+                  </>
+                ) : (
+                  <div
+                    className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-center"
+                    style={{
+                      top: (identityZoneTopMm() + 12) * PX_MM,
+                      fontSize: 11,
+                      color: "#9b1257",
+                      maxWidth: "80%",
+                    }}
+                  >
+                    Sual cavablarını 2-ci səhifədə qeyd edin.
+                  </div>
+                )}
+                {canvasFields.map((f) => (
                   <DraggableBlock
                     key={f.blockId}
                     field={f}
                     sheetConfig={wysiwygCfg}
                     selected={selectedFieldId === f.blockId}
                     readOnly={readOnly}
-                    onSelect={() => {
-                      onSelectField(f.blockId);
-                      setSelMcq(false);
-                    }}
+                    scale={scale}
+                    onSelect={() => onSelectField(f.blockId)}
+                  />
+                ))}
+                {panelOpenBlocks.map(({ b, index }) => (
+                  <OpenBlockOverlay
+                    key={openBlockDragId(b, index)}
+                    block={b}
+                    index={index}
+                    selected={selectedFieldId === openBlockDragId(b, index)}
+                    readOnly={readOnly}
+                    scale={scale}
+                    onSelect={() => onSelectField(openBlockDragId(b, index))}
                   />
                 ))}
               </PageArtboard>
 
-              {showSecondPage && (
+              {useSecondPage && (
                 <PageArtboard
                   pageLabel="2-ci Səhifə — yalnız cavab şəbəkəsi"
                   pwMm={PAGE_W_MM}
                   phMm={PAGE_H_MM}
-                  sheetConfig={sheetConfig}
+                  sheetConfig={viewConfig}
                   sheetUuidPreview={sheetUuidPreview}
                 >
-                  <McqGridWysiwyg region={p2Region} />
+                  <McqGridWysiwyg region={p2Region} hideSectionTitles={hideSectionTitles} />
+                  {showMcqGridLabel ? (
+                    <DraggableMcqGridHandle
+                      mcq={mcq}
+                      region={p2Region}
+                      minTopMm={identityZoneTopMm() + 8}
+                      sheetConfig={viewConfig}
+                      pwMm={PAGE_W_MM}
+                      selected={selectedFieldId === MCQ_GRID_DRAG_ID}
+                      readOnly={readOnly}
+                      scale={scale}
+                      onSelect={() => onSelectField(MCQ_GRID_DRAG_ID)}
+                    />
+                  ) : (
+                    sectionTitleBlocks.map((block) => (
+                      <DraggableMcqSectionHandle
+                        key={`p2-${mcqSectionDragId(block.section_index)}`}
+                        block={block}
+                        region={p2Region}
+                        minTopMm={identityZoneTopMm() + 8}
+                        selected={selectedFieldId === mcqSectionDragId(block.section_index)}
+                        readOnly={readOnly}
+                        scale={scale}
+                        onSelect={() => onSelectField(mcqSectionDragId(block.section_index))}
+                      />
+                    ))
+                  )}
                   <div
                     className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center"
                     style={{ fontSize: 11, color: "#94a3b8", maxWidth: "70%" }}
                   >
                     Şəxsiyyət məlumatları 1-ci səhifədə qalır.
-                    <br />Bu səhifə yalnız cavab şəbəkəsi üçündür.
+                    <br />
+                    Bu səhifə yalnız cavab şəbəkəsi üçündür.
                   </div>
                 </PageArtboard>
               )}
             </div>
           </div>
         </div>
-      </div>
-
-      <div
-        className="pointer-events-auto fixed bottom-4 right-4 z-50 flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white/95 px-3 py-1.5 shadow-md backdrop-blur-sm"
-        role="toolbar"
-        aria-label="Canvas böyütmə"
-      >
-        <span className="text-[11px] font-medium text-slate-500">Zoom</span>
-        <div className="flex items-center gap-0.5 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
-          <button
-            type="button"
-            aria-label="Kiçilt"
-            title="Kiçilt (10–300%)"
-            disabled={zoom <= 10}
-            onClick={() => setZoom((z) => clampZoom(z - 5))}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[15px] font-semibold text-slate-700 transition hover:bg-white hover:shadow-sm disabled:pointer-events-none disabled:opacity-35"
-          >
-            −
-          </button>
-          <span className="min-w-[2.75rem] select-none text-center text-[12px] font-semibold tabular-nums text-slate-800">
-            {zoom}%
-          </span>
-          <button
-            type="button"
-            aria-label="Böyüt"
-            title="Böyüt (10–300%)"
-            disabled={zoom >= 300}
-            onClick={() => setZoom((z) => clampZoom(z + 5))}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[15px] font-semibold text-slate-700 transition hover:bg-white hover:shadow-sm disabled:pointer-events-none disabled:opacity-35"
-          >
-            +
-          </button>
-        </div>
-        <div className="hidden h-4 w-px bg-slate-200 sm:block" aria-hidden />
-        {[50, 75, 100, 150, 200].map((z) => (
-          <button
-            key={z}
-            type="button"
-            onClick={() => setZoom(z)}
-            className={`rounded-lg px-2.5 py-1 text-[12px] font-medium transition ${
-              zoom === z ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
-            }`}
-          >
-            {z}%
-          </button>
-        ))}
       </div>
     </DndContext>
   );

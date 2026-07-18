@@ -102,6 +102,7 @@ async def compute_exam_readiness(db: AsyncSession, exam: Exam) -> dict[str, Any]
     ]
 
     scan_prerequisites = [
+        has_questions,
         answer_key_complete,
         sheet_confirmed,
         has_students,
@@ -113,6 +114,8 @@ async def compute_exam_readiness(db: AsyncSession, exam: Exam) -> dict[str, Any]
     missing: list[str] = []
     if qc < 1:
         missing.append("Sual sayı təyin edilməyib")
+    if not has_questions:
+        missing.append("Bütün suallar qeydiyyatda deyil")
     if not answer_key_complete:
         missing.append("Cavab açarı tam deyil")
     if not sheet_confirmed:

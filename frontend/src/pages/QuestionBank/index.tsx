@@ -15,6 +15,7 @@ import {
 } from "../../api/questionBank";
 import { RichHtmlEditor } from "../../components/RichHtmlEditor";
 import { SafeHtml } from "../../components/SafeHtml";
+import PageHeader from "../../components/ui/PageHeader";
 import { plainTextFromHtml } from "../../utils/html";
 import { useAuthStore } from "../../store/authStore";
 
@@ -130,11 +131,11 @@ export default function QuestionBankPage() {
 
   if (!canEdit) {
     return (
-      <div className="mx-auto max-w-3xl rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h1 className="text-xl font-semibold text-slate-900">Sual bazası</h1>
-        <p className="mt-2 text-sm text-slate-600">
-          Bu bölməyə yalnız menecer və administrator daxil ola bilər.
-        </p>
+      <div className="page-container">
+        <PageHeader
+          title="Sual bazası"
+          subtitle="Bu bölməyə yalnız menecer və administrator daxil ola bilər."
+        />
       </div>
     );
   }
@@ -142,15 +143,17 @@ export default function QuestionBankPage() {
   const subjects = subjectsQuery.data ?? [];
 
   return (
-    <div className="mx-auto max-w-[1400px] space-y-6 px-4 py-6">
-      <header className="border-b border-slate-200 pb-6">
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Sual bazası</h1>
-        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-600">
-          Əvvəl <strong className="font-medium text-slate-800">fənlər</strong> yaradın, sonra hər sualı uyğun fənə
-          bağlayın. Çoxtan seçimli suallarda variantların hamısı redaktə oluna bilər; düzgün cavab bir variant seçilir.
-          Word və oxşar proqramlardan məzmunu birbaşa yapışdıra bilərsiniz.
-        </p>
-      </header>
+    <div className="page-container-wide">
+      <PageHeader
+        title="Sual bazası"
+        subtitle={
+          <>
+            Əvvəl <strong className="font-medium text-slate-800">fənlər</strong> yaradın, sonra hər sualı uyğun fənə
+            bağlayın. Çoxtan seçimli suallarda variantların hamısı redaktə oluna bilər; düzgün cavab bir variant seçilir.
+            Word və oxşar proqramlardan məzmunu birbaşa yapışdıra bilərsiniz.
+          </>
+        }
+      />
 
       <div className="flex flex-col gap-8 xl:flex-row xl:items-start">
         <aside className="shrink-0 space-y-4 xl:sticky xl:top-4 xl:w-80">
@@ -285,7 +288,7 @@ export default function QuestionBankPage() {
                           ) : null}
                         </td>
                         <td className="px-4 py-3">{diffLabels[q.difficulty] ?? q.difficulty}</td>
-                        <td className="px-4 py-3">{q.qtype === "mcq" ? "ÇS" : "D/Y"}</td>
+                        <td className="px-4 py-3">{q.qtype === "mcq" ? "ÇS" : q.qtype === "grid_in" ? "Grid" : q.qtype === "essay" ? "Essay" : "D/Y"}</td>
                         <td className="max-w-md px-4 py-3 text-slate-700">
                           {plainTextFromHtml(q.stem).slice(0, 120)}
                           {plainTextFromHtml(q.stem).length > 120 ? "…" : ""}
@@ -442,7 +445,7 @@ function QuestionComposer({
   const qc = useQueryClient();
   const [subjectId, setSubjectId] = useState<number | "">("");
   const [difficulty, setDifficulty] = useState("medium");
-  const [qtype, setQtype] = useState<"mcq" | "tf">("mcq");
+  const [qtype, setQtype] = useState<"mcq" | "tf" | "grid_in" | "essay">("mcq");
   const [stem, setStem] = useState("<p></p>");
   const [points, setPoints] = useState(1);
   const [mcq, setMcq] = useState<McqState>(() => defaultMcq());
@@ -453,7 +456,11 @@ function QuestionComposer({
       const opts =
         qtype === "mcq"
           ? { choices: mcq.choices, correct_key: mcq.correct_key }
-          : { correct_key: tfCorrect };
+          : qtype === "grid_in"
+            ? { answer_length: 3, alphabet: "digits" }
+            : qtype === "essay"
+              ? { max_lines: 8, rubric: "" }
+              : { correct_key: tfCorrect };
       return createBankQuestion({
         subject_id: subjectId === "" ? undefined : subjectId,
         difficulty,
@@ -527,9 +534,11 @@ function QuestionComposer({
         </label>
         <label className="sm:col-span-3 block text-xs font-medium text-slate-600">
           Növ
-          <select className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm" value={qtype} onChange={(e) => setQtype(e.target.value as "mcq" | "tf")}>
+          <select className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm" value={qtype} onChange={(e) => setQtype(e.target.value as "mcq" | "tf" | "grid_in" | "essay")}>
             <option value="mcq">Çoxtan seçimli</option>
             <option value="tf">Doğru / Yanlış</option>
+            <option value="grid_in">Açıq (ədədi grid)</option>
+            <option value="essay">Sərbəst cavab (essay)</option>
           </select>
         </label>
         <label className="sm:col-span-2 block text-xs font-medium text-slate-600">
@@ -636,7 +645,11 @@ function QuestionDetailPanel({
       const opts =
         qtype === "mcq"
           ? { choices: mcq.choices, correct_key: mcq.correct_key }
-          : { correct_key: tfCorrect };
+          : qtype === "grid_in"
+            ? { answer_length: 3, alphabet: "digits" }
+            : qtype === "essay"
+              ? { max_lines: 8, rubric: "" }
+              : { correct_key: tfCorrect };
       await updateBankQuestion(q.id, {
         subject_id: subjectId === "" ? null : subjectId,
         difficulty,
@@ -719,7 +732,7 @@ function QuestionDetailPanel({
                     <strong>Çətinlik:</strong> {diffLabels[q.difficulty] ?? q.difficulty}
                   </span>
                   <span>
-                    <strong>Növ:</strong> {q.qtype === "mcq" ? "ÇS" : "D/Y"}
+                    <strong>Növ:</strong> {q.qtype === "mcq" ? "ÇS" : q.qtype === "grid_in" ? "Grid" : q.qtype === "essay" ? "Essay" : "D/Y"}
                   </span>
                   <span>
                     <strong>Xal:</strong> {q.points}
@@ -781,9 +794,11 @@ function QuestionDetailPanel({
                 </label>
                 <label className="block text-xs font-medium text-slate-600">
                   Növ
-                  <select className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm" value={qtype} onChange={(e) => setQtype(e.target.value as "mcq" | "tf")}>
+                  <select className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm" value={qtype} onChange={(e) => setQtype(e.target.value as "mcq" | "tf" | "grid_in" | "essay")}>
                     <option value="mcq">ÇS</option>
                     <option value="tf">D/Y</option>
+                    <option value="grid_in">Grid</option>
+                    <option value="essay">Essay</option>
                   </select>
                 </label>
                 <label className="block text-xs font-medium text-slate-600">

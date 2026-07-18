@@ -48,3 +48,14 @@ class BankQuestionOut(BaseModel):
 class QuestionFromBankCreate(BaseModel):
     bank_question_id: int = Field(ge=1)
     order_index: int = Field(ge=1, le=500)
+
+
+class QuestionFromBankBulkCreate(BaseModel):
+    bank_question_ids: list[int] = Field(min_length=1, max_length=500)
+    start_order_index: int | None = Field(default=None, ge=1, le=500)
+
+
+class QuestionFromBankBulkResult(BaseModel):
+    imported: int
+    skipped: int
+    errors: list[str] = Field(default_factory=list)

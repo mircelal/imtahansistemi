@@ -43,6 +43,40 @@ class ExamTicketOut(ORMModel):
     ends_at: datetime | None
     is_active: bool
     created_at: datetime
+    confirmed_count: int = 0
+    remaining_quota: int | None = None
+    sale_status: str = "active"
+    exam_title: str | None = None
+    exam_scope: str | None = None
+
+
+class AdminTicketOrderOut(ORMModel):
+    id: int
+    ticket_id: int
+    ticket_title: str
+    course_id: int
+    course_name: str
+    exam_id: int | None
+    exam_title: str | None
+    exam_scope: str | None
+    buyer_name: str
+    buyer_email: str
+    buyer_phone: str | None
+    quantity: int
+    unit_price: float
+    line_total: float
+    currency: str
+    status: TicketOrderStatus
+    notes: str | None
+    student_id: int | None = None
+    created_at: datetime
+
+
+class AdminTicketOrdersSummary(BaseModel):
+    total_orders: int
+    total_tickets_sold: int
+    total_revenue: float
+    by_course: list[dict]
 
 
 class TicketOrderCreate(BaseModel):
@@ -62,4 +96,6 @@ class TicketOrderOut(ORMModel):
     quantity: int
     status: TicketOrderStatus
     notes: str | None
+    payment_method: str | None = None
+    payment_intent_id: int | None = None
     created_at: datetime

@@ -5,15 +5,11 @@ services:
     build:
       context: ./frontend
     ports:
-      - "3000:3000"
+      - "${FRONTEND_HOST_PORT:-3000}:3000"
     environment:
       # Boş: axios /api istifadə edir; Vite proxy backend konteynerinə yönləndirir
       - VITE_API_BASE_URL=
       - VITE_PROXY_API=http://backend:8000
-    volumes:
-      # Hostdakı kod dərhal görünsün (əks halda yalnız image build-dəki köhnə fayllar işləyirdi)
-      - ./frontend:/app
-      - imtahan_frontend_node_modules:/app/node_modules
     depends_on:
       backend:
         condition: service_healthy
@@ -42,11 +38,17 @@ services:
 
   omr-service:
     build:
-      context: ./omr-service
+      context: .
+      dockerfile: omr-service/Dockerfile
     ports:
       - "8001:8001"
     env_file:
       - .env
+    environment:
+      # 0 = nproc (host CPU); sabit limit yoxdur — server böyüdükcə sürətlənir
+      - OMR_UVICORN_WORKERS=${OMR_UVICORN_WORKERS:-0}
+      - OMR_EARLY_EXIT=${OMR_EARLY_EXIT:-1}
+      - OMR_MAX_VARIANTS=${OMR_MAX_VARIANTS:-0}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 20s
@@ -56,7 +58,11 @@ services:
   worker:
     build:
       context: ./backend
-    command: celery -A app.celery_worker.celery_app worker --loglevel=info
+    entrypoint: ["/bin/sh", "/app/scripts/celery_entrypoint.sh"]
+    command: []
+    environment:
+      - SKIP_ALEMBIC=1
+      - CELERY_CONCURRENCY=${CELERY_CONCURRENCY:-0}
     env_file:
       - .env
     depends_on:

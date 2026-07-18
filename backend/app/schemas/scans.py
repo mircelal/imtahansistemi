@@ -13,6 +13,16 @@ class ScanSessionEnsure(BaseModel):
     """İmtahan üçün aktiv skan partiyasını tap və ya avtomatik yarat."""
 
     exam_id: int
+    # True: həmişə yeni boş partiya (köhnə nəticələr saxlanır).
+    force_new: bool = False
+
+
+class ScanQrDetectOut(BaseModel):
+    qr_raw: str | None = None
+    sheet_uuid: str | None = None
+    exam_id: int | None = None
+    exam_title: str | None = None
+    source_file: str | None = None
 
 
 class ScanSessionOut(BaseModel):
@@ -26,6 +36,13 @@ class ScanSessionOut(BaseModel):
     processed_images: int
     created_at: datetime
     finished_at: datetime | None
+
+
+class ScanQuickUploadOut(BaseModel):
+    session: ScanSessionOut
+    uploaded: int
+    queued: bool
+    qr: ScanQrDetectOut
 
 
 class ScanResultOut(BaseModel):
@@ -44,6 +61,11 @@ class ScanResultOut(BaseModel):
     processed_at: datetime
     student_number: str | None = None
     student_full_name: str | None = None
+    # Kartdan OMR ilə oxunan şəxsiyyət (kurs DB-də olmasa belə)
+    card_student_number: str | None = None
+    card_full_name: str | None = None
+    card_identity: dict[str, str] | None = None
+    essay_crops: dict[str, str] | None = None
 
 
 class AssignStudentRequest(BaseModel):
@@ -53,6 +75,23 @@ class AssignStudentRequest(BaseModel):
 
 class ManualCorrectionRequest(BaseModel):
     corrected_answers: dict[str, Any]
+
+
+class EssayGradeRequest(BaseModel):
+    question_number: int
+    awarded_points: float
+    notes: str | None = None
+
+
+class EssayGradeOut(BaseModel):
+    id: int
+    scan_result_id: int
+    question_number: int
+    awarded_points: float
+    max_points: float
+    notes: str | None = None
+    graded_by: int
+    graded_at: datetime
 
 
 class ScanReadingOut(BaseModel):
@@ -72,6 +111,7 @@ class ScanReadingOut(BaseModel):
     processed_at: str | None = None
     field_labels: dict[str, str]
     identity: dict[str, str]
+    identity_summary: dict[str, str] | None = None
     mcq: dict[str, str]
     meta: dict[str, Any]
     raw_detected: dict[str, Any]

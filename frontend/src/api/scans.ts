@@ -19,6 +19,10 @@ export type ScanResult = {
   student_id: number | null;
   student_number?: string | null;
   student_full_name?: string | null;
+  /** Kurs DB-də olmasa belə kartdan OMR kodu */
+  card_student_number?: string | null;
+  card_full_name?: string | null;
+  card_identity?: Record<string, string> | null;
   image_path: string;
   detected_answers: Record<string, unknown>;
   score: number | null;
@@ -27,6 +31,7 @@ export type ScanResult = {
   status: string;
   error_message: string | null;
   processed_at: string;
+  essay_crops?: Record<string, string> | null;
 };
 
 /** Backend `ScanReadingOut` — kanonik OMR oxunuşu. */
@@ -45,6 +50,7 @@ export type ScanReading = {
   processed_at: string | null;
   field_labels: Record<string, string>;
   identity: Record<string, string>;
+  identity_summary?: Record<string, string> | null;
   mcq: Record<string, string>;
   meta: Record<string, unknown>;
   raw_detected: Record<string, unknown>;
@@ -70,8 +76,43 @@ export async function createScanSession(payload: { exam_id: number; operator_id:
 }
 
 /** İmtahan üçün aktiv skan partiyasını tap və ya avtomatik yarat (manual oturum seçimi lazım deyil). */
-export async function ensureScanSession(examId: number) {
-  const { data } = await api.post<ScanSession>("/api/scans/sessions/ensure", { exam_id: examId });
+export async function ensureScanSession(examId: number, forceNew = false) {
+  const { data } = await api.post<ScanSession>("/api/scans/sessions/ensure", {
+    exam_id: examId,
+    force_new: forceNew,
+  });
+  return data;
+}
+
+export type ScanQrDetect = {
+  qr_raw: string | null;
+  sheet_uuid: string | null;
+  exam_id: number | null;
+  exam_title: string | null;
+  source_file: string | null;
+};
+
+export type ScanQuickUpload = {
+  session: ScanSession;
+  uploaded: number;
+  queued: boolean;
+  qr: ScanQrDetect;
+};
+
+/** QR-dan imtahanı avtomatik tanıyıb skan partiyasını açır və faylları yükləyir. */
+export async function quickUploadScanFiles(files: File[], autoProcess = true) {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f));
+  const { data } = await api.post<ScanQuickUpload>("/api/scans/quick-upload", form, {
+    params: { auto_process: autoProcess },
+  });
+  return data;
+}
+
+export async function detectScanQr(file: File) {
+  const form = new FormData();
+  form.append("file", file);
+  const { data } = await api.post<ScanQrDetect>("/api/scans/detect-qr", form);
   return data;
 }
 
@@ -133,4 +174,32 @@ export async function downloadScanResultsCsv(sessionId: number): Promise<Blob> {
     responseType: "blob"
   });
   return data;
+}
+
+export type EssayGrade = {
+  id: number;
+  scan_result_id: number;
+  question_number: number;
+  awarded_points: number;
+  max_points: number;
+  notes: string | null;
+  graded_by: number;
+  graded_at: string;
+};
+
+export async function saveEssayGrade(
+  resultId: number,
+  payload: { question_number: number; awarded_points: number; notes?: string | null },
+) {
+  const { data } = await api.post<EssayGrade>(`/api/scans/results/${resultId}/essay-grade`, payload);
+  return data;
+}
+
+export async function listEssayGrades(resultId: number) {
+  const { data } = await api.get<EssayGrade[]>(`/api/scans/results/${resultId}/essay-grades`);
+  return data;
+}
+
+export function essayCropUrl(resultId: number, questionNumber: number) {
+  return `/api/scans/results/${resultId}/essay-crop/${questionNumber}`;
 }

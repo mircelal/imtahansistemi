@@ -1,12 +1,7 @@
 import type { ReactNode } from "react";
-import { Navigate } from "react-router-dom";
-import { useAuthStore } from "../store/authStore";
+import ProtectedRoute from "./ProtectedRoute";
 
 /** Admin və ya menecer — sual bazası kimi məhdud endpointlər üçün */
 export default function StaffRoute({ children }: { children: ReactNode }) {
-  const user = useAuthStore((s) => s.user);
-  if (user?.role !== "admin" && user?.role !== "manager") {
-    return <Navigate to="/" replace />;
-  }
-  return <>{children}</>;
+  return <ProtectedRoute roles={["admin", "manager"]}>{children}</ProtectedRoute>;
 }

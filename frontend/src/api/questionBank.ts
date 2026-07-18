@@ -21,7 +21,7 @@ export type BankQuestion = {
   subject_id: number | null;
   subject: BankSubjectBrief | null;
   difficulty: string;
-  qtype: "mcq" | "tf";
+  qtype: "mcq" | "tf" | "grid_in" | "essay";
   stem: string;
   options: unknown;
   points: number;
@@ -81,7 +81,7 @@ export async function listQuestionBank(params?: {
 export async function createBankQuestion(payload: {
   subject_id?: number | null;
   difficulty?: string | null;
-  qtype: "mcq" | "tf";
+  qtype: "mcq" | "tf" | "grid_in" | "essay";
   stem: string;
   points?: number;
   options?: unknown;
@@ -96,7 +96,7 @@ export async function updateBankQuestion(
   payload: Partial<{
     subject_id: number | null;
     difficulty: string | null;
-    qtype: "mcq" | "tf";
+    qtype: "mcq" | "tf" | "grid_in" | "essay";
     stem: string;
     points: number;
     options: unknown;

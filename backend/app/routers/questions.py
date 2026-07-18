@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.deps import ensure_exam_access, ensure_exam_write, get_current_user
+from app.deps import ensure_exam_access, ensure_exam_content_write, get_current_user
 from app.models.entities import BankQuestion, BankSubject, Question, QuestionType, User
 from app.schemas.question_bank import QuestionFromBankBulkCreate, QuestionFromBankBulkResult, QuestionFromBankCreate
 from app.schemas.questions import QuestionCreate, QuestionImportResult, QuestionOut, QuestionUpdate
@@ -20,20 +20,24 @@ from app.services.omr_template_stale import mark_exam_omr_templates_stale
 router = APIRouter(prefix="/api/exams", tags=["questions"])
 
 
-def _default_mcq_options_if_needed(qtype: QuestionType, options):
-    if qtype != QuestionType.MCQ:
-        return options
+def _default_options_if_needed(qtype: QuestionType, options):
     if options is not None:
         return options
-    return {
-        "choices": [
-            {"key": "A", "html": "<p></p>"},
-            {"key": "B", "html": "<p></p>"},
-            {"key": "C", "html": "<p></p>"},
-            {"key": "D", "html": "<p></p>"},
-        ],
-        "correct_key": "A",
-    }
+    if qtype == QuestionType.MCQ:
+        return {
+            "choices": [
+                {"key": "A", "html": "<p></p>"},
+                {"key": "B", "html": "<p></p>"},
+                {"key": "C", "html": "<p></p>"},
+                {"key": "D", "html": "<p></p>"},
+            ],
+            "correct_key": "A",
+        }
+    if qtype == QuestionType.GRID_IN:
+        return {"answer_length": 3, "alphabet": "digits"}
+    if qtype == QuestionType.ESSAY:
+        return {"max_lines": 8, "rubric": ""}
+    return options
 
 
 async def _resolve_bank_subject_id(
@@ -74,7 +78,7 @@ async def _insert_bank_row(
     points: float,
     metadata: dict,
 ) -> BankQuestion:
-    raw_opts = _default_mcq_options_if_needed(qtype, options)
+    raw_opts = _default_options_if_needed(qtype, options)
     opts = normalize_bank_options(qtype, raw_opts)
     b = BankQuestion(
         subject_id=subject_id,
@@ -92,9 +96,21 @@ async def _insert_bank_row(
 
 def _serialize_question(q: Question) -> QuestionOut:
     b = q.bank_question
-    sid = b.subject_id if b else None
+    meta = q.metadata_json or {}
+    # Exam-local subject/difficulty overrides (do not mutate shared BankQuestion)
+    if "subject_id" in meta:
+        sid = meta.get("subject_id")
+    else:
+        sid = b.subject_id if b else None
+    if "difficulty" in meta and meta.get("difficulty") is not None:
+        difficulty = meta.get("difficulty")
+    else:
+        difficulty = b.difficulty if b else None
     sname = b.subject_ref.name if b and b.subject_ref else None
     sscode = b.subject_ref.short_code if b and b.subject_ref else None
+    if "subject_id" in meta and sid is not None and (b is None or b.subject_id != sid):
+        sname = meta.get("subject_name") or sname
+        sscode = meta.get("subject_short_code") or sscode
     return QuestionOut(
         id=q.id,
         exam_id=q.exam_id,
@@ -102,7 +118,7 @@ def _serialize_question(q: Question) -> QuestionOut:
         subject_id=sid,
         subject_name=sname,
         subject_short_code=sscode,
-        difficulty=b.difficulty if b else None,
+        difficulty=difficulty,
         order_index=q.order_index,
         qtype=q.qtype,
         stem=q.stem,
@@ -146,11 +162,11 @@ async def create_question(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     if payload.qtype == QuestionType.TF:
         raise HTTPException(
             status_code=400,
-            detail="Doğru/Yanlış sualları hələ dəstəklənmir — çoxseçimli (MCQ) sual istifadə edin",
+            detail="Doğru/Yanlış sualları hələ dəstəklənmir — çoxseçimli (MCQ), grid_in və ya essay istifadə edin",
         )
     exists = await db.scalar(
         select(Question.id).where(Question.exam_id == exam_id, Question.order_index == payload.order_index)
@@ -195,7 +211,7 @@ async def create_question_from_bank(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     exists = await db.scalar(
         select(Question.id).where(Question.exam_id == exam_id, Question.order_index == payload.order_index)
     )
@@ -232,7 +248,7 @@ async def create_questions_from_bank_bulk(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     seen_ids: set[int] = set()
     unique_ids: list[int] = []
     for raw in payload.bank_question_ids:
@@ -297,7 +313,7 @@ async def update_question(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     row = await db.scalar(
         select(Question)
         .options(selectinload(Question.bank_question).selectinload(BankQuestion.subject_ref))
@@ -335,22 +351,31 @@ async def update_question(
     for key, value in data.items():
         setattr(row, key, value)
 
-    b = row.bank_question
-    if b is not None:
-        for bk, bv in bank_side.items():
-            setattr(b, bk, bv)
-        if any(k in data for k in ("stem", "options", "qtype", "points")):
-            b.stem = row.stem
-            b.points = row.points
-            b.qtype = row.qtype
-            qt = row.qtype
-            if "options" in data:
-                raw_opts = _default_mcq_options_if_needed(qt, row.options)
-                b.options = normalize_bank_options(qt, raw_opts)
-            elif "qtype" in data:
-                raw_opts = _default_mcq_options_if_needed(qt, row.options)
-                b.options = normalize_bank_options(qt, raw_opts)
-            row.options = b.options
+    # Exam Question is source of truth — never mutate shared BankQuestion
+    if bank_side:
+        meta = dict(row.metadata_json or {})
+        if "subject_id" in bank_side:
+            sid = bank_side["subject_id"]
+            meta["subject_id"] = sid
+            if sid is not None:
+                sub = await db.get(BankSubject, sid)
+                if sub is not None:
+                    meta["subject_name"] = sub.name
+                    meta["subject_short_code"] = sub.short_code
+                else:
+                    meta.pop("subject_name", None)
+                    meta.pop("subject_short_code", None)
+            else:
+                meta["subject_name"] = None
+                meta["subject_short_code"] = None
+        if "difficulty" in bank_side:
+            meta["difficulty"] = bank_side["difficulty"]
+        row.metadata_json = meta
+
+    if "options" in data or "qtype" in data:
+        qt = row.qtype
+        raw_opts = _default_options_if_needed(qt, row.options)
+        row.options = normalize_bank_options(qt, raw_opts)
 
     await db.commit()
     loaded = await _load_question(db, question_id)
@@ -366,7 +391,7 @@ async def delete_question(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     row = await db.get(Question, question_id)
     if row is None or row.exam_id != exam_id:
         raise HTTPException(status_code=404, detail="Question not found")
@@ -383,7 +408,7 @@ async def import_questions_csv(
     user: User = Depends(get_current_user),
     file: UploadFile = File(...),
 ):
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     raw = (await file.read()).decode("utf-8-sig")
     reader = csv.DictReader(StringIO(raw))
     required = {"order_index", "stem"}
@@ -403,7 +428,18 @@ async def import_questions_csv(
             order_index = int(row["order_index"].strip())
             stem = (row.get("stem") or "").strip()
             qtype_raw = (row.get("qtype") or "mcq").strip().lower()
-            qtype = QuestionType.MCQ if qtype_raw == "mcq" else QuestionType.TF
+            qtype_map = {
+                "mcq": QuestionType.MCQ,
+                "tf": QuestionType.TF,
+                "grid_in": QuestionType.GRID_IN,
+                "grid-in": QuestionType.GRID_IN,
+                "essay": QuestionType.ESSAY,
+                "open": QuestionType.ESSAY,
+            }
+            qtype = qtype_map.get(qtype_raw, QuestionType.MCQ)
+            if qtype == QuestionType.TF:
+                skipped += 1
+                continue
             points = float(row.get("points") or 1.0)
             options = None
             if row.get("options_json"):
@@ -450,6 +486,85 @@ async def import_questions_csv(
         except (ValueError, KeyError, json.JSONDecodeError):
             skipped += 1
             continue
+    await db.commit()
+    await mark_exam_omr_templates_stale(db, exam_id)
+    await db.commit()
+    return QuestionImportResult(imported=imported, skipped=skipped)
+
+
+@router.post("/{exam_id}/questions/import-docx", response_model=QuestionImportResult)
+async def import_questions_docx(
+    exam_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    file: UploadFile = File(...),
+):
+    """Word (.docx) — nömrələnmiş suallar və A–E variantları."""
+    await ensure_exam_content_write(exam_id, user, db)
+    name = (file.filename or "").lower()
+    if not name.endswith(".docx"):
+        raise HTTPException(status_code=400, detail="Yalnız .docx (Word) faylı qəbul edilir")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Fayl boşdur")
+
+    from app.services.question_docx_import import parse_questions_from_docx, parsed_to_bank_options
+
+    try:
+        parsed = parse_questions_from_docx(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Word faylı oxunmadı: {exc}") from exc
+
+    if not parsed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Sual tapılmadı. Format nümunəsi: «1. Sual mətni» sonra «A) variant» «B) variant»…"
+            ),
+        )
+
+    imported = 0
+    skipped = 0
+    for pq in parsed:
+        exists = await db.scalar(
+            select(Question.id).where(Question.exam_id == exam_id, Question.order_index == pq.order_index)
+        )
+        if exists is not None:
+            skipped += 1
+            continue
+        qtype = QuestionType.ESSAY if pq.qtype == "essay" or not pq.options else QuestionType.MCQ
+        options = parsed_to_bank_options(pq)
+        if qtype == QuestionType.MCQ and options is None:
+            skipped += 1
+            continue
+        try:
+            bank = await _insert_bank_row(
+                db,
+                subject_id=None,
+                difficulty=None,
+                qtype=qtype,
+                stem=pq.stem,
+                options=options,
+                points=1.0,
+                metadata={"imported_from": "docx"},
+            )
+            db.add(
+                Question(
+                    exam_id=exam_id,
+                    bank_question_id=bank.id,
+                    order_index=pq.order_index,
+                    qtype=qtype,
+                    stem=pq.stem,
+                    options=bank.options,
+                    points=1.0,
+                    metadata_json={"imported_from": "docx"},
+                )
+            )
+            imported += 1
+        except Exception:
+            skipped += 1
+            continue
+
     await db.commit()
     await mark_exam_omr_templates_stale(db, exam_id)
     await db.commit()

@@ -22,6 +22,37 @@ const statusClass: Record<string, string> = {
   error: "text-red-700"
 };
 
+/** Q1=A Q2=B … qısa önizləmə */
+function answersPreview(detected: Record<string, unknown> | null | undefined, limit = 12): string {
+  if (!detected) return "—";
+  const pairs: { n: number; v: string }[] = [];
+  for (const [k, raw] of Object.entries(detected)) {
+    if (k.startsWith("__")) continue;
+    const m = /^q?(\d+)$/i.exec(k);
+    if (!m) continue;
+    const n = Number(m[1]);
+    const v = raw == null ? "" : String(raw).trim().toUpperCase().slice(0, 1);
+    if (!v || !/^[A-E]$/.test(v)) continue;
+    if (!pairs.some((p) => p.n === n)) pairs.push({ n, v });
+  }
+  pairs.sort((a, b) => a.n - b.n);
+  if (!pairs.length) return "oxunmayıb";
+  const head = pairs.slice(0, limit).map((p) => `${p.n}${p.v}`).join(" ");
+  return pairs.length > limit ? `${head}…` : head;
+}
+
+function cardMetaLine(card: Record<string, string> | null | undefined): string {
+  if (!card) return "";
+  const bits: string[] = [];
+  if (card.school) bits.push(`Məktəb ${card.school}`);
+  if (card.class) bits.push(`Sinif ${card.class}`);
+  if (card.variant) bits.push(`Var ${card.variant}`);
+  if (card.language) bits.push(`Dil ${card.language}`);
+  if (card.group) bits.push(`Qrup ${card.group}`);
+  if (card.section) bits.push(`Bölmə ${card.section}`);
+  return bits.join(" · ");
+}
+
 export default function ResultsTable({ sessionId, sessionStatus, selectedResultId, onSelectResult }: Props) {
   const [onlyPendingReview, setOnlyPendingReview] = useState(false);
 
@@ -100,7 +131,7 @@ export default function ResultsTable({ sessionId, sessionStatus, selectedResultI
               <tr className="border-b border-slate-200 text-slate-600">
                 <th className="py-2 pr-4">ID</th>
                 <th className="py-2 pr-4">Şagird</th>
-                <th className="py-2 pr-4">Fayl</th>
+                <th className="py-2 pr-4">Cavablar</th>
                 <th className="py-2 pr-4">Xal</th>
                 <th className="py-2 pr-4">Status</th>
                 <th className="py-2">Xəta / qeyd</th>
@@ -108,8 +139,6 @@ export default function ResultsTable({ sessionId, sessionStatus, selectedResultI
             </thead>
             <tbody>
               {visibleRows.map((row) => {
-                const shortPath =
-                  row.image_path.length > 48 ? `…${row.image_path.slice(-44)}` : row.image_path;
                 const active = row.id === selectedResultId;
                 return (
                   <tr
@@ -120,20 +149,40 @@ export default function ResultsTable({ sessionId, sessionStatus, selectedResultI
                     onClick={() => onSelectResult(row.id)}
                   >
                     <td className="py-2 pr-4 font-medium">{row.id}</td>
-                    <td className="max-w-[140px] truncate py-2 pr-4 text-xs text-slate-800" title={row.student_full_name ?? ""}>
-                      {row.student_number ? (
+                    <td
+                      className="max-w-[200px] py-2 pr-4 text-xs text-slate-800"
+                      title={[row.student_full_name, cardMetaLine(row.card_identity)].filter(Boolean).join(" · ")}
+                    >
+                      {row.student_number || row.card_student_number ? (
                         <>
-                          <span className="font-mono font-semibold">{row.student_number}</span>
-                          {row.student_full_name ? (
-                            <span className="mt-0.5 block truncate text-slate-600">{row.student_full_name}</span>
+                          <span className="font-mono font-semibold">
+                            {row.student_number || row.card_student_number}
+                          </span>
+                          {!row.student_id && (row.student_number || row.card_student_number) ? (
+                            <span className="ml-1 rounded bg-amber-50 px-1 text-[10px] font-medium text-amber-900">
+                              kartdan
+                            </span>
+                          ) : null}
+                          {row.student_full_name || row.card_full_name ? (
+                            <span className="mt-0.5 block truncate text-slate-600">
+                              {row.student_full_name || row.card_full_name}
+                            </span>
+                          ) : null}
+                          {cardMetaLine(row.card_identity) ? (
+                            <span className="mt-0.5 block truncate text-[10px] text-slate-500">
+                              {cardMetaLine(row.card_identity)}
+                            </span>
                           ) : null}
                         </>
                       ) : (
                         <span className="text-slate-400">—</span>
                       )}
                     </td>
-                    <td className="max-w-[240px] truncate py-2 pr-4 text-slate-700" title={row.image_path}>
-                      {shortPath}
+                    <td
+                      className="max-w-[220px] truncate py-2 pr-4 font-mono text-[11px] text-slate-700"
+                      title={answersPreview(row.detected_answers, 40)}
+                    >
+                      {answersPreview(row.detected_answers)}
                     </td>
                     <td className="py-2 pr-4">
                       {row.score != null && row.max_score != null ? (

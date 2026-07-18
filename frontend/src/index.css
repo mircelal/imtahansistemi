@@ -4,7 +4,7 @@
 
 @layer base {
   body {
-    @apply min-h-screen bg-[#f5f5f7] antialiased text-[#1d1d1f];
+    @apply min-h-screen bg-surface antialiased text-[#1d1d1f];
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   }
 }
@@ -21,10 +21,33 @@
   }
 }
 
-/* Köhnə `.card` istifadələri üçün (styles.css silindikdən sonra boş qalmışdı) */
 @layer components {
   .card {
-    @apply rounded-xl border border-slate-200 bg-white p-4 shadow-sm;
+    @apply rounded-2xl border border-slate-200 bg-white p-4 shadow-sm;
+  }
+
+  .page-container {
+    @apply mx-auto w-full max-w-content space-y-8 pb-10;
+  }
+
+  .page-container-wide {
+    @apply mx-auto w-full max-w-contentWide space-y-8 pb-10;
+  }
+
+  .page-container-narrow {
+    @apply mx-auto w-full max-w-3xl space-y-8 pb-10;
+  }
+
+  .section-title {
+    @apply text-lg font-semibold tracking-tight text-slate-900;
+  }
+
+  .table-base {
+    @apply min-w-full text-left text-sm;
+  }
+
+  .table-head {
+    @apply border-b border-slate-100 bg-slate-50/80 text-[11px] font-bold uppercase tracking-wider text-slate-500;
   }
 
   /* Sidebar: incə, Apple-oxşar scroll zolağı */

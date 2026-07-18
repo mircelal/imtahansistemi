@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
-from app.deps import ensure_exam_access, ensure_exam_write, get_current_user
+from app.deps import ensure_exam_access, ensure_exam_content_write, ensure_exam_write, get_current_user
 from app.models.entities import AnswerSheetTemplate, Exam, User
 from app.schemas.answer_sheets import (
     AnswerSheetAuditResponse,
@@ -237,7 +237,7 @@ async def finalize_answer_sheet_draft(
     user: User = Depends(get_current_user),
 ):
     """Qaralamadan PDF yaradır, MinIO-ya yazır və şablonu skan üçün aktiv edir."""
-    await ensure_exam_write(exam_id, user, db)
+    await ensure_exam_content_write(exam_id, user, db)
     row = await db.get(AnswerSheetTemplate, template_id)
     if row is None or row.exam_id != exam_id:
         raise HTTPException(status_code=404, detail="Şablon tapılmadı")

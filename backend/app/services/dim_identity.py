@@ -146,6 +146,15 @@ def digit_group_row_stack_height_mm(cfg: dict[str, Any], field: dict[str, Any] |
     if field is not None and digit_group_show_handwrite_box(field, cfg):
         h += digit_group_handwrite_square_side_mm(met) + DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM
     return h + ch
+
+
+# PDF `_draw_identity_section` mcq / mcq_groups ilə eyni offsetlər
+MCQ_GROUPS_X_INSET_MM = 2.0
+MCQ_GROUPS_LABEL_TO_FIRST_BUBBLE_MM = 14.0
+MCQ_GROUPS_BUBBLE_CY_OFFSET_MM = 6.0
+MCQ_SINGLE_GAP_AFTER_HEADER_MM = 1.5
+
+
 def mcq_single_block_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
     met = identity_draw_metrics(cfg)
     ld, lhg = float(met["letter_d"]), float(met["letter_hgap"])
@@ -160,23 +169,72 @@ def mcq_single_block_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
 def mcq_single_block_height_mm(cfg: dict[str, Any]) -> float:
     met = identity_draw_metrics(cfg)
     ld = float(met["letter_d"])
-    return _IDENTITY_FIELD_HEADER_MM + 1.0 + 1.5 + ld + 3.5
+    return _IDENTITY_FIELD_HEADER_MM + 1.0 + MCQ_SINGLE_GAP_AFTER_HEADER_MM + ld + 3.5
+
+
+def identity_mcq_single_first_bubble_center_mm(
+    field_left_mm: float,
+    field_top_mm: float,
+    cfg: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    """
+    `kind=mcq` ilk balon mərkəzi (cx, cy), mərkəz–mərkəz gap, diametr — PDF ilə eyni.
+    """
+    met = identity_draw_metrics(cfg)
+    ld = float(met["letter_d"])
+    gap = float(met["letter_hgap"])
+    cx0 = field_left_mm + MCQ_GROUPS_X_INSET_MM + ld / 2.0
+    cy = field_top_mm + _IDENTITY_FIELD_HEADER_MM + MCQ_SINGLE_GAP_AFTER_HEADER_MM + ld / 2.0
+    return cx0, cy, gap, ld
+
+
+def iter_mcq_groups_bubble_layouts(
+    field: dict[str, Any],
+    field_left_mm: float,
+    field_top_mm: float,
+    cfg: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    `mcq_groups` hər qrup üçün ilk balon mərkəzi + gap/d — PDF draw ilə eyni mm.
+    Hər element: id, options, label_x_mm, cx0_mm, cy_mm, gap_mm, d_mm.
+    """
+    met = identity_draw_metrics(cfg)
+    gap_mm = float(met["letter_hgap"])
+    ld = float(met["letter_d"])
+    cy = field_top_mm + MCQ_GROUPS_BUBBLE_CY_OFFSET_MM
+    x_mm = field_left_mm + MCQ_GROUPS_X_INSET_MM
+    out: list[dict[str, Any]] = []
+    for g in field.get("groups") or []:
+        gid = str(g.get("id", "mcq"))
+        glabel = str(g.get("label") or gid)
+        opts = [str(x) for x in (g.get("options") or ["A", "B"])]
+        n = max(1, len(opts))
+        bx_mm = x_mm + MCQ_GROUPS_LABEL_TO_FIRST_BUBBLE_MM
+        out.append(
+            {
+                "id": gid,
+                "label": glabel,
+                "options": opts,
+                "label_x_mm": x_mm,
+                "cx0_mm": bx_mm,
+                "cy_mm": cy,
+                "gap_mm": gap_mm,
+                "d_mm": ld,
+            }
+        )
+        x_mm = bx_mm + max(6.5, float(n) * gap_mm + 2.0)
+    return out
 
 
 def mcq_groups_row_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
     """Üfüqi bir sətirdə `mcq_groups` — `pdf_generator` ilə eyni x_addımı (mm, sahənin solundan)."""
-    groups = list(f.get("groups") or [])
-    if not groups:
+    layouts = iter_mcq_groups_bubble_layouts(f, 0.0, 0.0, cfg)
+    if not layouts:
         return 88.0
-    met = identity_draw_metrics(cfg)
-    gap_mm = float(met["letter_hgap"])
-    x_mm = 2.0
-    for g in groups:
-        opts = list(g.get("options") or ["A", "B"])
-        n = max(1, len(opts))
-        bx_mm = x_mm + 14.0
-        x_mm = bx_mm + max(6.5, float(n) * gap_mm + 2.0)
-    return max(88.0, x_mm + 6.0)
+    last = layouts[-1]
+    n = max(1, len(last["options"]))
+    right = float(last["cx0_mm"]) + max(6.5, float(n) * float(last["gap_mm"]) + 2.0)
+    return max(88.0, right + 6.0)
 
 
 def _field_height_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
@@ -207,6 +265,8 @@ def _field_height_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
     if kind == "note":
         lines = int(f.get("lines", 1))
         return _IDENTITY_FIELD_HEADER_MM + 5.0 * max(1, lines)
+    if kind == "declaration":
+        return _IDENTITY_FIELD_HEADER_MM + float(f.get("box_h_mm", 28.0))
     return 6.0
 
 
@@ -252,6 +312,8 @@ def _field_width_mm(f: dict[str, Any], cfg: dict[str, Any]) -> float:
         return mcq_single_block_width_mm(f, cfg)
     if kind == "note":
         return 175.0
+    if kind == "declaration":
+        return float(f.get("box_w_mm", 175.0))
     return 80.0
 
 
@@ -314,19 +376,13 @@ def identity_field_audit_boxes(
         return out
 
     if kind == "mcq_groups":
-        y_meta = y0 + 6.0
         block_h = mcq_single_block_height_mm(cfg)
-        x_run = x0 + 2.0
-        for g in f.get("groups") or []:
-            gid = str(g.get("id", "mcq"))
-            label = str(g.get("label") or gid)
-            opts = list(g.get("options") or ["A", "B"])
-            n = max(1, len(opts))
-            gap = float(lhg)
-            # PDF: x_cursor += 2.45 + len(opts) * gap + 16.0
-            gw = max(6.5, 2.45 + n * gap + 2.0)
-            _push(x_run, y0, gw, block_h, tag=gid, label=label)
-            x_run += 2.45 + n * gap + 16.0
+        for lay in iter_mcq_groups_bubble_layouts(f, x0, y0, cfg):
+            n = max(1, len(lay["options"]))
+            gap = float(lay["gap_mm"])
+            # Label inset + bubbles span (PDF row advance)
+            gw = MCQ_GROUPS_LABEL_TO_FIRST_BUBBLE_MM + max(6.5, float(n) * gap + 2.0)
+            _push(float(lay["label_x_mm"]), y0, gw, block_h, tag=str(lay["id"]), label=str(lay["label"]))
         return out
 
     w = _field_width_mm(f, cfg)
@@ -478,21 +534,20 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
                 y = y_row
 
         elif kind == "mcq_groups":
-            y_meta = y + 6.0
-            x_cursor = field_left_mm + 2.0
-            for g in f.get("groups") or []:
-                gid = str(g.get("id", "mcq"))
-                opts = [str(x) for x in (g.get("options") or ["A", "B"])]
+            for lay in iter_mcq_groups_bubble_layouts(f, field_left_mm, y, cfg):
+                gid = str(lay["id"])
+                opts = list(lay["options"])
                 lab = f"id_{gid}"
                 n = max(2, min(5, len(opts)))
-                gap = 8.5 if len(opts) <= 5 else 7.0
-                ox_mm, oy_mm = _center_to_origin_tl(x_cursor + 2.45, y_meta, 4.9)
+                gap = float(lay["gap_mm"])
+                d_mm = float(lay["d_mm"])
+                ox_mm, oy_mm = _center_to_origin_tl(float(lay["cx0_mm"]), float(lay["cy_mm"]), d_mm)
                 std4 = list("ABCD")
                 std5 = list("ABCDE")
                 blk: dict[str, Any] = {
                     "fieldLabels": [lab],
                     "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
-                    "bubblesGap": mm_to_px(gap if gid == "grp" else gap + 0.5),
+                    "bubblesGap": mm_to_px(gap),
                     "labelsGap": mm_to_px(0),
                 }
                 if n in (4, 5) and opts in (std4, std5):
@@ -505,7 +560,6 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
                     blk["direction"] = "horizontal"
                 field_blocks[f"MCQ_{gid}_{fb_i}"] = blk
                 out_cols.append(lab)
-                x_cursor += 2.45 + len(opts) * gap + 16.0
                 fb_i += 1
             if not layout_ff:
                 y += 14.0
@@ -585,17 +639,14 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
         elif kind == "mcq":
             gid = str(f.get("id", "one"))
             opts = [str(x) for x in (f.get("options") or ["A", "B", "C", "D"])]
-            y_meta = y + 6.0
-            ox_mm, oy_mm = _center_to_origin_tl(field_left_mm + 12.0 + 2.45, y_meta, 4.9)
-            opts = [str(x) for x in (f.get("options") or ["A", "B", "C", "D"])]
-            y_meta = y + 6.0
-            ox_mm, oy_mm = _center_to_origin_tl(field_left_mm + 12.0 + 2.45, y_meta, 4.9)
+            cx0, cy, gap, d_mm = identity_mcq_single_first_bubble_center_mm(field_left_mm, y, cfg)
+            ox_mm, oy_mm = _center_to_origin_tl(cx0, cy, d_mm)
             n = max(2, min(5, len(opts)))
             std4 = list("ABCD")
             std5 = list("ABCDE")
             blk: dict[str, Any] = {
                 "fieldLabels": [f"id_{gid}"],
-                "bubblesGap": mm_to_px(9.0),
+                "bubblesGap": mm_to_px(gap),
                 "labelsGap": mm_to_px(0),
                 "origin": [mm_to_px(ox_mm), mm_to_px(oy_mm)],
             }
@@ -617,6 +668,10 @@ def build_identity_omr_field_blocks(cfg: dict[str, Any]) -> tuple[dict[str, Any]
             if not layout_ff:
                 y += 5.0
 
+        elif kind == "declaration":
+            if not layout_ff:
+                y += float(f.get("box_h_mm", 28.0))
+
         if not layout_ff:
             y += 2.0
 
@@ -635,6 +690,7 @@ def validate_identity_fields(fields: list[dict[str, Any]]) -> list[str]:
             "digits",
             "mcq",
             "note",
+            "declaration",
         ):
             errs.append(f"Sahə {i}: naməlum kind '{k}'")
     return errs

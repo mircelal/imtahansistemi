@@ -1,0 +1,2 @@
+# Shell skriptləri yalnız LF — Docker/Linux üçün məcburidir
+*.sh text eol=lf

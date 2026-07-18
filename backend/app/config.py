@@ -15,11 +15,16 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     rate_limit_per_minute: int = 120
 
+    # If set, POST /api/auth/bootstrap-admin requires matching X-Bootstrap-Token header or body setup_token
+    bootstrap_setup_token: str | None = None
+
     database_url: str
     sync_database_url: str
 
     celery_broker_url: str
     celery_result_backend: str
+    # 0 = os.cpu_count(); server resursuna görə miqyas
+    celery_concurrency: int = 0
 
     minio_endpoint: str
     minio_root_user: str
@@ -31,6 +36,17 @@ class Settings(BaseSettings):
 
     omr_service_url: str = "http://omr-service:8001"
     omr_confidence_threshold: float = 0.85
+    # 0 = os.cpu_count()
+    omr_uvicorn_workers: int = 0
+
+    wallet_enabled: bool = False
+
+    # Payriff (optional — skeleton until credentials set)
+    payriff_merchant_id: str | None = None
+    payriff_secret_key: str | None = None
+    payriff_checkout_base: str | None = None
+    # Public app base for absolute return URLs (e.g. https://bilik.sayt.cam)
+    public_app_url: str | None = None
 
     @property
     def cors_origins_list(self) -> list[str]:

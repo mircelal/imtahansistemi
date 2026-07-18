@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import uuid
 
 from jose import jwt
 from passlib.context import CryptContext
@@ -19,5 +20,16 @@ def hash_password(password: str) -> str:
 
 def create_access_token(subject: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire_minutes)
-    payload = {"sub": subject, "exp": expire}
+    payload = {"sub": subject, "exp": expire, "jti": str(uuid.uuid4())}
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+
+def create_impersonation_token(subject: str, *, impersonated_by: int, minutes: int = 15) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    payload = {
+        "sub": subject,
+        "exp": expire,
+        "jti": str(uuid.uuid4()),
+        "impersonated_by": impersonated_by,
+    }
     return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)

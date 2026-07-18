@@ -4,21 +4,40 @@ version: "3.9"
 # İşə salma: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 
 services:
-  # frontend: əsas docker-compose.yml-də artıq bind mount + node_modules həcmi var
+  frontend:
+    environment:
+      - FRONTEND_HOST_PORT=${FRONTEND_HOST_PORT:-3000}
+      - VITE_HMR_HOST=${VITE_HMR_HOST:-127.0.0.1}
+    volumes:
+      # Hostdakı kod dərhal görünsün (əks halda yalnız image build-dəki köhnə fayllar işləyirdi)
+      - ./frontend:/app
+      - imtahan_frontend_node_modules:/app/node_modules
 
   backend:
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # Bind mount CRLF ilə docker-entrypoint.sh pozula bilər — migrasiya + uvicorn birbaşa sh -c.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - cd /app && alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: []
     volumes:
       - ./backend:/app
 
   omr-service:
+    # Dev: reload (tək proses). Prod compose OMR_UVICORN_WORKERS ilə miqyaslanır.
     command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    entrypoint: []
     volumes:
       - ./omr-service:/app
 
   worker:
     build:
       context: ./backend
-    command: celery -A app.celery_worker.celery_app worker --loglevel=info --pool=solo
+    # Dev: solo + bind-mount (Windows). Prod: celery_entrypoint.sh + CELERY_CONCURRENCY.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - cd /app && alembic upgrade head && exec celery -A app.celery_worker.celery_app worker --loglevel=info --pool=solo --prefetch-multiplier=1
+    command: []
     volumes:
       - ./backend:/app

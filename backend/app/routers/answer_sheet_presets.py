@@ -12,6 +12,7 @@ from app.services.answer_sheet_preset_merge import (
     count_exams_using_preset,
     ensure_preset_library_write,
 )
+from app.services.layout_normalize import apply_layout_publish_guards
 
 router = APIRouter(prefix="/api/answer-sheet-presets", tags=["answer-sheet-presets"])
 
@@ -75,8 +76,6 @@ async def list_answer_sheet_presets(
     stmt = select(AnswerSheetLayoutPreset).where(AnswerSheetLayoutPreset.is_active.is_(True))
 
     if scope == "global_only":
-        if user.role != UserRole.ADMIN:
-            return []
         stmt = stmt.where(scope_global)
     elif course_id is not None:
         await ensure_course_access(course_id, user, db)
@@ -121,7 +120,10 @@ async def create_answer_sheet_preset(
 
         await ensure_course_write(payload.course_id, user, db)
 
-    clean_cfg = _strip_volatile_from_preset_config(dict(payload.template_config))
+    clean_cfg = apply_layout_publish_guards(
+        _strip_volatile_from_preset_config(dict(payload.template_config)),
+        preserve_identity_positions=True,
+    )
     row = AnswerSheetLayoutPreset(
         course_id=payload.course_id,
         name=payload.name.strip(),
@@ -182,7 +184,13 @@ async def update_answer_sheet_preset(
     await ensure_preset_library_write(row, user, db)
     data = payload.model_dump(exclude_unset=True)
     if "template_config" in data:
-        data["template_config"] = _strip_volatile_from_preset_config(dict(data["template_config"]))
+        incoming = _strip_volatile_from_preset_config(dict(data["template_config"]))
+        merged = dict(row.template_config or {})
+        merged.update(incoming)
+        data["template_config"] = apply_layout_publish_guards(
+            merged,
+            preserve_identity_positions=True,
+        )
     if "name" in data and data["name"] is not None:
         data["name"] = data["name"].strip()
     if "description" in data:

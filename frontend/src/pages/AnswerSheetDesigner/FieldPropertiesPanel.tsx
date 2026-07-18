@@ -1,7 +1,44 @@
 import React from "react";
-import { verticalLettersRowPitchMm, type LayoutField } from "./layoutBlockModel";
+import {
+  applyIdentityMcqBubbleSync,
+  defaultDimMcqMatchInfo,
+  estimateBlockHeightMm,
+  estimateBlockWidthMm,
+  verticalLettersRowPitchMm,
+  type LayoutField,
+} from "./layoutBlockModel";
 import type { SheetConfig } from "./hooks/useSheetConfig";
+import {
+  LAYOUT_CONTENT_LEFT_MM,
+  identityZoneTopMmRef,
+  layoutContentRightMaxMm,
+  layoutPaperHeightMm,
+  layoutPaperWidthMm,
+} from "../../constants/sheetLayoutSpec";
 
+const FOOTER_RESERVE_MM = 40;
+
+function effectiveConfig(cfg: SheetConfig): SheetConfig {
+  const mcqMatch = defaultDimMcqMatchInfo(cfg);
+  return cfg.identity_match_mcq_bubbles ? applyIdentityMcqBubbleSync(cfg, mcqMatch) : cfg;
+}
+
+function clampFieldXMm(field: LayoutField, x: number, cfg: SheetConfig): number {
+  const eff = effectiveConfig(cfg);
+  const mcqMatch = defaultDimMcqMatchInfo(cfg);
+  const pw = layoutPaperWidthMm(cfg.paper_size);
+  const xl = LAYOUT_CONTENT_LEFT_MM;
+  const maxLeft = layoutContentRightMaxMm(pw) - estimateBlockWidthMm(field, eff, mcqMatch);
+  return Math.min(Math.max(x, xl), Math.max(xl, maxLeft));
+}
+
+function maxFieldYMm(field: LayoutField, cfg: SheetConfig): number {
+  const eff = effectiveConfig(cfg);
+  const mcqMatch = defaultDimMcqMatchInfo(cfg);
+  const ph = layoutPaperHeightMm(cfg.paper_size);
+  const blockH = estimateBlockHeightMm(field, eff, mcqMatch);
+  return Math.max(identityZoneTopMmRef() + 2, ph - FOOTER_RESERVE_MM - blockH);
+}
 type Props = {
   field: LayoutField;
   onUpdate: (updated: LayoutField) => void;
@@ -18,12 +55,12 @@ const KIND_LABELS: Record<string, string> = {
   mcq_groups: "Seçim qrupları",
   mcq: "Tək seçim",
   note: "Qeyd xanası",
+  declaration: "Bəyannamə + imza",
   digit_groups: "Rəqəm qrupları",
 };
 
 const inp =
-  "w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-[13px] text-slate-900 outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100";
-
+  "w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-[13px] text-slate-900 outline-none transition focus:border-[#c0176a] focus:ring-2 focus:ring-[#fce8f3]";
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
@@ -63,7 +100,7 @@ function SliderRow({
           step={step ?? 1}
           value={value}
           onChange={(e) => onChange(Number(e.target.value))}
-          className="h-1.5 flex-1 cursor-pointer appearance-none rounded-full bg-slate-200 accent-sky-600"
+          className="h-1.5 flex-1 cursor-pointer appearance-none rounded-full bg-slate-200 accent-[#c0176a]"
         />
         <span className="w-12 shrink-0 rounded-lg border border-slate-200 bg-slate-50 py-1 text-center text-[12px] font-mono font-medium text-slate-800">
           {value.toFixed(step && step < 1 ? 1 : 0)}
@@ -80,12 +117,21 @@ function Divider() {
 
 export default function FieldPropertiesPanel({ field, onUpdate, onRemove, sheetConfig }: Props) {
   const upd = (changes: Record<string, unknown>) => onUpdate({ ...field, ...changes } as LayoutField);
+  const effCfg = effectiveConfig(sheetConfig);
+  const mcqMatch = defaultDimMcqMatchInfo(sheetConfig);
+  const xMax = Math.max(
+    LAYOUT_CONTENT_LEFT_MM,
+    layoutContentRightMaxMm(layoutPaperWidthMm(sheetConfig.paper_size)) -
+      estimateBlockWidthMm(field, effCfg, mcqMatch),
+  );
+  const yMax = maxFieldYMm(field, sheetConfig);
+  const yMin = identityZoneTopMmRef() + 2;
 
   return (
     <div className="space-y-5 overflow-y-auto">
       <div className="flex items-start justify-between gap-2 px-4 pt-4">
         <div>
-          <p className="text-[11px] font-semibold uppercase tracking-wide text-sky-700">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-[#9b1257]">
             {KIND_LABELS[field.kind] ?? field.kind}
           </p>
           <h3 className="mt-0.5 text-[16px] font-semibold text-slate-900">
@@ -254,6 +300,48 @@ export default function FieldPropertiesPanel({ field, onUpdate, onRemove, sheetC
           />
         )}
 
+        {/* declaration */}
+        {field.kind === "declaration" && (
+          <>
+            <Row label="Bəyannamə mətni">
+              <textarea
+                className={`${inp} min-h-[4.5rem] resize-y`}
+                value={String(field.text ?? "")}
+                onChange={(e) => upd({ text: e.target.value })}
+              />
+            </Row>
+            <Row label="İmza etiketi">
+              <input
+                className={inp}
+                value={String(field.signature_label ?? "İmza")}
+                onChange={(e) => upd({ signature_label: e.target.value })}
+              />
+            </Row>
+            <Row label="En (mm)">
+              <input
+                className={inp}
+                type="number"
+                step={1}
+                min={40}
+                max={200}
+                value={Number(field.box_w_mm ?? 175)}
+                onChange={(e) => upd({ box_w_mm: Number(e.target.value) })}
+              />
+            </Row>
+            <Row label="Hündürlük (mm)">
+              <input
+                className={inp}
+                type="number"
+                step={1}
+                min={16}
+                max={60}
+                value={Number(field.box_h_mm ?? 28)}
+                onChange={(e) => upd({ box_h_mm: Number(e.target.value) })}
+              />
+            </Row>
+          </>
+        )}
+
         <Divider />
 
         {/* Position */}
@@ -265,10 +353,14 @@ export default function FieldPropertiesPanel({ field, onUpdate, onRemove, sheetC
                 type="number"
                 className={inp}
                 step={0.5}
-                min={0}
-                max={200}
+                min={LAYOUT_CONTENT_LEFT_MM}
+                max={Math.round(xMax * 10) / 10}
                 value={Number(field.x_mm.toFixed(1))}
-                onChange={(e) => onUpdate({ ...field, x_mm: Number(e.target.value) })}
+                onChange={(e) => {
+                  const raw = Number(e.target.value);
+                  const cx = clampFieldXMm(field, Number.isFinite(raw) ? raw : LAYOUT_CONTENT_LEFT_MM, sheetConfig);
+                  onUpdate({ ...field, x_mm: cx });
+                }}
               />
             </div>
             <div>
@@ -277,10 +369,16 @@ export default function FieldPropertiesPanel({ field, onUpdate, onRemove, sheetC
                 type="number"
                 className={inp}
                 step={0.5}
-                min={0}
-                max={295}
+                min={yMin}
+                max={Math.round(yMax * 10) / 10}
                 value={Number(field.y_mm.toFixed(1))}
-                onChange={(e) => onUpdate({ ...field, y_mm: Number(e.target.value) })}
+                onChange={(e) => {
+                  const raw = Number(e.target.value);
+                  const cy = Number.isFinite(raw)
+                    ? Math.min(Math.max(raw, yMin), yMax)
+                    : yMin;
+                  onUpdate({ ...field, y_mm: cy });
+                }}
               />
             </div>
           </div>

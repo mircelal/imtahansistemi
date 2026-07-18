@@ -14,6 +14,7 @@ import { listCourses } from "../../api/courses";
 import type { Exam } from "../../api/exams";
 import {
   AnswerKeyRow,
+  applyDimExamPreset,
   createExam,
   deleteExam,
   downloadExamBookletCover,
@@ -30,7 +31,9 @@ import {
 } from "../../api/exams";
 import { listBankSubjects, listQuestionBank } from "../../api/questionBank";
 import { listAnswerSheetPresets } from "../../api/sheetPresets";
-import { addQuestionsFromBankBulk, createQuestion, deleteQuestion, importQuestionsCsv, listQuestions } from "../../api/questions";
+import { listScoringFormulaPresets } from "../../api/scoringFormulaPresets";
+import { addQuestionsFromBankBulk, createQuestion,
+  qtypeLabel, deleteQuestion, importQuestionsCsv, importQuestionsDocx, listQuestions } from "../../api/questions";
 import { useAuthStore } from "../../store/authStore";
 import PageHeader from "../../components/ui/PageHeader";
 import { plainTextFromHtml } from "../../utils/html";
@@ -41,11 +44,12 @@ import {
 } from "./buildAnswerCardIdentity";
 import ExamCreateForm from "./components/ExamCreateForm";
 import ExamListPage from "./components/ExamListPage";
+import ScoringProfileApplyBar from "./components/ScoringProfileApplyBar";
 import ExamIntegrationsStrip from "./components/ExamIntegrationsStrip";
 import ExamSettingsEditor from "./components/ExamSettingsEditor";
 import ExamWizardStepper from "./components/ExamWizardStepper";
 import ExamQuestionBankPicker from "./components/ExamQuestionBankPicker";
-import ExamQuestionsPanel, { ExamCsvImportZone, type QuestionAddMode } from "./components/ExamQuestionsPanel";
+import ExamQuestionsPanel, { ExamCsvImportZone, ExamDocxImportZone, type QuestionAddMode } from "./components/ExamQuestionsPanel";
 import ExamWizardGuide from "./components/ExamWizardGuide";
 import ExamStepSubNav from "./components/ExamStepSubNav";
 import SheetStatusBadge, { sheetStatusFromReadiness } from "./components/SheetStatusBadge";
@@ -80,6 +84,7 @@ type ExamBasicsForm = {
   options_per_question: number;
   columns_count: number;
   scheduled_at: string;
+  ends_at: string;
   seat_quota: string;
   venue: string;
   city: string;
@@ -92,11 +97,29 @@ type ExamBasicsForm = {
   answer_sheet_preset_id: number | "";
   negative_marking: boolean;
   negative_ratio: number;
+  list_price_amount: number;
+  use_dim_preset: boolean;
+  exam_category: string;
+  scoring_profile_id: number | "";
+};
+
+type GradingSubjectRow = {
+  code: string;
+  title: string;
+  weight: number;
+  priority: number;
+  formula: "raw_sum" | "weighted_linear";
+  closed_coeff: number;
+  open_coded_coeff: number;
+  open_written_coeff: number;
+  relative_max: number;
+  round_step: number;
+  guess_correction: boolean;
 };
 
 type QuestionForm = {
   order_index: number;
-  qtype: "mcq" | "tf";
+  qtype: "mcq" | "tf" | "grid_in" | "essay";
   stem: string;
   points: number;
   subject_id: string;
@@ -131,6 +154,7 @@ function ExamsWizardPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const user = useAuthStore((s) => s.user);
   const [umumiExam, setUmumiExam] = useState(false);
+  const canCreateUmumi = user?.role === "admin" || user?.role === "manager";
   const [step, setStep] = useState(0);
   const [examId, setExamId] = useState<number | null>(null);
   const [answerRows, setAnswerRows] = useState<AnswerKeyRow[]>([]);
@@ -150,7 +174,7 @@ function ExamsWizardPage() {
   const [bookletVariants, setBookletVariants] = useState<string[]>([...DEFAULT_BOOKLET_VARIANTS]);
   /** İki səhifəli PDF-də şəxsiyyət + MCQ tək şəkil/şablonda OMR üçün (backend `omr_two_page_stitched`). */
   const [omrTwoPageStitched, setOmrTwoPageStitched] = useState(false);
-  const [gradingSubjectRows, setGradingSubjectRows] = useState<{ code: string; title: string }[]>([]);
+  const [gradingSubjectRows, setGradingSubjectRows] = useState<GradingSubjectRow[]>([]);
   const [gradingBlockRows, setGradingBlockRows] = useState<
     { subject_code: string; from_q: number; to_q: number }[]
   >([]);
@@ -161,8 +185,9 @@ function ExamsWizardPage() {
   );
   const [gradingLoadedForExamId, setGradingLoadedForExamId] = useState<number | null>(null);
   const [csvDragActive, setCsvDragActive] = useState(false);
+  const [docxDragActive, setDocxDragActive] = useState(false);
   const [step1SubSection, setStep1SubSection] = useState<ExamStep1SubSection>("suallar");
-  const [questionAddMode, setQuestionAddMode] = useState<QuestionAddMode>("bank");
+  const [questionAddMode, setQuestionAddMode] = useState<QuestionAddMode>("docx");
   const [gradingSaveError, setGradingSaveError] = useState<string | null>(null);
   const [gradingSavedOk, setGradingSavedOk] = useState(false);
   const [bulkBankMsg, setBulkBankMsg] = useState<string | null>(null);
@@ -177,6 +202,7 @@ function ExamsWizardPage() {
       title: "",
       description: "",
       scheduled_at: "",
+      ends_at: "",
       seat_quota: "",
       venue: "",
       city: "",
@@ -189,6 +215,10 @@ function ExamsWizardPage() {
       answer_sheet_preset_id: "",
       negative_marking: false,
       negative_ratio: 0.25,
+      list_price_amount: 0,
+      use_dim_preset: false,
+      exam_category: "custom",
+      scoring_profile_id: "",
     }
   });
   const qForm = useForm<QuestionForm>({
@@ -214,6 +244,13 @@ function ExamsWizardPage() {
   }, [examParam, wizardStepParam]);
 
   const coursesQuery = useQuery({ queryKey: ["courses"], queryFn: listCourses });
+
+  useEffect(() => {
+    if (!canCreateUmumi) return;
+    const cs = coursesQuery.data;
+    if (cs == null) return;
+    if (cs.length === 0) setUmumiExam(true);
+  }, [canCreateUmumi, coursesQuery.data]);
 
   useEffect(() => {
     const cs = coursesQuery.data;
@@ -246,6 +283,11 @@ function ExamsWizardPage() {
     enabled: examId != null
   });
 
+  const formulaPresetsQuery = useQuery({
+    queryKey: ["scoring-formula-presets", "exam-grading"],
+    queryFn: () => listScoringFormulaPresets({ active_only: true }),
+  });
+
   useEffect(() => {
     if (examId == null) {
       setGradingLoadedForExamId(null);
@@ -259,10 +301,26 @@ function ExamsWizardPage() {
     setGradingSubjectRows(
       subs
         .filter((x): x is Record<string, unknown> => x != null && typeof x === "object")
-        .map((s) => ({
-          code: String(s.code ?? "").trim(),
-          title: String(s.title ?? s.code ?? "").trim(),
-        }))
+        .map((s) => {
+          const fp =
+            s.formula_params != null && typeof s.formula_params === "object"
+              ? (s.formula_params as Record<string, unknown>)
+              : {};
+          const formulaRaw = String(s.formula ?? "raw_sum");
+          return {
+            code: String(s.code ?? "").trim(),
+            title: String(s.title ?? s.code ?? "").trim(),
+            weight: Number(s.weight) > 0 ? Number(s.weight) : 1,
+            priority: Number.isFinite(Number(s.priority)) ? Number(s.priority) : 0,
+            formula: formulaRaw === "weighted_linear" ? "weighted_linear" : "raw_sum",
+            closed_coeff: Number(fp.closed_coeff) || 1,
+            open_coded_coeff: Number(fp.open_coded_coeff) || 1,
+            open_written_coeff: Number(fp.open_written_coeff) || 1,
+            relative_max: Number(fp.relative_max) || 100,
+            round_step: Number(fp.round_step) || 0.1,
+            guess_correction: Boolean(fp.guess_correction),
+          } satisfies GradingSubjectRow;
+        })
         .filter((r) => r.code.length > 0),
     );
     const blocks = Array.isArray(gc.question_blocks) ? gc.question_blocks : [];
@@ -372,8 +430,23 @@ function ExamsWizardPage() {
           : undefined;
       const sq = payload.seat_quota.trim();
       const seatQuotaNum = sq === "" ? NaN : Number(sq);
+      if (!payload.scheduled_at.trim() || !payload.ends_at.trim()) {
+        throw new Error("İmtahanın başlama və bitmə tarixi mütləqdir.");
+      }
+      const starts = new Date(payload.scheduled_at.trim());
+      const ends = new Date(payload.ends_at.trim());
+      if (Number.isNaN(starts.getTime()) || Number.isNaN(ends.getTime()) || ends <= starts) {
+        throw new Error("Bitmə vaxtı başlama vaxtından sonra olmalıdır.");
+      }
+      if (!umumiExam) {
+        if (payload.course_id === "" || payload.course_id == null) {
+          throw new Error("Kurs seçin və ya «Ümumi (kurs yoxdur)» tipinə keçin.");
+        }
+      } else if (!canCreateUmumi) {
+        throw new Error("Kurssuz imtahan yalnız administrator və ya menecer yarada bilər.");
+      }
       return createExam({
-        course_id: umumiExam ? null : payload.course_id === "" ? null : Number(payload.course_id),
+        course_id: umumiExam ? null : Number(payload.course_id),
         title: payload.title,
         description: payload.description || undefined,
         question_count: Number(payload.question_count),
@@ -382,7 +455,8 @@ function ExamsWizardPage() {
         negative_marking: payload.negative_marking,
         negative_ratio: payload.negative_marking ? Number(payload.negative_ratio) || 0 : 0,
         is_active: true,
-        scheduled_at: payload.scheduled_at.trim() ? new Date(payload.scheduled_at).toISOString() : undefined,
+        scheduled_at: starts.toISOString(),
+        ends_at: ends.toISOString(),
         seat_quota:
           sq !== "" && Number.isFinite(seatQuotaNum) && seatQuotaNum >= 1 ? Math.floor(seatQuotaNum) : undefined,
         resale_enabled: umumiExam ? payload.resale_enabled : false,
@@ -390,7 +464,15 @@ function ExamsWizardPage() {
         venue: payload.venue.trim() || undefined,
         answer_sheet_preset_id:
           payload.answer_sheet_preset_id === "" ? undefined : Number(payload.answer_sheet_preset_id),
-        bundled_ticket: bundled
+        list_price_amount: user?.role === "admin" ? Number(payload.list_price_amount) || 0 : undefined,
+        list_price_currency: user?.role === "admin" ? "AZN" : undefined,
+        bundled_ticket: bundled,
+        use_dim_preset: Boolean(payload.use_dim_preset),
+        exam_category: payload.exam_category || "custom",
+        scoring_profile_id:
+          payload.scoring_profile_id === "" || payload.scoring_profile_id == null
+            ? undefined
+            : Number(payload.scoring_profile_id),
       });
     },
     onSuccess: (exam) => {
@@ -409,6 +491,12 @@ function ExamsWizardPage() {
         qtype: payload.qtype,
         stem: payload.stem,
         points: payload.points,
+        options:
+          payload.qtype === "grid_in"
+            ? { answer_length: 3, alphabet: "digits" }
+            : payload.qtype === "essay"
+              ? { max_lines: 8, rubric: "" }
+              : undefined,
         subject_id: payload.subject_id.trim() === "" ? undefined : Number(payload.subject_id),
         difficulty: payload.difficulty === "" ? undefined : payload.difficulty
       }),
@@ -589,7 +677,7 @@ function ExamsWizardPage() {
           const q = byOrder.get(n);
           return {
             question_number: n,
-            correct_answer: q ? (q.qtype === "tf" ? "T" : "A") : "A",
+            correct_answer: q ? (q.qtype === "tf" ? "T" : q.qtype === "essay" ? "" : q.qtype === "grid_in" ? "0" : "A") : "A",
             points: q ? q.points : 1
           };
         })
@@ -615,9 +703,29 @@ function ExamsWizardPage() {
     mutationFn: async () => {
       if (examId == null) throw new Error("İmtahan yoxdur");
       const subjects = gradingSubjectRows
-        .map((r) => ({ code: r.code.trim(), title: r.title.trim() || r.code.trim() }))
-        .filter((r) => r.code.length > 0);
-      const codes = new Set(subjects.map((s) => s.code));
+        .map((r) => {
+          const row: Record<string, unknown> = {
+            code: r.code.trim(),
+            title: r.title.trim() || r.code.trim(),
+            weight: Number(r.weight) > 0 ? Number(r.weight) : 1,
+            priority: Math.floor(Number(r.priority) || 0),
+            formula: r.formula === "weighted_linear" ? "weighted_linear" : "raw_sum",
+          };
+          if (r.formula === "weighted_linear") {
+            row.formula_params = {
+              closed_coeff: Number(r.closed_coeff) || 1,
+              open_coded_coeff: Number(r.open_coded_coeff) || 1,
+              open_written_coeff: Number(r.open_written_coeff) || 1,
+              relative_max: Number(r.relative_max) || 100,
+              round_step: Number(r.round_step) || 0.1,
+              guess_correction: Boolean(r.guess_correction),
+              options_k: 4,
+            };
+          }
+          return row;
+        })
+        .filter((r) => String(r.code).length > 0);
+      const codes = new Set(subjects.map((s) => String(s.code)));
       const question_blocks = gradingBlockRows
         .filter((r) => r.subject_code.trim())
         .map((r) => {
@@ -642,6 +750,11 @@ function ExamsWizardPage() {
       } catch {
         throw new Error("Bal siyasəti (JSON) düzgün deyil.");
       }
+      const subject_weights: Record<string, number> = {};
+      for (const s of subjects) {
+        subject_weights[String(s.code)] = Number(s.weight) || 1;
+      }
+      grading_policy = { ...grading_policy, subject_weights };
       return updateExam(examId, {
         grading_config: {
           subjects,
@@ -786,10 +899,27 @@ function ExamsWizardPage() {
   async function handleQuestionsCsvFile(file: File | undefined) {
     if (!file || examId == null) return;
     setImportMsg(null);
-    const r = await importQuestionsCsv(examId, file);
-    setImportMsg(`İdxal: ${r.imported} əlavə, ${r.skipped} keçildi`);
-    await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
-    await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+    try {
+      const r = await importQuestionsCsv(examId, file);
+      setImportMsg(`CSV idxal: ${r.imported} əlavə, ${r.skipped} keçildi`);
+      await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
+      await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+    } catch (e: unknown) {
+      setImportMsg(e instanceof Error ? e.message : "CSV idxal alınmadı");
+    }
+  }
+
+  async function handleQuestionsDocxFile(file: File | undefined) {
+    if (!file || examId == null) return;
+    setImportMsg(null);
+    try {
+      const r = await importQuestionsDocx(examId, file);
+      setImportMsg(`Word idxal: ${r.imported} əlavə, ${r.skipped} keçildi`);
+      await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
+      await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+    } catch (e: unknown) {
+      setImportMsg(getApiErrorMessage(e) || "Word idxal alınmadı");
+    }
   }
 
   return (
@@ -919,6 +1049,16 @@ function ExamsWizardPage() {
             </button>
           </div>
 
+          <ScoringProfileApplyBar
+            examId={examId}
+            examCategory={examQuery.data?.exam_category}
+            onApplied={() => {
+              setGradingLoadedForExamId(null);
+              void queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+            }}
+            onError={(msg) => setGradingSaveError(msg)}
+          />
+
           <div className="mt-5 rounded-xl border border-indigo-100 bg-indigo-50/40 p-4">
             <h3 className="text-sm font-semibold text-indigo-950">Cavab kartı — şəxsiyyət sahələri</h3>
             <p className="mt-1 text-xs text-indigo-950/80">
@@ -986,54 +1126,199 @@ function ExamsWizardPage() {
           </div>
 
           <div className="mt-6">
-            <h3 className="text-sm font-semibold text-slate-900">Fənnlər (bal bölgüsü üçün kodlar)</h3>
+            <h3 className="text-sm font-semibold text-slate-900">Fənnlər (çəki, üstünlük, formula)</h3>
             <p className="mt-1 text-xs text-slate-600">
-              Hər fənnə qısa kod verin (məs. <code className="rounded bg-slate-100 px-1">riyaz</code>); sual bloklarında həmin
-              koddan istifadə ediləcək.
+              Hər fənnə qısa kod verin (məs. <code className="rounded bg-slate-100 px-1">riyaz</code>). Çəki əmsalı və
+              üstünlük dərəcəsi DİM qəbul qaydalarına uyğundur; «Çəkili» formula nisbi balı 100-ə normallaşdırır.
             </p>
             <div className="mt-3 space-y-2">
               {gradingSubjectRows.length === 0 && (
                 <p className="text-sm text-slate-500">Hələ fənn yoxdur — əlavə edin və ya boş buraxın.</p>
               )}
               {gradingSubjectRows.map((row, idx) => (
-                <div key={`sub-${idx}`} className="flex flex-wrap items-end gap-2 rounded-lg border border-slate-200 bg-white p-3">
-                  <label className={`${labelClass} min-w-[100px] flex-1`}>
-                    Kod
-                    <input
-                      className={inputClass}
-                      value={row.code}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setGradingSubjectRows((rs) => rs.map((r, i) => (i === idx ? { ...r, code: v } : r)));
-                      }}
-                      placeholder="məs. riyaz"
-                    />
-                  </label>
-                  <label className={`${labelClass} min-w-[140px] flex-[2]`}>
-                    Ad
-                    <input
-                      className={inputClass}
-                      value={row.title}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setGradingSubjectRows((rs) => rs.map((r, i) => (i === idx ? { ...r, title: v } : r)));
-                      }}
-                      placeholder="Riyaziyyat"
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className="rounded-lg border border-red-200 px-2 py-2 text-sm text-red-700 hover:bg-red-50"
-                    onClick={() => setGradingSubjectRows((rs) => rs.filter((_, i) => i !== idx))}
-                  >
-                    Sil
-                  </button>
+                <div key={`sub-${idx}`} className="space-y-2 rounded-lg border border-slate-200 bg-white p-3">
+                  <div className="flex flex-wrap items-end gap-2">
+                    <label className={`${labelClass} min-w-[90px] flex-1`}>
+                      Kod
+                      <input
+                        className={inputClass}
+                        value={row.code}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setGradingSubjectRows((rs) => rs.map((r, i) => (i === idx ? { ...r, code: v } : r)));
+                        }}
+                        placeholder="məs. riyaz"
+                      />
+                    </label>
+                    <label className={`${labelClass} min-w-[120px] flex-[2]`}>
+                      Ad
+                      <input
+                        className={inputClass}
+                        value={row.title}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setGradingSubjectRows((rs) => rs.map((r, i) => (i === idx ? { ...r, title: v } : r)));
+                        }}
+                        placeholder="Riyaziyyat"
+                      />
+                    </label>
+                    <label className={`${labelClass} w-20`}>
+                      Çəki
+                      <input
+                        className={inputClass}
+                        type="number"
+                        step={0.1}
+                        min={0.1}
+                        value={row.weight}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          setGradingSubjectRows((rs) =>
+                            rs.map((r, i) => (i === idx ? { ...r, weight: Number.isFinite(v) ? v : 1 } : r)),
+                          );
+                        }}
+                      />
+                    </label>
+                    <label className={`${labelClass} w-24`}>
+                      Üstünlük
+                      <input
+                        className={inputClass}
+                        type="number"
+                        min={0}
+                        value={row.priority}
+                        onChange={(e) => {
+                          const v = Number(e.target.value);
+                          setGradingSubjectRows((rs) =>
+                            rs.map((r, i) => (i === idx ? { ...r, priority: Number.isFinite(v) ? v : 0 } : r)),
+                          );
+                        }}
+                      />
+                    </label>
+                    <label className={`${labelClass} min-w-[140px]`}>
+                      Formula
+                      <select
+                        className={inputClass}
+                        value={row.formula}
+                        onChange={(e) => {
+                          const v = e.target.value === "weighted_linear" ? "weighted_linear" : "raw_sum";
+                          setGradingSubjectRows((rs) => rs.map((r, i) => (i === idx ? { ...r, formula: v } : r)));
+                        }}
+                      >
+                        <option value="raw_sum">Sadə cəm</option>
+                        <option value="weighted_linear">Çəkili (DİM)</option>
+                      </select>
+                    </label>
+                    <label className={`${labelClass} min-w-[180px]`}>
+                      Şablondan doldur
+                      <select
+                        className={inputClass}
+                        defaultValue=""
+                        onChange={(e) => {
+                          const id = e.target.value;
+                          e.target.value = "";
+                          if (!id) return;
+                          const preset = formulaPresetsQuery.data?.find((p) => String(p.id) === id);
+                          if (!preset) return;
+                          const eng = preset.engine === "weighted_linear" ? "weighted_linear" : "raw_sum";
+                          const fp = preset.default_params || {};
+                          setGradingSubjectRows((rs) =>
+                            rs.map((r, i) =>
+                              i === idx
+                                ? {
+                                    ...r,
+                                    formula: eng,
+                                    closed_coeff: Number(fp.closed_coeff ?? r.closed_coeff),
+                                    open_coded_coeff: Number(fp.open_coded_coeff ?? r.open_coded_coeff),
+                                    open_written_coeff: Number(fp.open_written_coeff ?? r.open_written_coeff),
+                                    relative_max: Number(fp.relative_max ?? r.relative_max),
+                                    round_step: Number(fp.round_step ?? r.round_step),
+                                    guess_correction: Boolean(fp.guess_correction ?? r.guess_correction),
+                                  }
+                                : r,
+                            ),
+                          );
+                        }}
+                      >
+                        <option value="">— seçin —</option>
+                        {(formulaPresetsQuery.data ?? []).map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      className="rounded-lg border border-red-200 px-2 py-2 text-sm text-red-700 hover:bg-red-50"
+                      onClick={() => setGradingSubjectRows((rs) => rs.filter((_, i) => i !== idx))}
+                    >
+                      Sil
+                    </button>
+                  </div>
+                  {row.formula === "weighted_linear" ? (
+                    <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-50 p-2 sm:grid-cols-3 lg:grid-cols-6">
+                      {(
+                        [
+                          ["closed_coeff", "Qapalı əmsal"],
+                          ["open_coded_coeff", "Kod əmsalı"],
+                          ["open_written_coeff", "Yazılı əmsal"],
+                          ["relative_max", "Maks nisbi"],
+                          ["round_step", "Yuvarlaq"],
+                        ] as const
+                      ).map(([key, label]) => (
+                        <label key={key} className={`${labelClass} text-[11px]`}>
+                          {label}
+                          <input
+                            className={inputClass}
+                            type="number"
+                            step={0.01}
+                            value={row[key]}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              setGradingSubjectRows((rs) =>
+                                rs.map((r, i) => (i === idx ? { ...r, [key]: Number.isFinite(v) ? v : r[key] } : r)),
+                              );
+                            }}
+                          />
+                        </label>
+                      ))}
+                      <label className="flex items-center gap-2 pt-5 text-[12px] text-slate-700">
+                        <input
+                          type="checkbox"
+                          checked={row.guess_correction}
+                          onChange={(e) => {
+                            const v = e.target.checked;
+                            setGradingSubjectRows((rs) =>
+                              rs.map((r, i) => (i === idx ? { ...r, guess_correction: v } : r)),
+                            );
+                          }}
+                        />
+                        Təxmin korreksiyası (−Y/4)
+                      </label>
+                    </div>
+                  ) : null}
                 </div>
               ))}
               <button
                 type="button"
                 className="rounded-lg border border-dashed border-slate-300 bg-slate-50 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
-                onClick={() => setGradingSubjectRows((rs) => [...rs, { code: "", title: "" }])}
+                onClick={() =>
+                  setGradingSubjectRows((rs) => [
+                    ...rs,
+                    {
+                      code: "",
+                      title: "",
+                      weight: 1,
+                      priority: rs.length + 1,
+                      formula: "raw_sum",
+                      closed_coeff: 1,
+                      open_coded_coeff: 1,
+                      open_written_coeff: 1,
+                      relative_max: 100,
+                      round_step: 0.1,
+                      guess_correction: false,
+                    },
+                  ])
+                }
               >
                 + Fənn əlavə et
               </button>
@@ -1182,6 +1467,7 @@ function ExamsWizardPage() {
           umumiExam={umumiExam}
           onUmumiExamChange={setUmumiExam}
           isAdmin={user?.role === "admin"}
+          canCreateUmumi={canCreateUmumi}
           isPending={createExamMut.isPending}
           isError={createExamMut.isError}
           onSubmit={handleSubmit((v) => createExamMut.mutate(v))}
@@ -1272,6 +1558,20 @@ function ExamsWizardPage() {
                   }}
                 />
               }
+              docxPanel={
+                <ExamDocxImportZone
+                  dragActive={docxDragActive}
+                  importMsg={importMsg}
+                  onDragActive={setDocxDragActive}
+                  onFile={async (f) => {
+                    if (f && !f.name.toLowerCase().endsWith(".docx")) {
+                      setImportMsg("Yalnız .docx (Word) faylı qəbul edilir.");
+                      return;
+                    }
+                    await handleQuestionsDocxFile(f);
+                  }}
+                />
+              }
               manualPanel={
                 <form
                   className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm"
@@ -1291,9 +1591,11 @@ function ExamsWizardPage() {
                       Növ
                       <select className={inputClass} {...qForm.register("qtype")}>
                         <option value="mcq">Çoxtan seçimli</option>
+                        <option value="grid_in">Açıq (ədədi grid)</option>
+                        <option value="essay">Sərbəst cavab (essay)</option>
                       </select>
-                      <p className="mt-1 text-xs text-amber-800">
-                        Doğru/Yanlış sualları hələ dəstəklənmir — OMR skan üçün yalnız MCQ istifadə edin.
+                      <p className="mt-1 text-xs text-slate-500">
+                        Grid-in: OMR ilə avtomatik; essay: skandan sonra əl ilə qiymətləndirilir.
                       </p>
                     </label>
                     <label className={`${labelClass} sm:col-span-12`}>
@@ -1374,7 +1676,7 @@ function ExamsWizardPage() {
                                   <span className="text-slate-400">— boş</span>
                                 )}
                               </td>
-                              <td className="whitespace-nowrap px-4 py-3 text-slate-600">{q.qtype === "tf" ? "D/Y" : "MT"}</td>
+                              <td className="whitespace-nowrap px-4 py-3 text-slate-600">{qtypeLabel(q.qtype)}</td>
                               <td className="whitespace-nowrap px-4 py-3 text-slate-600">
                                 {q.subject_short_code?.trim() || q.subject_name?.trim() || "—"}
                               </td>
@@ -1620,6 +1922,47 @@ function ExamsWizardPage() {
                   {plannedQuestionCount} sual üçün düzgün cavab və xal. Variant sayı:{" "}
                   <strong>{examQuery.data?.options_per_question ?? "—"}</strong>.
                 </p>
+                {examId != null ? (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-xs font-semibold text-rose-900 hover:bg-rose-100"
+                      onClick={async () => {
+                        try {
+                          await applyDimExamPreset(examId);
+                          await queryClient.invalidateQueries({ queryKey: ["exam", examId] });
+                          await queryClient.invalidateQueries({ queryKey: ["questions", examId] });
+                          const existing = await getAnswerKey(examId);
+                          if (existing.length) {
+                            setAnswerRows([...existing].sort((a, b) => a.question_number - b.question_number));
+                          } else {
+                            setAnswerRows((prev) =>
+                              prev.map((r) => {
+                                const qn = r.question_number;
+                                const qMeta = questionsQuery.data?.find((q) => q.order_index === qn);
+                                const isEssay = qMeta?.qtype === "essay";
+                                let points = r.points;
+                                if (isEssay) {
+                                  if (qn >= 31 && qn <= 38) points = 5;
+                                  else if (qn >= 39 && qn <= 40) points = 10;
+                                } else if (qn >= 1 && qn <= 20) points = 1;
+                                else if (qn >= 21 && qn <= 30) points = 2;
+                                return { ...r, points };
+                              }),
+                            );
+                          }
+                        } catch {
+                          /* ignore — user can set points manually */
+                        }
+                      }}
+                    >
+                      DİM xalları
+                    </button>
+                    <span className="text-[11px] text-slate-500">
+                      MCQ 1–20=1, 21–30=2 · Essay 31–38=5, 39–40=10
+                    </span>
+                  </div>
+                ) : null}
               </div>
               <div className="max-h-[min(420px,55vh)] overflow-auto rounded-xl border border-slate-200 shadow-inner">
                 <table className="w-full min-w-[320px] text-left text-sm">
@@ -1635,7 +1978,10 @@ function ExamsWizardPage() {
                       const optN = Math.min(5, Math.max(2, examQuery.data?.options_per_question ?? 4));
                       const letters = ["A", "B", "C", "D", "E"].slice(0, optN);
                       const qMeta = questionsQuery.data?.find((q) => q.order_index === row.question_number);
-                      const isTf = qMeta?.qtype === "tf";
+                      const qt = qMeta?.qtype ?? "mcq";
+                      const isEssay = qt === "essay";
+                      const isGrid = qt === "grid_in";
+                      const isTf = qt === "tf";
                       return (
                         <tr key={`${row.question_number}-${idx}`} className="hover:bg-slate-50/90">
                           <td className="whitespace-nowrap px-4 py-2 font-medium text-slate-900">
@@ -1647,22 +1993,37 @@ function ExamsWizardPage() {
                             ) : null}
                           </td>
                           <td className="px-4 py-2">
-                            <select
-                              className={`${inputClass} !mt-0 max-w-[100px] py-1.5`}
-                              value={isTf ? "A" : row.correct_answer}
-                              onChange={(e) => {
-                                const next = [...answerRows];
-                                next[idx] = { ...next[idx], correct_answer: e.target.value };
-                                setAnswerRows(next);
-                              }}
-                              disabled={isTf}
-                            >
-                              {letters.map((L) => (
-                                <option key={L} value={L}>
-                                  {L}
-                                </option>
-                              ))}
-                            </select>
+                            {isEssay ? (
+                              <span className="text-xs text-slate-500">əl ilə</span>
+                            ) : isGrid ? (
+                              <input
+                                className={`${inputClass} !mt-0 max-w-[120px] py-1.5 font-mono`}
+                                value={row.correct_answer}
+                                placeholder="042"
+                                onChange={(e) => {
+                                  const next = [...answerRows];
+                                  next[idx] = { ...next[idx], correct_answer: e.target.value.toUpperCase() };
+                                  setAnswerRows(next);
+                                }}
+                              />
+                            ) : (
+                              <select
+                                className={`${inputClass} !mt-0 max-w-[100px] py-1.5`}
+                                value={isTf ? "A" : row.correct_answer}
+                                onChange={(e) => {
+                                  const next = [...answerRows];
+                                  next[idx] = { ...next[idx], correct_answer: e.target.value };
+                                  setAnswerRows(next);
+                                }}
+                                disabled={isTf}
+                              >
+                                {letters.map((L) => (
+                                  <option key={L} value={L}>
+                                    {L}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
                           </td>
                           <td className="px-4 py-2">
                             <input
@@ -1888,7 +2249,7 @@ function ExamsWizardPage() {
                     Skana keç
                   </Link>
                   <Link
-                    to={`/reports?exam=${examId}`}
+                    to={`/exams/${examId}/dashboard`}
                     className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-800 hover:bg-slate-50"
                   >
                     Nəticələrə keç

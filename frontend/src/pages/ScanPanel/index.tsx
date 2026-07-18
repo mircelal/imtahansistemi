@@ -3,7 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCourseStudentsSummary } from "../../api/courses";
 import { getExam, getExamIntegrations, getExamReadiness } from "../../api/exams";
-import { ensureScanSession, getScanSession, listScanResults } from "../../api/scans";
+import { ensureScanSession, getScanSession, listScanResults, type ScanQuickUpload } from "../../api/scans";
 import ExportPanel from "./ExportPanel";
 import ImageUploader from "./ImageUploader";
 import ManualCorrection from "./ManualCorrection";
@@ -35,7 +35,7 @@ export default function ScanPanelPage() {
   const examFilter = parseExamFromSearch(searchParams.toString());
   const sessionFromUrl = Number(searchParams.get("session") || "0");
   const step = parseDisplayStep(searchParams.get("step"));
-  const showAdvancedSessions = searchParams.get("sessions") === "1";
+  const showManualSessions = searchParams.get("sessions") === "1" || searchParams.get("manual") === "1";
 
   const [sessionId, setSessionId] = useState<number | null>(
     sessionFromUrl > 0 ? sessionFromUrl : null,
@@ -71,12 +71,32 @@ export default function ScanPanelPage() {
     [examFilter, sessionId, syncUrl],
   );
 
+  const handleQuickUpload = useCallback(
+    (result: ScanQuickUpload) => {
+      setSessionId(result.session.id);
+      setSelectedResultId(null);
+      syncUrl({
+        step: 2,
+        exam: result.session.exam_id,
+        session: result.session.id,
+      });
+    },
+    [syncUrl],
+  );
+
   const ensureMut = useMutation({
     mutationFn: (examId: number) => ensureScanSession(examId),
     onSuccess: (session) => {
       setSessionId(session.id);
       setSelectedResultId(null);
-      goStep(Math.max(step, 1), { sessionId: session.id, examId: session.exam_id });
+      // Bitmiş partiyada nəticələr varsa birbaşa yoxlama addımına
+      const openReview =
+        session.status === "done" ||
+        (session.processed_images > 0 && session.status !== "processing");
+      goStep(openReview ? 3 : Math.max(step, 1), {
+        sessionId: session.id,
+        examId: session.exam_id,
+      });
     },
   });
 
@@ -127,6 +147,7 @@ export default function ScanPanelPage() {
   });
 
   const scanReady = readinessQ.data?.ready_for_scan ?? false;
+  const sessionStatus = sessionQ.data?.status;
 
   const coverage = useMemo(() => {
     const rows = resultsQ.data ?? [];
@@ -136,9 +157,36 @@ export default function ScanPanelPage() {
     return { uniqueStudents, totalScans, courseTotal };
   }, [resultsQ.data, studentsSummaryQ.data]);
 
+  const prevStatusRef = useRef<string | null>(null);
+
+  /** Reprocess köhnə ScanResult sətirlərini silir — seçilmiş ID-ni təmizlə. */
+  useEffect(() => {
+    if (sessionStatus === "pending" || sessionStatus === "processing") {
+      setSelectedResultId(null);
+    }
+    // Emal bitəndə klassik yoxlama: ilk nəticəni aç
+    if (
+      prevStatusRef.current &&
+      (prevStatusRef.current === "pending" || prevStatusRef.current === "processing") &&
+      (sessionStatus === "done" || sessionStatus === "error")
+    ) {
+      goStep(3);
+    }
+    prevStatusRef.current = sessionStatus ?? null;
+  }, [sessionStatus, goStep]);
+
+  useEffect(() => {
+    const rows = resultsQ.data;
+    if (!rows?.length) return;
+    if (selectedResultId != null && rows.some((r) => r.id === selectedResultId)) return;
+    const pending = rows.find((r) => r.status === "manual_review" || r.status === "error");
+    setSelectedResultId(pending?.id ?? rows[0]!.id);
+  }, [resultsQ.data, selectedResultId]);
+
   useEffect(() => {
     if (sessionFromUrl > 0 && sessionId !== sessionFromUrl) {
       setSessionId(sessionFromUrl);
+      setSelectedResultId(null);
     }
   }, [sessionFromUrl, sessionId]);
 
@@ -157,11 +205,7 @@ export default function ScanPanelPage() {
     <div className="page-container-wide space-y-4">
       <PageHeader
         title="Skan və OMR"
-        subtitle={
-          examFilter != null
-            ? "Cavab kartlarının şəkillərini yükləyin — sistem avtomatik oxuyub qiymətləndirir."
-            : "İmtahan seçin və ya skan partiyasını idarə edin."
-        }
+        subtitle="Cavab kartı şəkillərini yükləyin — QR kod imtahanı avtomatik tanıyır, sistem oxuyub qiymətləndirir."
       />
 
       {bootstrapping && (
@@ -191,7 +235,20 @@ export default function ScanPanelPage() {
         </div>
       )}
 
-      {!examFilter && (
+      {!examFilter && !sessionReady && !bootstrapping && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-4 py-2.5 text-sm text-slate-700">
+          <span>İmtahan seçməyə ehtiyac yoxdur — kartın QR kodu kifayətdir.</span>
+          <button
+            type="button"
+            className="text-[13px] font-medium text-indigo-700 underline hover:text-indigo-900"
+            onClick={() => syncUrl({ sessions: !showManualSessions })}
+          >
+            {showManualSessions ? "Əl ilə seçimi gizlət" : "Əl ilə imtahan seç"}
+          </button>
+        </div>
+      )}
+
+      {showManualSessions && !examFilter && (
         <ScanSessionControls
           examFilter={null}
           sessionId={sessionId}
@@ -203,34 +260,31 @@ export default function ScanPanelPage() {
         />
       )}
 
-      {examFilter != null && sessionReady && (
+      {(examFilter != null || sessionReady) && sessionReady && (
         <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 px-4 py-3 text-sm text-emerald-950">
           <strong className="font-semibold">
-            {examQ.data?.title ?? integrationsQ.data?.exam_title ?? `İmtahan #${examFilter}`}
+            {examQ.data?.title ?? integrationsQ.data?.exam_title ?? sessionQ.data?.exam_title ?? `İmtahan #${examId}`}
           </strong>
           <span className="text-emerald-900/80">
             {" "}
             · Skan partiyası №{sessionId}
             {sessionQ.data?.status ? ` · ${sessionStatusAz(sessionQ.data.status)}` : ""}
           </span>
-          <button
-            type="button"
-            className="ml-2 text-[13px] font-medium text-emerald-800 underline hover:text-emerald-950"
-            onClick={() => syncUrl({ sessions: !showAdvancedSessions })}
-          >
-            {showAdvancedSessions ? "Partiya seçimini gizlət" : "Başqa skan partiyası"}
-          </button>
         </div>
       )}
 
-      {showAdvancedSessions && examFilter != null && (
+      {/* İmtahan seçilibsə əvvəlki yoxlamalar (partiyalar) həmişə görünsün */}
+      {examFilter != null && sessionReady && (
         <ScanSessionControls
           examFilter={examFilter}
           sessionId={sessionId}
-          onSessionChange={(id) => {
+          onSessionChange={(id, meta) => {
             setSessionId(id);
             setSelectedResultId(null);
-            if (id != null) goStep(step, { sessionId: id });
+            if (id == null) return;
+            const st = meta?.status;
+            const toReview = st === "done" || st === "error";
+            goStep(toReview ? 3 : 1, { sessionId: id });
           }}
         />
       )}
@@ -241,7 +295,7 @@ export default function ScanPanelPage() {
       >
         {SCAN_STEPS.map((label, i) => {
           const n = i + 1;
-          const disabled = !sessionReady;
+          const disabled = n > 1 && !sessionReady;
           return (
             <button
               key={label}
@@ -290,10 +344,20 @@ export default function ScanPanelPage() {
         </div>
       )}
 
-      {step >= 1 && sessionReady && (
+      {step >= 1 && (
         <>
-          <ImageUploader sessionId={sessionId} uploadDisabled={!scanReady && examId != null} />
-          {step === 1 && (
+          <ImageUploader
+            sessionId={sessionId}
+            autoDetect={!sessionReady && examFilter == null}
+            uploadDisabled={
+              (examId != null && !scanReady && sessionReady) ||
+              sessionStatus === "done" ||
+              sessionStatus === "error"
+            }
+            sessionClosed={sessionStatus === "done" || sessionStatus === "error"}
+            onQuickUpload={handleQuickUpload}
+          />
+          {step === 1 && sessionReady && (
             <div className="flex justify-end">
               <button
                 type="button"

@@ -21,14 +21,50 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 from app.services.pdf_fonts import register_pdf_fonts
+from app.services.a3_fold_imposition import (
+    compose_a3_fold_pdf_from_panel_pdfs,
+    is_a3_duplex_fold,
+    panel_config,
+)
 from app.services.dim_identity import (
     C_DIM_BUBBLE_STROKE,
     C_DIM_MAGENTA,
     C_DIM_MAGENTA_LIGHT,
     C_DIM_TEXT_ON_MAGENTA,
+    DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM,
+    DIGIT_GROUP_ROW_HEADER_MM,
+    DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM,
+    MCQ_SINGLE_GAP_AFTER_HEADER_MM,
+    _IDENTITY_FIELD_HEADER_MM,
     build_identity_omr_field_blocks,
     digit_group_row_chunks,
+    digit_group_show_handwrite_box,
+    digits_field_outer_width_mm,
+    identity_mcq_single_first_bubble_center_mm,
+    iter_mcq_groups_bubble_layouts,
+    mcq_single_block_width_mm,
     resolve_identity_fields,
+)
+from app.services.mcq_sections import (
+    MCQ_SECTION_TITLE_H_MM,
+    compute_stacked_mcq_blocks,
+    enrich_mcq_sections_from_grading,
+    mcq_grid_handle_width_mm,
+    prepare_mcq_grid_blocks,
+    resolve_mcq_sections,
+    should_show_mcq_grid_label,
+)
+from app.services.open_question_layout import (
+    GRID_IN_BUBBLE_D_MM,
+    GRID_IN_COL_GAP_MM,
+    GRID_IN_HANDWRITE_H_MM,
+    GRID_IN_LABEL_H_MM,
+    GRID_IN_PAD_MM,
+    GRID_IN_VGAP_MM,
+    build_open_omr_field_blocks,
+    essay_block_size_mm,
+    grid_in_block_size_mm,
+    resolve_open_blocks,
 )
 from app.services.dim_sheet_layout import (
     AZ_LATIN,
@@ -45,17 +81,22 @@ from app.services.dim_sheet_layout import (
     fiducial_corner_center_from_edge_mm,
     fiducial_outer_bottom_from_page_top_mm,
     horizontal_letter_block_height_mm,
+    horizontal_letter_row_pitch_mm,
+    horizontal_letters_body_top_mm,
+    HORIZONTAL_LETTERS_HEADER_MM,
+    HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM,
     header_magenta_horizontal_inset_mm,
     header_magenta_top_from_page_top_mm,
     identity_draw_metrics,
     identity_enabled,
     identity_height_mm,
     identity_zone_top_mm,
+    freeform_mcq_grid_top_anchor_mm,
     letter_row_bubble_center_mm,
     letter_row_first_bubble_x_mm,
-    max_questions_fit_below_identity,
     mm_to_px,
     resolve_mcq_spacing,
+    answer_sheet_two_page_required,
     tower_num_label_box_width_mm,
     vertical_letters_block_height_mm,
     vertical_letters_handwrite_square_side_mm,
@@ -232,21 +273,6 @@ def _draw_bubble(
     c.restoreState()
 
 
-def _freeform_mcq_grid_top_anchor_mm(mg: dict[str, Any], id_h_mm: float) -> float:
-    """Sərbəst dizayn: saxlanmış top_mm şəxsiyyət zonasından yuxarıdırsa, PDF minimum gt ilə sinxron."""
-    default_gt = identity_zone_top_mm() + id_h_mm + L_BASE["sep_v"]
-    raw = mg.get("top_mm")
-    if raw is None:
-        return float(default_gt)
-    try:
-        rv = float(raw)
-    except (TypeError, ValueError):
-        return float(default_gt)
-    if rv <= 0:
-        return float(default_gt)
-    return max(float(default_gt), rv)
-
-
 def _draw_qr(c: canvas.Canvas, pw: float, ph: float, data: str) -> float:
     """Aşağı sağ künc: şəxsiyyət / sual şəbəkəsinə toxunmur; kiçik modul ilə qənaət."""
     qr_obj = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=8, border=1)
@@ -383,27 +409,34 @@ def _draw_identity_section(
             y = float(f.get("y_mm", zone_top + 3.0 + 7.0))
 
         if kind == "digit_groups":
-            groups = list(f.get("groups") or [])
             rows = digit_group_row_chunks(f)
             compact = bool(f.get("compact")) or bool(m_combined.get("identity_digit_compact"))
-            label_w = 13.0 if compact else 26.0
             group_tail = 3.5 if compact else 10.0
             row_gap0, row_gap1 = (4.0, 4.0) if compact else (5.0, 6.0)
+            dg_hdr = DIGIT_GROUP_ROW_HEADER_MM
+            top_gap = DIGIT_GROUP_TOP_GAP_AFTER_BAR_MM
+            gap_hw = DIGIT_GROUP_HANDWRITE_TO_BUBBLE_GAP_MM
+            show_hw = digit_group_show_handwrite_box(f, m_combined)
+            sq_top = vertical_letters_handwrite_square_side_mm(dd, max(dd + 0.12, pitch), None) if show_hw else 0.0
+            hw_block_mm = (sq_top + gap_hw) if show_hw else 0.0
+            row_stack_mm = dg_hdr + top_gap + hw_block_mm + ch
             y_row = y
             c_alt = colors.Color(0.995, 0.98, 0.99)
+            c_white = colors.Color(1.0, 1.0, 1.0)
             for row_i, row_groups in enumerate(rows):
                 if not row_groups:
                     continue
                 xc = field_left_mm + 2.0
-                row_plan: list[tuple[str, str, int, float, float]] = []
+                row_plan: list[tuple[str, str, int, float, float, float]] = []
                 for g in row_groups:
                     glabel = str(g.get("label", ""))
                     gid = str(g.get("id", "d"))
                     cnt = int(g.get("count", 1))
-                    col0_cx = xc + label_w + dd / 2.0
-                    row_plan.append((glabel, gid, cnt, xc, col0_cx))
-                    xc = col0_cx + cnt * pitch + group_tail
-                row_right_mm = xc
+                    group_w_mm = 2.0 + cnt * pitch + 1.0
+                    col0_cx = xc + 2.0 + pitch / 2.0
+                    row_plan.append((glabel, gid, cnt, xc, col0_cx, group_w_mm))
+                    xc += group_w_mm + group_tail
+                row_right_mm = xc - group_tail if row_groups else field_left_mm + 2.0
                 if layout_ff:
                     lm_band_mm = max(content_left_mm(), field_left_mm - 1.5)
                     rm_band_mm = min(rm_page_mm, row_right_mm + 4.0)
@@ -413,35 +446,76 @@ def _draw_identity_section(
                 c.saveState()
                 c.setFillColor(C_MAG_LT if row_i % 2 == 0 else c_alt)
                 y_top_pt = _rl(ph, y_row)
-                y_bot_pt = _rl(ph, y_row + ch)
+                y_bot_pt = _rl(ph, y_row + row_stack_mm)
                 band_w_pt = max(6.0 * mm, (rm_band_mm - lm_band_mm) * mm)
                 c.rect(lm_band_mm * mm, y_bot_pt, band_w_pt, y_top_pt - y_bot_pt, fill=1, stroke=0)
                 c.restoreState()
-                y_digits = y_row
-                for glabel, _gid, cnt, x_cursor, col0_cx in row_plan:
-                    c.setFont(_FB, 6.5 if compact else 6.8)
-                    c.setFillColor(C_MAG_ST)
-                    c.drawString(x_cursor * mm, _rl(ph, y_row + 3.0), f"{glabel}:")
-                    _draw_digit_columns(c, ph, col0_cx, y_digits, cnt, 10, dd=dd, dvg=dvg, dcol=dcol)
-                y_row += ch + (row_gap0 if row_i == 0 else row_gap1)
+
+                y_cols_top = y_row + dg_hdr + top_gap + hw_block_mm
+                for glabel, _gid, cnt, g_left, _col0_first, group_w_mm in row_plan:
+                    bar_top_pt = _rl(ph, y_row + dg_hdr)
+                    c.saveState()
+                    c.setFillColor(C_MAG)
+                    c.rect(g_left * mm, bar_top_pt, group_w_mm * mm, dg_hdr * mm, fill=1, stroke=0)
+                    c.setFillColor(C_MAG_TX)
+                    t_show = (glabel.rstrip(":").strip() or "Kod")[:44]
+                    tfs = max(5.2, min(6.5, dg_hdr * 1.05))
+                    while tfs >= 4.8 and c.stringWidth(t_show, _FB, tfs) > group_w_mm * mm - 2.5 * mm:
+                        tfs -= 0.2
+                    c.setFont(_FB, tfs)
+                    cx_bar = (g_left + group_w_mm / 2.0) * mm
+                    c.drawCentredString(cx_bar, bar_top_pt + dg_hdr * mm * 0.42, t_show)
+                    c.restoreState()
+
+                    y_body0 = y_row + dg_hdr + top_gap
+                    body_bot = y_body0 + hw_block_mm + ch
+                    for j in range(cnt):
+                        cx_col = g_left + 2.0 + pitch / 2.0 + j * pitch
+                        x_strip = (cx_col - pitch / 2.0 + 0.06) * mm
+                        w_strip = max(0.15, pitch - 0.12) * mm
+                        y_top_strip = _rl(ph, y_body0)
+                        y_bot_strip = _rl(ph, body_bot)
+                        h_strip = y_top_strip - y_bot_strip
+                        c.saveState()
+                        c.setFillColor(C_MAG_LT if j % 2 == 0 else c_white)
+                        c.rect(x_strip, y_bot_strip, w_strip, h_strip, fill=1, stroke=0)
+                        if j > 0:
+                            c.setStrokeColor(C_LINE)
+                            c.setLineWidth(0.25)
+                            c.line(x_strip, y_bot_strip, x_strip, y_top_strip)
+                        c.restoreState()
+
+                    if show_hw:
+                        for j in range(cnt):
+                            cx_col = g_left + 2.0 + pitch / 2.0 + j * pitch
+                            sq_left = (cx_col - sq_top / 2.0) * mm
+                            y_hw_top = _rl(ph, y_body0 + sq_top)
+                            c.saveState()
+                            c.setFillColorRGB(1, 1, 1)
+                            c.setStrokeColor(C_MAG_ST)
+                            c.setLineWidth(0.35)
+                            c.rect(sq_left, y_hw_top, sq_top * mm, sq_top * mm, fill=1, stroke=1)
+                            c.restoreState()
+
+                    col0_cx = g_left + 2.0 + pitch / 2.0
+                    _draw_digit_columns(c, ph, col0_cx, y_cols_top, cnt, 10, dd=dd, dvg=dvg, dcol=dcol)
+                y_row += row_stack_mm + (row_gap0 if row_i == 0 else row_gap1)
             if not layout_ff:
                 y = y_row
 
         elif kind == "mcq_groups":
-            y_meta = y + 6.0
-            row_y = _rl(ph, y_meta)
-            x_mm = field_left_mm + 2.0
-            gap_mm = lhg_centers
+            layouts = iter_mcq_groups_bubble_layouts(f, field_left_mm, y, m_combined)
             grp_list = list(f.get("groups") or [])
-            traces: list[tuple[str, list[str], float, float]] = []
-            for g in grp_list:
-                glabel = str(g.get("label", ""))
-                opts = [str(x) for x in (g.get("options") or ["A", "B"])]
-                bx_mm = x_mm + 14.0
-                traces.append((glabel, opts, bx_mm, x_mm))
-                x_mm = bx_mm + max(6.5, len(opts) * gap_mm + 2.0)
-            row_right_mm = x_mm
-            if layout_ff and grp_list:
+            if layouts:
+                row_y = _rl(ph, float(layouts[0]["cy_mm"]))
+                row_right_mm = float(layouts[-1]["cx0_mm"]) + max(
+                    6.5,
+                    len(layouts[-1]["options"]) * float(layouts[-1]["gap_mm"]) + 2.0,
+                )
+            else:
+                row_y = _rl(ph, y + 6.0)
+                row_right_mm = field_left_mm + 2.0
+            if layout_ff and grp_list and layouts:
                 lm_meta_mm = max(content_left_mm(), field_left_mm - 1.5)
                 rm_meta_mm = min(rm_page_mm, row_right_mm + 3.0)
                 bh_mm = 9.5
@@ -458,11 +532,13 @@ def _draw_identity_section(
                     stroke=0,
                 )
                 c.restoreState()
-            for glabel, opts, bx_mm, x_mm_lab in traces:
+            for lay in layouts:
+                gap_mm = float(lay["gap_mm"])
+                bx_mm = float(lay["cx0_mm"])
                 c.setFont(_FB, 6.8)
                 c.setFillColor(C_MAG_ST)
-                c.drawString(x_mm_lab * mm, row_y + 2 * mm, f"{glabel}:")
-                for j, lab in enumerate(opts):
+                c.drawString(float(lay["label_x_mm"]) * mm, row_y + 2 * mm, f"{lay['label']}:")
+                for j, lab in enumerate(lay["options"]):
                     _draw_bubble(c, (bx_mm + j * gap_mm) * mm, row_y, lr, lab, fs_scale=1.05)
             if not layout_ff:
                 y += 14.0
@@ -474,7 +550,7 @@ def _draw_identity_section(
             n_letters = max(1, min(len(AZ_LATIN), n_letters))
             letter_seq = AZ_LATIN[:n_letters]
             block_top = y
-            ct = block_top + 5.0
+            body_top = horizontal_letters_body_top_mm()
             lx0_mm = letter_row_first_bubble_x_mm(field_left_mm, f, met, m_combined)
             right_edge_mm = lx0_mm + (n_letters - 1) * lhg_centers + ld / 2.0
             band_w_pt = right_edge_mm * mm - field_lm
@@ -483,12 +559,25 @@ def _draw_identity_section(
             hw_w = float(f.get("handwrite_w_mm", m_combined.get("identity_handwrite_w_mm", 13.0)))
             hw_h = float(f.get("handwrite_h_mm", m_combined.get("identity_handwrite_h_mm", 5.0)))
             hw_gap = float(f.get("handwrite_gap_mm", m_combined.get("identity_handwrite_gap_mm", 1.4)))
-            row0 = block_top + 5.0 + 6.0
-            row_pitch_hw = hw_h + hw_gap + ld + 1.5
+            row_pitch = horizontal_letter_row_pitch_mm(f, met, m_combined)
+            row0 = block_top + body_top
+            bar_top_pt = _rl(ph, block_top + HORIZONTAL_LETTERS_HEADER_MM)
+            bar_w_pt = max(band_w_pt, (right_edge_mm - field_left_mm) * mm)
+            c.saveState()
+            c.setFillColor(C_MAG)
+            c.rect(field_lm, bar_top_pt, bar_w_pt, HORIZONTAL_LETTERS_HEADER_MM * mm, fill=1, stroke=0)
+            c.setFillColor(C_MAG_TX)
+            t_show = title[:48]
+            tfs = max(5.6, min(6.8, HORIZONTAL_LETTERS_HEADER_MM * 1.05))
+            while tfs >= 5.0 and c.stringWidth(t_show, _FB, tfs) > bar_w_pt - 3.5 * mm:
+                tfs -= 0.22
+            c.setFont(_FB, tfs)
+            c.drawString(field_lm + 2 * mm, bar_top_pt + HORIZONTAL_LETTERS_HEADER_MM * mm * 0.42, t_show)
+            c.restoreState()
             for ri in range(nrows):
                 if hw_mode:
-                    band_bot_mm = row0 + ri * row_pitch_hw
-                    band_top_mm = row0 + (ri + 1) * row_pitch_hw
+                    band_bot_mm = row0 + ri * row_pitch
+                    band_top_mm = row0 + (ri + 1) * row_pitch
                 else:
                     cy_mm = letter_row_bubble_center_mm(block_top, ri, f, met, m_combined)
                     vg_row = met["letter_vgap"]
@@ -500,23 +589,25 @@ def _draw_identity_section(
                 y_bl = _rl(ph, band_bot_mm)
                 c.rect(field_lm, y_bl, band_w_pt, h_band, fill=1, stroke=0)
                 c.restoreState()
-            c.setFillColor(C_MAG)
-            c.setFont(_FB, 7.0)
-            c.drawString(field_lm + 2 * mm, _rl(ph, ct), title[:48])
             for ri in range(nrows):
                 cy_mm = letter_row_bubble_center_mm(block_top, ri, f, met, m_combined)
                 by = _rl(ph, cy_mm)
                 c.setFillColorRGB(0.2, 0.2, 0.2)
                 c.setFont(_FB, 6.0)
                 if hw_mode:
-                    row0 = block_top + 5.0 + 6.0
-                    row_pitch = hw_h + hw_gap + ld + 1.5
                     y_row_top = row0 + ri * row_pitch
                     hb_top = _rl(ph, y_row_top + hw_h)
                     c.saveState()
                     c.setStrokeColor(C_MAG_ST)
                     c.setLineWidth(0.35)
-                    c.rect((field_left_mm + 11.0) * mm, hb_top, hw_w * mm, hw_h * mm, fill=0, stroke=1)
+                    c.rect(
+                        (field_left_mm + HORIZONTAL_LETTERS_ROW_LABEL_LEFT_MM) * mm,
+                        hb_top,
+                        hw_w * mm,
+                        hw_h * mm,
+                        fill=0,
+                        stroke=1,
+                    )
                     c.restoreState()
                     lbl_y = _rl(ph, y_row_top + hw_h / 2.0)
                     c.drawString(field_lm + 2 * mm, lbl_y - 0.8 * mm, f"{ri + 1:02d}")
@@ -598,7 +689,7 @@ def _draw_identity_section(
             glabel = str(f.get("label", "Kod"))
             # Pink header bar for digits field
             dbar_h = 4.8
-            dfield_w_mm = 3.0 + cnt * (dd + dcol) + 2.0
+            dfield_w_mm = digits_field_outer_width_mm(cnt, met, glabel)
             dbar_top_pt = _rl(ph, y + dbar_h)
             c.saveState()
             c.setFillColor(C_MAG)
@@ -616,16 +707,24 @@ def _draw_identity_section(
         elif kind == "mcq":
             glabel = str(f.get("label", ""))
             opts = [str(x) for x in (f.get("options") or ["A", "B", "C", "D"])]
-            y_meta = y + 6.0
-            row_y = _rl(ph, y_meta)
-            c.setFont(_FB, 6.8)
-            c.setFillColor(C_MAG_ST)
-            c.drawString((field_left_mm + 2.0) * mm, row_y + 2 * mm, f"{glabel}:")
-            bx0 = (field_left_mm + 14.0) * mm
+            dbar_h = _IDENTITY_FIELD_HEADER_MM
+            field_w_mm = mcq_single_block_width_mm(f, m_combined)
+            dbar_top_pt = _rl(ph, y + dbar_h)
+            c.saveState()
+            c.setFillColor(C_MAG)
+            c.rect(field_lm, dbar_top_pt, field_w_mm * mm, dbar_h * mm, fill=1, stroke=0)
+            c.setFillColor(C_MAG_TX)
+            c.setFont(_FB, 6.5)
+            c.drawCentredString(field_lm + (field_w_mm * mm) / 2.0, dbar_top_pt + 1.2 * mm, glabel[:40])
+            c.restoreState()
+            bx0_mm, cy_mm, gap_mcq, _d = identity_mcq_single_first_bubble_center_mm(
+                field_left_mm, y, m_combined
+            )
+            row_y = _rl(ph, cy_mm)
             for j, lab in enumerate(opts):
-                _draw_bubble(c, bx0 + j * lhg_centers * mm, row_y, lr, lab, fs_scale=1.05)
+                _draw_bubble(c, (bx0_mm + j * gap_mcq) * mm, row_y, lr, lab, fs_scale=1.05)
             if not layout_ff:
-                y += 12.0
+                y += dbar_h + MCQ_SINGLE_GAP_AFTER_HEADER_MM + ch + 4.0
 
         elif kind == "note":
             lines = int(f.get("lines", 1))
@@ -643,6 +742,69 @@ def _draw_identity_section(
             c.restoreState()
             if not layout_ff:
                 y += box_h
+
+        elif kind == "declaration":
+            body_h = float(f.get("box_h_mm", 28.0))
+            dbar_h = _IDENTITY_FIELD_HEADER_MM
+            total_h = dbar_h + body_h
+            field_w_mm = float(f.get("box_w_mm", 175.0))
+            if not layout_ff:
+                field_w_mm = (pw - field_lm - L_BASE["margin"] * mm) / mm
+            dbar_top_pt = _rl(ph, y + dbar_h)
+            body_top_pt = _rl(ph, y + total_h)
+            c.saveState()
+            c.setFillColor(C_MAG)
+            c.rect(field_lm, dbar_top_pt, field_w_mm * mm, dbar_h * mm, fill=1, stroke=0)
+            c.setFillColor(C_MAG_TX)
+            c.setFont(_FB, 6.5)
+            title = str(f.get("label", "Bəyannamə"))[:40]
+            c.drawCentredString(field_lm + (field_w_mm * mm) / 2.0, dbar_top_pt + 1.2 * mm, title)
+            c.setStrokeColor(C_MAG_ST)
+            c.setLineWidth(0.5)
+            c.setFillColorRGB(1, 1, 1)
+            c.rect(field_lm, body_top_pt, field_w_mm * mm, body_h * mm, fill=1, stroke=1)
+            c.setFillColorRGB(0.15, 0.15, 0.15)
+            c.setFont(_FN, 7)
+            text = str(
+                f.get(
+                    "text",
+                    "Mən bu cavab kartındakı məlumatların düzgünlüyünü təsdiq edirəm.",
+                )
+            )
+            # Simple wrap
+            max_chars = max(20, int(field_w_mm / 1.7))
+            words = text.split()
+            lines_out: list[str] = []
+            cur = ""
+            for w in words:
+                trial = f"{cur} {w}".strip()
+                if len(trial) <= max_chars:
+                    cur = trial
+                else:
+                    if cur:
+                        lines_out.append(cur)
+                    cur = w
+            if cur:
+                lines_out.append(cur)
+            ty = body_top_pt + body_h * mm - 4.2 * mm
+            for line in lines_out[:4]:
+                c.drawString(field_lm + 2.5 * mm, ty, line[:90])
+                ty -= 3.2 * mm
+            sig = str(f.get("signature_label", "İmza"))
+            sig_y = body_top_pt + 3.5 * mm
+            c.setFont(_FN, 7)
+            c.drawRightString(field_lm + field_w_mm * mm - 48 * mm, sig_y, f"{sig}:")
+            c.setStrokeColorRGB(0.2, 0.2, 0.2)
+            c.setLineWidth(0.6)
+            c.line(
+                field_lm + field_w_mm * mm - 45 * mm,
+                sig_y - 0.5 * mm,
+                field_lm + field_w_mm * mm - 3 * mm,
+                sig_y - 0.5 * mm,
+            )
+            c.restoreState()
+            if not layout_ff:
+                y += total_h
 
         if not layout_ff:
             y += 2.0
@@ -723,6 +885,62 @@ def _draw_grid_tower(
                 _draw_bubble(c, cx_pt, by, r, lbl, fs_scale=1.15)
 
 
+def _draw_mcq_section_title_band(c: canvas.Canvas, ph: float, blk: dict) -> None:
+    left = float(blk["left_mm"]) * mm
+    w = float(blk["width_mm"]) * mm
+    y_mm = float(blk["y_mm"])
+    top = _rl(ph, y_mm)
+    h = MCQ_SECTION_TITLE_H_MM * mm
+    title = str(blk.get("title") or "").strip()[:72]
+    if not title:
+        return
+    c.saveState()
+    c.setFillColor(C_MAG)
+    c.rect(left, top - h, w, h, fill=1, stroke=0)
+    c.setFillColor(C_MAG_TX)
+    c.setFont(_FB, 7.0)
+    c.drawString(left + 3 * mm, top - h + 2.0 * mm, title)
+    c.restoreState()
+
+
+def _draw_mcq_grid_title_band(
+    c: canvas.Canvas,
+    ph: float,
+    left_mm: float,
+    width_mm: float,
+    y_top_mm: float,
+    label: str,
+) -> None:
+    """Cavab şəbəkəsi üst başlığı (dizayner `mcq_grid_label`, default CAVABLAR)."""
+    title = str(label or "CAVABLAR").strip() or "CAVABLAR"
+    h = DIGIT_GROUP_ROW_HEADER_MM * mm
+    top = _rl(ph, y_top_mm)
+    left = float(left_mm) * mm
+    w = float(width_mm) * mm
+    c.saveState()
+    c.setFillColor(C_MAG)
+    c.rect(left, top - h, w, h, fill=1, stroke=0)
+    c.setFillColor(C_MAG_TX)
+    c.setFont(_FB, 7.0)
+    c.drawCentredString(left + w / 2, top - h + 2.0 * mm, title[:48])
+    c.restoreState()
+
+
+def _draw_mcq_grid_label(
+    c: canvas.Canvas,
+    ph: float,
+    pw_mm: float,
+    config: dict[str, Any],
+    blocks: list[dict],
+    gt_mm: float,
+    left_mm: float,
+) -> None:
+    label = str(config.get("mcq_grid_label") or "CAVABLAR").strip() or "CAVABLAR"
+    w = mcq_grid_handle_width_mm(label, blocks, left_mm, pw_mm)
+    y_top = float(gt_mm) - DIGIT_GROUP_ROW_HEADER_MM
+    _draw_mcq_grid_title_band(c, ph, left_mm, w, y_top, label)
+
+
 def _draw_grid(
     c: canvas.Canvas,
     pw: float,
@@ -736,21 +954,47 @@ def _draw_grid(
     vgap_mm: float | None = None,
     hgap_mm: float | None = None,
 ) -> None:
-    if blocks and blocks[0].get("layout") == "mcq_tower_row":
-        _draw_grid_tower(c, pw, ph, blocks, options, gb_mm)
+    for blk in blocks:
+        if blk.get("layout") == "mcq_section_title":
+            _draw_mcq_section_title_band(c, ph, blk)
+
+    data_blocks = [b for b in blocks if b.get("layout") != "mcq_section_title"]
+    if not data_blocks:
         return
 
-    opt_labels = list("ABCDE"[:options])
-    bd_use = float(bubble_d_mm if bubble_d_mm is not None else L_BASE["bubble_d"])
-    vg_use = float(vgap_mm if vgap_mm is not None else L_BASE["vgap"])
-    hg_use = float(hgap_mm if hgap_mm is not None else L_BASE["hgap"])
-    r = bd_use / 2.0 * mm
+    if data_blocks[0].get("layout") == "mcq_tower_row":
+        _draw_grid_tower(c, pw, ph, data_blocks, options, gb_mm)
+        return
 
-    for blk in blocks:
-        cx    = blk["col_x"] * mm
-        cw    = blk["col_w"] * mm
-        c_top = _rl(ph, gt_mm)
-        c_h   = (gb_mm - gt_mm) * mm
+    # Çoxbölməli şəbəkə: hər blokun öz fby/qs hündürlüyü (boş başlıqlı bölmələr də)
+    stacked = len(data_blocks) > 1 and (
+        any(b.get("section_title") for b in data_blocks)
+        or len({round(float(b.get("fby", 0)), 2) for b in data_blocks}) > 1
+    )
+
+    opt_labels = list("ABCDE"[:options])
+    bd_fallback = float(bubble_d_mm if bubble_d_mm is not None else L_BASE["bubble_d"])
+    vg_fallback = float(vgap_mm if vgap_mm is not None else L_BASE["vgap"])
+    hg_fallback = float(hgap_mm if hgap_mm is not None else L_BASE["hgap"])
+
+    for blk in data_blocks:
+        bd_use = float(blk.get("_bd", bd_fallback))
+        vg_use = float(blk.get("_vg", vg_fallback))
+        hg_use = float(blk.get("_hg", hg_fallback))
+        r = bd_use / 2.0 * mm
+        cx = blk["col_x"] * mm
+        cw = blk["col_w"] * mm
+        n_q = len(blk.get("qs") or [])
+        if n_q <= 0:
+            continue
+        if stacked:
+            top_mm = float(blk["fby"]) - bd_use / 2.0 - L_BASE["grid_top_pad"]
+            bot_mm = float(blk["fby"]) + (n_q - 1) * vg_use + bd_use / 2.0 + 1.0
+            c_top = _rl(ph, top_mm)
+            c_h = max(4.0, bot_mm - top_mm) * mm
+        else:
+            c_top = _rl(ph, gt_mm)
+            c_h = (gb_mm - gt_mm) * mm
 
         c.saveState()
         c.setFillColor(C_MAG_LT)
@@ -768,7 +1012,12 @@ def _draw_grid(
         c.drawCentredString(cx + cw / 2, c_top + 1.8 * mm, f"Sual {blk['qs'][0]}–{blk['qs'][-1]}")
         c.restoreState()
 
-        hdr_y = _rl(ph, gt_mm + L_BASE["grid_top_pad"] - 0.5)
+        hdr_y = _rl(
+            ph,
+            (float(blk["fby"]) - bd_use / 2.0 - L_BASE["grid_top_pad"] + 0.5)
+            if stacked
+            else (gt_mm + L_BASE["grid_top_pad"] - 0.5),
+        )
         for j, lbl in enumerate(opt_labels):
             bx = (blk["fbx"] + j * hg_use) * mm
             c.saveState()
@@ -851,6 +1100,81 @@ def _draw_footer(c: canvas.Canvas, pw: float, ph: float, sheet_uuid: str, *, qr_
     c.restoreState()
 
 
+def _draw_open_blocks(
+    c: canvas.Canvas,
+    ph: float,
+    config: dict[str, Any],
+    *,
+    page: int = 1,
+    panel: int | None = None,
+) -> None:
+    """Grid-in və essay açıq sual bloklarını çək."""
+    for block in resolve_open_blocks(config):
+        if int(block.get("page") or 1) != page:
+            continue
+        if panel is not None and int(block.get("panel") or 1) != panel:
+            continue
+        qn = int(block["question_number"])
+        x = float(block["x_mm"])
+        y = float(block["y_mm"])
+
+        if block["kind"] == "grid_in":
+            w, h = grid_in_block_size_mm(block)
+            values = list(block.get("bubble_values") or list("0123456789"))
+            n_cols = int(block["answer_length"])
+            dd = GRID_IN_BUBBLE_D_MM
+            pitch = dd + GRID_IN_COL_GAP_MM
+            c.saveState()
+            c.setStrokeColor(C_MAG_ST)
+            c.setLineWidth(0.6)
+            c.setFillColor(colors.Color(1, 0.98, 0.99))
+            y_top = _rl(ph, y)
+            y_bot = _rl(ph, y + h)
+            c.rect(x * mm, y_bot, w * mm, y_top - y_bot, fill=1, stroke=1)
+            c.setFillColor(C_MAG)
+            c.rect(x * mm, _rl(ph, y + GRID_IN_LABEL_H_MM), w * mm, GRID_IN_LABEL_H_MM * mm, fill=1, stroke=0)
+            c.setFillColor(C_MAG_TX)
+            c.setFont(_FB, 8)
+            c.drawCentredString((x + w / 2) * mm, _rl(ph, y + GRID_IN_LABEL_H_MM - 1.2), str(qn))
+            hw_top = y + GRID_IN_LABEL_H_MM
+            for j in range(n_cols):
+                cx = x + GRID_IN_PAD_MM + pitch / 2.0 + j * pitch
+                sq = GRID_IN_HANDWRITE_H_MM
+                c.setFillColorRGB(1, 1, 1)
+                c.setStrokeColor(C_MAG_ST)
+                c.setLineWidth(0.35)
+                c.rect((cx - sq / 2) * mm, _rl(ph, hw_top + sq), sq * mm, sq * mm, fill=1, stroke=1)
+            y_bub = hw_top + GRID_IN_HANDWRITE_H_MM + 1.0
+            r = dd / 2.0 * mm
+            for j in range(n_cols):
+                cx = x + GRID_IN_PAD_MM + pitch / 2.0 + j * pitch
+                for k, val in enumerate(values):
+                    cy_mm = y_bub + dd / 2.0 + k * GRID_IN_VGAP_MM
+                    _draw_bubble(c, cx * mm, _rl(ph, cy_mm), r, str(val), fs_scale=0.9)
+            c.restoreState()
+
+        elif block["kind"] == "essay":
+            w, h = essay_block_size_mm(block)
+            c.saveState()
+            c.setStrokeColor(C_MAG_ST)
+            c.setLineWidth(0.7)
+            c.setFillColor(colors.Color(1, 0.985, 0.99))
+            y_top = _rl(ph, y)
+            y_bot = _rl(ph, y + h)
+            c.rect(x * mm, y_bot, w * mm, y_top - y_bot, fill=1, stroke=1)
+            c.setFillColor(colors.Color(0.92, 0.55, 0.7))
+            c.setFont(_FB, min(28, max(14, h * 0.35)))
+            c.drawCentredString((x + w / 2) * mm, _rl(ph, y + h / 2 + 2), str(qn))
+            c.setStrokeColor(C_LINE)
+            c.setLineWidth(0.25)
+            n_lines = int(block.get("max_lines") or 8)
+            line_gap = (h - 8.0) / max(1, n_lines)
+            for i in range(1, n_lines):
+                ly = y + 6.0 + i * line_gap
+                c.line((x + 2) * mm, _rl(ph, ly), (x + w - 2) * mm, _rl(ph, ly))
+            c.restoreState()
+
+
 def generate_answer_sheet_pdf(
     config: dict[str, Any],
     exam_id: int,
@@ -859,6 +1183,22 @@ def generate_answer_sheet_pdf(
     if not sheet_uuid:
         sheet_uuid = str(uuid.uuid4())
 
+    if is_a3_duplex_fold(config):
+        panel_pdfs: dict[int, bytes] = {}
+        for panel in (1, 2, 3, 4):
+            pcfg = panel_config(config, panel)
+            raw, _ = _generate_answer_sheet_pdf_inner(pcfg, exam_id, f"{sheet_uuid}-p{panel}")
+            panel_pdfs[panel] = raw
+        return compose_a3_fold_pdf_from_panel_pdfs(panel_pdfs), sheet_uuid
+
+    return _generate_answer_sheet_pdf_inner(config, exam_id, sheet_uuid)
+
+
+def _generate_answer_sheet_pdf_inner(
+    config: dict[str, Any],
+    exam_id: int,
+    sheet_uuid: str,
+) -> tuple[bytes, str]:
     _ensure_pdf_fonts()
 
     logo_reader: ImageReader | None = None
@@ -877,27 +1217,25 @@ def generate_answer_sheet_pdf(
     pw_mm  = pw / mm
     ph_mm  = ph / mm
 
-    q_count = max(1, int(config.get("question_count", 50)))
+    q_count = max(1, int(config.get("question_count", 50))) if int(config.get("question_count", 50) or 0) > 0 else 0
+    # Keep at least 1 for legacy MCQ-only sheets that omit open blocks
+    if q_count == 0 and not resolve_open_blocks(config):
+        q_count = 1
     options = max(2, min(5, int(config.get("options_per_question", 5))))
     cols    = max(1, min(6, int(config.get("columns_count", 2))))
     title   = str(config.get("title", "") or "CAVAB KARTI")
     sub_hdr = str(config.get("header_subtitle") or "").strip()
     part_lab = str(config.get("participant_label", "") or "")
     sheet_code = str(config.get("participant_code", "") or config.get("sheet_code", "") or "")
+    panel_int = int(config["fold_panel"]) if config.get("fold_panel") is not None else None
 
     cfg_h = dict(config)
     if sheet_code:
         cfg_h["participant_code"] = sheet_code
     id_h = identity_height_mm(cfg_h)
     layout_ff = config.get("layout_mode") == "freeform"
-    mg0 = config.get("mcq_grid") or {}
-    left_fit = float(mg0.get("left_mm", content_left_mm())) if layout_ff else content_left_mm()
-    fit1 = max_questions_fit_below_identity(
-        ph_mm, cols, id_h, config, pw_mm=pw_mm, left_mm=left_fit,
-    )
 
-    single_page = bool(config.get("single_page_layout", True))
-    two_page = (not single_page) and (fit1 < q_count)
+    two_page = answer_sheet_two_page_required(config, pw_mm, ph_mm) if q_count > 0 else False
 
     buf = BytesIO()
     c   = canvas.Canvas(buf, pagesize=(pw, ph))
@@ -905,34 +1243,26 @@ def generate_answer_sheet_pdf(
     qr_data = f"omr:v1:{sheet_uuid}:{exam_id}"
     if sheet_code:
         qr_data += f":{sheet_code[:40]}"
+    if panel_int:
+        qr_data += f":panel:{panel_int}"
 
     def _prepare_grid(gt_anchor: float, left_anchor: float) -> tuple[list[dict], float, float, float, float, float, float]:
-        bd_f, vg_f, hg_f, nc_f = resolve_mcq_spacing(
-            ph_mm, cols, q_count, gt_anchor, config, pw_mm=pw_mm, left_mm=left_anchor,
-        )
-        if nc_f > 0:
-            bl, gt_o, gb_o = compute_mcquestion_tower_rows(
-                pw_mm, ph_mm, q_count, gt_anchor, left_anchor,
-                bd_f, vg_f, hg_f, nc_f, options, config,
-            )
-        else:
-            bl, gt_o, gb_o = compute_mcquestion_blocks_with_gt(
-                pw_mm, ph_mm, cols, q_count, gt_anchor,
-                left_mm=left_anchor, bubble_d=bd_f, vgap=vg_f, hgap=hg_f,
-            )
-        return bl, gt_o, gb_o, bd_f, vg_f, hg_f, nc_f
+        if q_count < 1:
+            return [], gt_anchor, gt_anchor, float(L_BASE["bubble_d"]), float(L_BASE["vgap"]), float(L_BASE["hgap"]), 0.0
+        return prepare_mcq_grid_blocks(pw_mm, ph_mm, config, gt_anchor, left_anchor)
 
     if two_page:
         gt_p2_pre = identity_zone_top_mm() + L_BASE["sep_v"]
         la_pre = content_left_mm()
         bd_id, _, _, nc_id = resolve_mcq_spacing(
-            ph_mm, cols, q_count, gt_p2_pre, config, pw_mm=pw_mm, left_mm=la_pre,
+            ph_mm, cols, max(1, q_count), gt_p2_pre, config, pw_mm=pw_mm, left_mm=la_pre,
         )
         cfg_identity = config_with_identity_matched_to_mcq(dict(config), bd_id, nc_id > 0.0)
         _draw_timing_strip(c, ph)
         _draw_header_dim(c, pw, ph, title, sub_hdr, part_lab, logo_reader)
         _draw_identity_section(c, pw, ph, pw_mm, cfg=cfg_identity, sheet_code=sheet_code)
         qx_p1 = _draw_qr(c, pw, ph, qr_data)
+        _draw_open_blocks(c, ph, config, page=1, panel=panel_int)
         c.saveState()
         c.setFillColor(C_MAG_ST)
         c.setFont(_FB, 9)
@@ -952,24 +1282,33 @@ def generate_answer_sheet_pdf(
         _draw_timing_strip(c, ph)
         _draw_header_dim(c, pw, ph, title, sub_hdr, part_lab, logo_reader)
         qx_p2 = _draw_qr(c, pw, ph, qr_data)
-        _draw_grid(c, pw, ph, blocks, options, gt_mm, gb_mm, bubble_d_mm=bd_f, vgap_mm=vg_f, hgap_mm=hg_f)
+        if q_count > 0 and should_show_mcq_grid_label(config):
+            _draw_mcq_grid_label(c, ph, pw_mm, config, blocks, gt_mm, content_left_mm())
+        if q_count > 0:
+            _draw_grid(c, pw, ph, blocks, options, gt_mm, gb_mm, bubble_d_mm=bd_f, vgap_mm=vg_f, hgap_mm=hg_f)
+        _draw_open_blocks(c, ph, config, page=2, panel=panel_int)
         _draw_footer(c, pw, ph, sheet_uuid, qr_left_x=qx_p2)
         _draw_corners(c, pw, ph)
     else:
         if layout_ff:
             mg = config.get("mcq_grid") or {}
-            gt_anchor = _freeform_mcq_grid_top_anchor_mm(mg, id_h)
+            gt_anchor = freeform_mcq_grid_top_anchor_mm(mg, id_h, config)
             left_anchor = float(mg.get("left_mm", content_left_mm()))
         else:
             gt_anchor = identity_zone_top_mm() + id_h + L_BASE["sep_v"]
             left_anchor = content_left_mm()
         blocks, gt_mm, gb_mm, bd_f, vg_f, hg_f, nc_f = _prepare_grid(gt_anchor, left_anchor)
-        cfg_identity = config_with_identity_matched_to_mcq(dict(config), bd_f, nc_f > 0.0)
+        cfg_identity = config_with_identity_matched_to_mcq(dict(config), bd_f if q_count else float(L_BASE["bubble_d"]), nc_f > 0.0)
         _draw_timing_strip(c, ph)
         _draw_header_dim(c, pw, ph, title, sub_hdr, part_lab, logo_reader)
-        _draw_identity_section(c, pw, ph, pw_mm, cfg=cfg_identity, sheet_code=sheet_code)
+        if identity_enabled(cfg_identity):
+            _draw_identity_section(c, pw, ph, pw_mm, cfg=cfg_identity, sheet_code=sheet_code)
         qx_p1b = _draw_qr(c, pw, ph, qr_data)
-        _draw_grid(c, pw, ph, blocks, options, gt_mm, gb_mm, bubble_d_mm=bd_f, vgap_mm=vg_f, hgap_mm=hg_f)
+        if q_count > 0 and should_show_mcq_grid_label(config):
+            _draw_mcq_grid_label(c, ph, pw_mm, config, blocks, gt_mm, left_anchor)
+        if q_count > 0:
+            _draw_grid(c, pw, ph, blocks, options, gt_mm, gb_mm, bubble_d_mm=bd_f, vgap_mm=vg_f, hgap_mm=hg_f)
+        _draw_open_blocks(c, ph, config, page=1, panel=panel_int)
         _draw_footer(c, pw, ph, sheet_uuid, qr_left_x=qx_p1b)
         _draw_corners(c, pw, ph)
 
@@ -978,6 +1317,19 @@ def generate_answer_sheet_pdf(
 
 
 def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
+    if is_a3_duplex_fold(config):
+        panels: dict[str, Any] = {}
+        for p in (1, 2, 3, 4):
+            panels[str(p)] = _get_omr_template_inner(panel_config(config, p))
+        base = dict(panels["1"])
+        base["a3_duplex_fold"] = True
+        base["fold_panel_templates"] = panels
+        base["pageDimensions"] = [mm_to_px(420.0), mm_to_px(297.0)]
+        return base
+    return _get_omr_template_inner(config)
+
+
+def _get_omr_template_inner(config: dict[str, Any]) -> dict[str, Any]:
     paper_key = str(config.get("paper_size", "A4"))
     if paper_key not in PAPERS:
         paper_key = "A4"
@@ -997,13 +1349,8 @@ def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
 
     id_h = identity_height_mm(cfg_h)
     layout_ff = config.get("layout_mode") == "freeform"
-    mg0 = config.get("mcq_grid") or {}
-    left_fit = float(mg0.get("left_mm", content_left_mm())) if layout_ff else content_left_mm()
-    fit1 = max_questions_fit_below_identity(
-        ph_mm, cols, id_h, config, pw_mm=pw_mm, left_mm=left_fit,
-    )
-    single_page = bool(config.get("single_page_layout", True))
-    two_page = (not single_page) and (fit1 < q_count)
+
+    two_page = answer_sheet_two_page_required(config, pw_mm, ph_mm)
 
     field_blocks: dict[str, Any] = {}
     out_cols: list[str] = []
@@ -1015,19 +1362,9 @@ def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
     if two_page:
         gt_p2 = identity_zone_top_mm() + L_BASE["sep_v"]
         la2 = content_left_mm()
-        bd_f, vg_f, hg_f, nc_f = resolve_mcq_spacing(
-            ph_mm, cols, q_count, gt_p2, config, pw_mm=pw_mm, left_mm=la2,
+        blocks, _, _, bd_f, vg_f, hg_f, nc_f = prepare_mcq_grid_blocks(
+            pw_mm, ph_mm, config, gt_p2, la2,
         )
-        if nc_f > 0:
-            blocks, _, _ = compute_mcquestion_tower_rows(
-                pw_mm, ph_mm, q_count, gt_p2, la2,
-                bd_f, vg_f, hg_f, nc_f, options, config,
-            )
-        else:
-            blocks, _, _ = compute_mcquestion_blocks_with_gt(
-                pw_mm, ph_mm, cols, q_count, gt_p2,
-                left_mm=la2, bubble_d=bd_f, vgap=vg_f, hgap=hg_f,
-            )
         if stitched_two_pages:
             gt_p2_pre = identity_zone_top_mm() + L_BASE["sep_v"]
             la_pre = content_left_mm()
@@ -1042,24 +1379,14 @@ def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
     else:
         if layout_ff:
             mg = config.get("mcq_grid") or {}
-            gt_a = _freeform_mcq_grid_top_anchor_mm(mg, id_h)
+            gt_a = freeform_mcq_grid_top_anchor_mm(mg, id_h, config)
             la = float(mg.get("left_mm", content_left_mm()))
         else:
             gt_a = identity_zone_top_mm() + id_h + L_BASE["sep_v"]
             la = content_left_mm()
-        bd_f, vg_f, hg_f, nc_f = resolve_mcq_spacing(
-            ph_mm, cols, q_count, gt_a, config, pw_mm=pw_mm, left_mm=la,
+        blocks, _, _, bd_f, vg_f, hg_f, nc_f = prepare_mcq_grid_blocks(
+            pw_mm, ph_mm, config, gt_a, la,
         )
-        if nc_f > 0:
-            blocks, _, _ = compute_mcquestion_tower_rows(
-                pw_mm, ph_mm, q_count, gt_a, la,
-                bd_f, vg_f, hg_f, nc_f, options, config,
-            )
-        else:
-            blocks, _, _ = compute_mcquestion_blocks_with_gt(
-                pw_mm, ph_mm, cols, q_count, gt_a,
-                left_mm=la, bubble_d=bd_f, vgap=vg_f, hgap=hg_f,
-            )
         id_cfg_omr = config_with_identity_matched_to_mcq(dict(cfg_h), bd_f, nc_f > 0.0)
         id_fb, id_cols = build_identity_omr_field_blocks(id_cfg_omr)
         field_blocks = dict(id_fb)
@@ -1068,39 +1395,78 @@ def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
 
     bd_main = mm_to_px(bd_f)
 
-    for i, blk in enumerate(blocks):
-        labels = [f"q{q}" for q in blk["qs"]]
+    mcq_idx = 0
+    for blk in blocks:
+        if blk.get("layout") == "mcq_section_title":
+            continue
+        qs = blk.get("qs") or []
+        if not qs:
+            continue
+        mcq_idx += 1
+        labels = [f"q{q}" for q in qs]
         out_cols.extend(labels)
+        bubble_vals = list("ABCDE"[:options])
         if blk.get("layout") == "mcq_tower_row":
             sp = float(blk["strip_pitch_mm"])
+            opt_vg = float(blk.get("opt_vgap", vg_f))
+            bd_blk = float(blk.get("bd", bd_f))
             ox_mm, oy_mm = _center_to_origin_tl(
-                float(blk["first_bx_mm"]), float(blk["first_by_mm"]) + mcq_y_shift_mm, bd_f,
+                float(blk["first_bx_mm"]), float(blk["first_by_mm"]) + mcq_y_shift_mm, bd_blk,
             )
-            # OMRChecker QTYPE_MCQ* defolt üfüqi A–E çəkir; DİM kartında isə A–E şaqulidir.
-            field_blocks[f"MCQ_{i + 1}"] = {
+            field_blocks[f"MCQ_{mcq_idx}"] = {
                 "fieldType":   f"QTYPE_MCQ{options}",
                 "direction":   "vertical",
                 "fieldLabels": labels,
+                "bubbleValues": bubble_vals,
                 "origin":      [mm_to_px(ox_mm), mm_to_px(oy_mm)],
-                "bubblesGap":  mm_to_px(vg_f),
+                "bubblesGap":  mm_to_px(opt_vg),
                 "labelsGap":   mm_to_px(sp),
             }
         else:
+            bd_blk = float(blk.get("_bd", bd_f))
+            hg_blk = float(blk.get("_hg", hg_f))
+            vg_blk = float(blk.get("_vg", vg_f))
             ox_mm, oy_mm = _center_to_origin_tl(
-                blk["fbx"], float(blk["fby"]) + mcq_y_shift_mm, bd_f,
+                blk["fbx"], float(blk["fby"]) + mcq_y_shift_mm, bd_blk,
             )
-            field_blocks[f"MCQ_{i + 1}"] = {
+            field_blocks[f"MCQ_{mcq_idx}"] = {
                 "fieldType":   f"QTYPE_MCQ{options}",
                 "fieldLabels": labels,
+                "bubbleValues": bubble_vals,
                 "origin":      [mm_to_px(ox_mm), mm_to_px(oy_mm)],
-                "bubblesGap":  mm_to_px(hg_f),
-                "labelsGap":   mm_to_px(vg_f),
+                "bubblesGap":  mm_to_px(hg_blk),
+                "labelsGap":   mm_to_px(vg_blk),
             }
+
+    open_panel = int(config["fold_panel"]) if config.get("fold_panel") is not None else None
+    if stitched_two_pages:
+        open_fb1, open_cols1 = build_open_omr_field_blocks(
+            config,
+            page_filter=1,
+            y_shift_mm=0.0,
+            panel_filter=open_panel,
+        )
+        open_fb2, open_cols2 = build_open_omr_field_blocks(
+            config,
+            page_filter=2,
+            y_shift_mm=ph_mm,
+            panel_filter=open_panel,
+        )
+        open_fb = {**open_fb1, **open_fb2}
+        open_cols = list(open_cols1) + list(open_cols2)
+    else:
+        open_fb, open_cols = build_open_omr_field_blocks(
+            config,
+            panel_filter=open_panel,
+        )
+    field_blocks.update(open_fb)
+    out_cols.extend(open_cols)
 
     bubble_d_px = bd_main
     if identity_enabled(cfg_h) and id_cfg_for_bubble_max is not None:
         im = identity_draw_metrics(id_cfg_for_bubble_max)
         bubble_d_px = max(bd_main, mm_to_px(im["digit_d"]), mm_to_px(im["letter_d"]))
+    bubble_d_px = max(bubble_d_px, mm_to_px(GRID_IN_BUBBLE_D_MM))
 
     ph_draw_mm = ph_mm * (2.0 if stitched_two_pages else 1.0)
     tpl: dict[str, Any] = {
@@ -1115,6 +1481,7 @@ def get_omr_template(config: dict[str, Any]) -> dict[str, Any]:
         "bubbleValues": list("ABCDE"[:options]),
         "two_page_pdf": two_page,
         "omr_two_page_stitched": stitched_two_pages,
+        "open_blocks": resolve_open_blocks(config),
     }
     return tpl
 

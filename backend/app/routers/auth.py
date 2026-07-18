@@ -1,15 +1,39 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+import secrets
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from jose import JWTError, jwt
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, oauth2_scheme
+from app.limiter import limiter
 from app.models.entities import User, UserRole
 from app.schemas.auth import BootstrapAdminRequest, LoginRequest, TokenResponse, UserOut
 from app.schemas.common import MessageResponse
 from app.security import create_access_token, hash_password, verify_password
+from app.services.auth_security import (
+    clear_login_failures,
+    denylist_token,
+    is_login_locked,
+    record_login_failure,
+)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+settings = get_settings()
+
+# Advisory lock key for first-admin bootstrap (empty-table race)
+_BOOTSTRAP_ADVISORY_LOCK = 87001601
+
+
+def _bootstrap_token_ok(provided: str | None, expected: str) -> bool:
+    if not provided:
+        return False
+    if len(provided) != len(expected):
+        return False
+    return secrets.compare_digest(provided, expected)
 
 
 @router.get("/bootstrap-status")
@@ -19,16 +43,35 @@ async def bootstrap_status(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("10/minute")
+async def login(request: Request, payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+    if is_login_locked(payload.email):
+        raise HTTPException(status_code=429, detail="Too many failed login attempts; try again later")
     user = await db.scalar(select(User).where(User.email == payload.email))
     if user is None or not verify_password(payload.password, user.password_hash):
+        record_login_failure(payload.email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    clear_login_failures(payload.email)
     token = create_access_token(str(user.id))
     return TokenResponse(access_token=token)
 
 
 @router.post("/bootstrap-admin", response_model=UserOut)
-async def bootstrap_admin(payload: BootstrapAdminRequest, db: AsyncSession = Depends(get_db)):
+@limiter.limit("5/hour")
+async def bootstrap_admin(
+    request: Request,
+    payload: BootstrapAdminRequest,
+    db: AsyncSession = Depends(get_db),
+    x_bootstrap_token: str | None = Header(default=None, alias="X-Bootstrap-Token"),
+):
+    expected = (settings.bootstrap_setup_token or "").strip() or None
+    if expected:
+        provided = (x_bootstrap_token or payload.setup_token or "").strip() or None
+        if not _bootstrap_token_ok(provided, expected):
+            raise HTTPException(status_code=403, detail="Invalid or missing bootstrap setup token")
+
+    # Serialize bootstrap across concurrent requests (empty table has no row locks)
+    await db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _BOOTSTRAP_ADVISORY_LOCK})
     users_count = await db.scalar(select(func.count()).select_from(User))
     if users_count and users_count > 0:
         raise HTTPException(status_code=400, detail="System already initialized")
@@ -45,7 +88,17 @@ async def bootstrap_admin(payload: BootstrapAdminRequest, db: AsyncSession = Dep
 
 
 @router.post("/logout", response_model=MessageResponse)
-async def logout():
+async def logout(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except JWTError:
+        return MessageResponse(message="Logged out")
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if jti and exp is not None:
+        now = int(datetime.now(timezone.utc).timestamp())
+        ttl = max(1, int(exp) - now)
+        denylist_token(str(jti), ttl_seconds=ttl)
     return MessageResponse(message="Logged out")
 
 
