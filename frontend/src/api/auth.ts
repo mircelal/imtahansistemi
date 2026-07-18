@@ -1,7 +1,8 @@
 import { api } from "./client";
 
 export type LoginPayload = {
-  email: string;
+  email?: string;
+  fin_code?: string;
   password: string;
 };
 
@@ -22,6 +23,7 @@ export async function me() {
     email: string;
     full_name: string;
     role: string;
+    fin_code?: string | null;
     linked_student_id?: number | null;
   }>("/api/auth/me");
   return data;
@@ -37,6 +39,22 @@ export async function bootstrapAdmin(payload: BootstrapPayload) {
 
 export async function bootstrapStatus() {
   const { data } = await api.get<{ needs_bootstrap: boolean }>("/api/auth/bootstrap-status");
+  return data;
+}
+
+export type StudentRegisterPayload = {
+  fin_code?: string;
+  email?: string;
+  full_name: string;
+  password: string;
+  student_number?: string;
+};
+
+export async function registerStudent(payload: StudentRegisterPayload) {
+  const { data } = await api.post<{ access_token: string; token_type: string }>(
+    "/api/auth/register-student",
+    payload
+  );
   return data;
 }
 

@@ -45,9 +45,43 @@ class StudentCreate(BaseModel):
         return s
 
 
+class AdminStudentCreate(BaseModel):
+    """Admin: kurssuz və ya kurs ilə şagird; istəyə bağlı kabinet."""
+
+    full_name: str = Field(min_length=1, max_length=255)
+    student_number: str | None = None
+    course_id: int | None = None
+    email: EmailStr | None = None
+    password: str | None = Field(default=None, min_length=6, max_length=128)
+    fin_code: str | None = Field(default=None, min_length=7, max_length=7)
+
+    @field_validator("student_number")
+    @classmethod
+    def student_number_optional_digits(cls, v: str | None) -> str | None:
+        if v is None or not str(v).strip():
+            return None
+        s = str(v).strip()
+        if not _STUDENT_CODE_RE.match(s):
+            raise ValueError("student_number must be exactly 6 digits")
+        return s
+
+    @field_validator("fin_code")
+    @classmethod
+    def fin_optional(cls, v: str | None) -> str | None:
+        if v is None or not str(v).strip():
+            return None
+        from app.services.fin_identity import normalize_fin
+
+        return normalize_fin(v)
+
+
+class StudentAssignCourse(BaseModel):
+    course_id: int = Field(ge=1)
+
+
 class StudentOut(ORMModel):
     id: int
-    course_id: int
+    course_id: int | None
     student_number: str
     full_name: str
     created_at: datetime
@@ -82,13 +116,14 @@ class StudentPasswordReset(BaseModel):
 
 class StudentListRowOut(BaseModel):
     id: int
-    course_id: int
+    course_id: int | None
     course_name: str
     student_number: str
     full_name: str
     created_at: datetime
     login_user_id: int | None = None
     login_email: str | None = None
+    fin_code: str | None = None
     has_login: bool = False
     exam_count: int = 0
     last_percent: float | None = None

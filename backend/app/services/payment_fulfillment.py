@@ -69,6 +69,13 @@ async def fulfill_intent(
         order.status = TicketOrderStatus.CONFIRMED
         order.payment_method = intent.driver or order.payment_method or "online"
         if order.student_id is None:
+            meta_sid = (intent.meta or {}).get("student_id")
+            if meta_sid is not None:
+                try:
+                    order.student_id = int(meta_sid)
+                except (TypeError, ValueError):
+                    pass
+        if order.student_id is None:
             sid = await resolve_student_for_order(db, ticket.course_id, order.buyer_name, order.buyer_phone)
             if sid is not None:
                 order.student_id = sid

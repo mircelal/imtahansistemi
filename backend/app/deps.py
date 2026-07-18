@@ -34,7 +34,7 @@ async def get_current_user(
     except (JWTError, TypeError, ValueError):
         raise credentials_exception
     user = await db.scalar(select(User).where(User.id == user_id))
-    if user is None:
+    if user is None or user.deleted_at is not None:
         raise credentials_exception
     # Ephemeral request context (not a DB column)
     user.impersonated_by = impersonated_by  # type: ignore[attr-defined]

@@ -11,9 +11,16 @@ class Settings(BaseSettings):
     environment: str = "development"
     secret_key: str
     algorithm: str = "HS256"
-    access_token_expire_minutes: int = 1440
+    access_token_expire_minutes: int = 60
+    refresh_token_expire_days: int = 30
     cors_origins: str = "http://localhost:3000"
     rate_limit_per_minute: int = 120
+    # Mobile deep link scheme for payment return
+    mobile_app_scheme: str = "imtahansistemi"
+    # Optional SİMA OAuth stub (Phase 3)
+    sima_enabled: bool = False
+    sima_client_id: str | None = None
+    sima_auth_url: str | None = None
 
     # If set, POST /api/auth/bootstrap-admin requires matching X-Bootstrap-Token header or body setup_token
     bootstrap_setup_token: str | None = None

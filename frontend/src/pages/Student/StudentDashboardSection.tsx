@@ -24,8 +24,11 @@ export default function StudentDashboardSection({ profile, systemName, userName 
           <h1 className="mt-2 text-3xl font-bold tracking-tight sm:text-4xl">{systemName}</h1>
           <p className="mt-3 text-sm leading-relaxed text-slate-300 sm:text-base">
             Xoş gəldiniz, <span className="font-semibold text-white">{userName}</span>. Kod:{" "}
-            <span className="font-mono font-semibold text-emerald-300">{student.student_number}</span> · Kurs:{" "}
+            <span className="font-mono font-semibold text-emerald-300">{student.student_number}</span> ·{" "}
             <span className="font-semibold text-white">{student.course_name}</span>
+            {(student.courses?.length ?? 0) > 1 ? (
+              <span className="text-slate-400"> ({student.courses!.join(", ")})</span>
+            ) : null}
           </p>
         </div>
       </section>

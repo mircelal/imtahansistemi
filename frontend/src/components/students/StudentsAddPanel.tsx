@@ -54,7 +54,9 @@ export default function StudentsAddPanel({ courseId, onSuccess }: Props) {
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
       <h2 className="text-sm font-semibold text-slate-900">Yeni qeydiyyat</h2>
-      <p className="mt-1 text-xs text-slate-500">6 rəqəmli OMR kodu və tam ad. Kabinet ayrıca açılır.</p>
+      <p className="mt-1 text-xs text-slate-500">
+    6 rəqəmli OMR kodu və tam ad. Eyni kodlu kurssuz şagird varsa, avtomatik bu kursa yazılır.
+  </p>
       <form
         className="mt-3 flex flex-wrap items-end gap-2"
         onSubmit={form.handleSubmit((v) => addMut.mutate(v))}

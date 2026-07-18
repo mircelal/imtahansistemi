@@ -40,6 +40,9 @@ class ExamCreate(BaseModel):
     delivery_mode: str = Field(default="in_person", max_length=16)
     venue: str | None = Field(default=None, max_length=255)
     city: str | None = Field(default=None, max_length=128)
+    region_id: int | None = None
+    area_id: int | None = None
+    venue_id: int | None = None
     list_price_amount: float = Field(ge=0, default=0)
     list_price_currency: str = Field(default="AZN", max_length=8)
     bundled_ticket: ExamTicketBundledCreate | None = None
@@ -74,6 +77,9 @@ class ExamUpdate(BaseModel):
     delivery_mode: str | None = Field(default=None, max_length=16)
     venue: str | None = Field(default=None, max_length=255)
     city: str | None = Field(default=None, max_length=128)
+    region_id: int | None = None
+    area_id: int | None = None
+    venue_id: int | None = None
     list_price_amount: float | None = Field(default=None, ge=0)
     list_price_currency: str | None = Field(default=None, max_length=8)
     answer_sheet_preset_id: int | None = None
@@ -102,6 +108,9 @@ class ExamOut(ORMModel):
     delivery_mode: str = "in_person"
     venue: str | None = None
     city: str | None = None
+    region_id: int | None = None
+    area_id: int | None = None
+    venue_id: int | None = None
     list_price_amount: float = 0
     list_price_currency: str = "AZN"
     created_at: datetime

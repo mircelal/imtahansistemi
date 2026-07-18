@@ -76,10 +76,101 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(255))
     full_name: Mapped[str] = mapped_column(String(255))
     role: Mapped[UserRole] = mapped_column(SqlEnum(UserRole), index=True)
+    fin_code: Mapped[str | None] = mapped_column(String(7), unique=True, nullable=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    preferred_region_id: Mapped[int | None] = mapped_column(
+        ForeignKey("regions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    preferred_area_id: Mapped[int | None] = mapped_column(
+        ForeignKey("areas.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    avatar_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bio: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    school_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    grade_label: Mapped[str | None] = mapped_column(String(64), nullable=True)
     linked_student_id: Mapped[int | None] = mapped_column(
         ForeignKey("students.id", ondelete="SET NULL"), nullable=True, unique=True, index=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Region(Base):
+    __tablename__ = "regions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128))
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Area(Base):
+    __tablename__ = "areas"
+    __table_args__ = (UniqueConstraint("region_id", "slug", name="uq_areas_region_slug"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    region_id: Mapped[int] = mapped_column(ForeignKey("regions.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    slug: Mapped[str] = mapped_column(String(64))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ExamVenue(Base):
+    __tablename__ = "exam_venues"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    area_id: Mapped[int] = mapped_column(ForeignKey("areas.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    address: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    jti: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    user_agent: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class StudentDevice(Base):
+    __tablename__ = "student_devices"
+    __table_args__ = (UniqueConstraint("user_id", "push_token", name="uq_student_devices_user_token"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    push_token: Mapped[str] = mapped_column(String(512))
+    app_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    actor_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    resource_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class SystemSetting(Base):
@@ -190,6 +281,15 @@ class Exam(Base):
     delivery_mode: Mapped[str] = mapped_column(String(16), default=ExamDeliveryMode.IN_PERSON.value)
     venue: Mapped[str | None] = mapped_column(String(255), nullable=True)
     city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    region_id: Mapped[int | None] = mapped_column(
+        ForeignKey("regions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    area_id: Mapped[int | None] = mapped_column(
+        ForeignKey("areas.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    venue_id: Mapped[int | None] = mapped_column(
+        ForeignKey("exam_venues.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     list_price_amount: Mapped[float] = mapped_column(Float, default=0.0)
     list_price_currency: Mapped[str] = mapped_column(String(8), default="AZN")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -299,10 +399,11 @@ class AnswerSheetTemplate(Base):
 
 class Student(Base):
     __tablename__ = "students"
-    __table_args__ = (UniqueConstraint("course_id", "student_number", name="uq_students_course_student_number"),)
+    # Unique (course_id, student_number) when enrolled; unique student_number when course_id IS NULL
+    # — see migration 20260718_0025 partial indexes.
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    course_id: Mapped[int] = mapped_column(ForeignKey("courses.id"), index=True)
+    course_id: Mapped[int | None] = mapped_column(ForeignKey("courses.id"), index=True, nullable=True)
     student_number: Mapped[str] = mapped_column(String(64), index=True)
     full_name: Mapped[str] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -342,6 +443,7 @@ class TicketOrder(Base):
     payment_intent_id: Mapped[int | None] = mapped_column(
         ForeignKey("payment_intents.id", ondelete="SET NULL"), nullable=True, index=True
     )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

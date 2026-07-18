@@ -1,0 +1,23 @@
+name: student_app CI
+on:
+  push:
+    paths:
+      - "mobile/student_app/**"
+  pull_request:
+    paths:
+      - "mobile/student_app/**"
+
+jobs:
+  analyze-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile/student_app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+      - run: flutter analyze --no-fatal-infos
+      - run: flutter test

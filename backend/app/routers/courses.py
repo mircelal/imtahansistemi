@@ -542,6 +542,28 @@ async def add_student(
     user: User = Depends(get_current_user),
 ):
     await ensure_course_write(course_id, user, db)
+    # Kurssuz eyni kodlu şagird varsa — kursa yaz
+    orphan = await db.scalar(
+        select(Student).where(
+            Student.course_id.is_(None),
+            Student.student_number == payload.student_number,
+        )
+    )
+    if orphan is not None:
+        orphan.course_id = course_id
+        if payload.full_name.strip():
+            orphan.full_name = payload.full_name.strip()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="Bu kursda eyni 6 rəqəmli kod artıq mövcuddur",
+            ) from exc
+        await db.refresh(orphan)
+        return StudentOut.model_validate(orphan)
+
     entity = Student(course_id=course_id, **payload.model_dump())
     db.add(entity)
     try:

@@ -60,6 +60,9 @@ export default function StudentProfilePage() {
           </span>
           <span>
             Kurs: <strong className="font-semibold text-white">{student.course_name}</strong>
+            {(student.courses?.length ?? 0) > 1 ? (
+              <span className="ml-2 text-sm font-normal text-white/70">({student.courses!.join(", ")})</span>
+            ) : null}
           </span>
           <span>
             E-poçt: <strong className="font-semibold text-white">{account.email}</strong>
@@ -81,6 +84,7 @@ export default function StudentProfilePage() {
           <dl className="mt-4 space-y-3 text-sm">
             <Row label="Tam ad" value={account.full_name} />
             <Row label="E-poçt" value={account.email} />
+            <Row label="FIN" value={account.fin_code || "—"} mono />
             <Row label="Qeydiyyat tarixi" value={formatDate(account.member_since)} />
           </dl>
         </div>
@@ -90,6 +94,9 @@ export default function StudentProfilePage() {
             <Row label="6 rəqəmli kod" value={student.student_number} mono />
             <Row label="Ad, soyad" value={student.full_name} />
             <Row label="Əsas kurs" value={student.course_name} />
+            {(student.courses?.length ?? 0) > 0 ? (
+              <Row label="Əlaqəli kurslar" value={student.courses!.join(", ")} />
+            ) : null}
           </dl>
         </div>
       </section>

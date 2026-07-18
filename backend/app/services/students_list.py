@@ -66,6 +66,7 @@ def _student_filters(params: StudentListParams):
                 Student.full_name.ilike(term),
                 Student.student_number.ilike(term),
                 User.email.ilike(term),
+                User.fin_code.ilike(term),
             )
         )
 
@@ -95,6 +96,7 @@ async def query_students_page(db: AsyncSession, params: StudentListParams) -> St
             Student,
             User.id.label("login_user_id"),
             User.email.label("login_email"),
+            User.fin_code.label("fin_code"),
             stats.c.exam_count,
             stats.c.last_graded_at,
             latest.c.score.label("last_score"),
@@ -105,7 +107,7 @@ async def query_students_page(db: AsyncSession, params: StudentListParams) -> St
         .outerjoin(User, User.linked_student_id == Student.id)
         .outerjoin(stats, stats.c.student_id == Student.id)
         .outerjoin(latest, latest.c.student_id == Student.id)
-        .join(Course, Course.id == Student.course_id)
+        .outerjoin(Course, Course.id == Student.course_id)
         .where(*filters)
     )
 
@@ -126,7 +128,18 @@ async def query_students_page(db: AsyncSession, params: StudentListParams) -> St
     rows = (await db.execute(q)).all()
 
     items: list[StudentListRowOut] = []
-    for st, login_uid, login_email, exam_count, last_graded, last_score, last_max, last_status, course_name in rows:
+    for (
+        st,
+        login_uid,
+        login_email,
+        fin_code,
+        exam_count,
+        last_graded,
+        last_score,
+        last_max,
+        last_status,
+        course_name,
+    ) in rows:
         last_pct = None
         if last_score is not None and last_max is not None and last_status != ResultStatus.ERROR:
             fake = ScanResult(
@@ -142,12 +155,13 @@ async def query_students_page(db: AsyncSession, params: StudentListParams) -> St
             StudentListRowOut(
                 id=st.id,
                 course_id=st.course_id,
-                course_name=course_name or "—",
+                course_name=course_name or ("Kurs təyin olunmayıb" if st.course_id is None else "—"),
                 student_number=st.student_number,
                 full_name=st.full_name,
                 created_at=st.created_at,
                 login_user_id=login_uid,
                 login_email=login_email,
+                fin_code=fin_code,
                 has_login=login_uid is not None,
                 exam_count=int(exam_count or 0),
                 last_percent=last_pct,

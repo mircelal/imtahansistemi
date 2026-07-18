@@ -23,10 +23,12 @@ from app.routers import (
     payments,
     question_bank,
     questions,
+    regions,
     reports,
     scans,
     scoring_formula_presets,
     settings as settings_router,
+    student_marketplace,
     student_portal,
     students_admin,
     tickets,
@@ -50,6 +52,8 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(student_portal.router)
+app.include_router(student_marketplace.router)
+app.include_router(regions.router)
 app.include_router(settings_router.router)
 app.include_router(users.router)
 app.include_router(courses.router)

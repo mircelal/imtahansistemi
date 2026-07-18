@@ -48,7 +48,7 @@ export default function StudentsFilters({ courses, isAdmin, filters, onChange }:
 
       <input
         type="search"
-        placeholder="Kod, ad və ya e-poçt…"
+        placeholder="Kod, FIN, ad və ya e-poçt…"
         className="min-w-[200px] flex-1 rounded-lg border border-slate-200 px-3 py-2 text-sm"
         value={filters.search}
         onChange={(e) => onChange({ search: e.target.value })}

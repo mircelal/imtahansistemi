@@ -7,6 +7,14 @@ class StudentAccountOut(BaseModel):
     user_id: int | None = None
     email: str
     full_name: str
+    fin_code: str | None = None
+    phone: str | None = None
+    preferred_region_id: int | None = None
+    preferred_area_id: int | None = None
+    has_avatar: bool = False
+    bio: str | None = None
+    school_name: str | None = None
+    grade_label: str | None = None
     member_since: datetime
 
 
@@ -14,8 +22,12 @@ class StudentSummaryOut(BaseModel):
     id: int
     student_number: str
     full_name: str
-    course_id: int
-    course_name: str = Field(description="Şagirdin əsas qeydiyyat olduğu kurs")
+    course_id: int | None = None
+    course_name: str = Field(description="Şagirdin əsas qeydiyyat olduğu kurs (yoxdursa —)")
+    courses: list[str] = Field(
+        default_factory=list,
+        description="Əlaqəli kurs adları (əsas + bilet/imtahan)",
+    )
 
 
 class StudentStatsOut(BaseModel):
@@ -80,6 +92,29 @@ class StudentRegistrationOut(BaseModel):
     quantity: int
     ordered_at: datetime
     has_result: bool = False
+    scheduled_at: datetime | None = None
+    venue_label: str | None = None
+    city: str | None = None
+    admit_qr_payload: str | None = Field(
+        default=None,
+        description="Offline admit QR: order|student|exam compact payload",
+    )
+
+
+class StudentProfileUpdate(BaseModel):
+    full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    phone: str | None = Field(default=None, max_length=64)
+    preferred_region_id: int | None = None
+    preferred_area_id: int | None = None
+    bio: str | None = Field(default=None, max_length=512)
+    school_name: str | None = Field(default=None, max_length=255)
+    grade_label: str | None = Field(default=None, max_length=64)
+
+
+class StudentDeviceRegister(BaseModel):
+    platform: str = Field(description="ios | android | web")
+    push_token: str = Field(min_length=8, max_length=512)
+    app_version: str | None = Field(default=None, max_length=32)
 
 
 class StudentProgressPointOut(BaseModel):

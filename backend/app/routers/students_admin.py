@@ -9,12 +9,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.deps import get_current_user, require_admin
 from app.models.entities import Course, CourseOperator, Student, User, UserRole
-from app.schemas.auth import TokenResponse
-from app.schemas.courses import StudentListPageOut, StudentsSummaryOut
+from app.schemas.courses import (
+    AdminStudentCreate,
+    StudentAssignCourse,
+    StudentListPageOut,
+    StudentLoginCreate,
+    StudentOut,
+    StudentsSummaryOut,
+)
 from app.schemas.student_portal import StudentProfileOut
-from app.security import create_impersonation_token
+from app.security import create_impersonation_token, hash_password
+from app.services.student_codes import allocate_platform_student_number
+from app.services.fin_identity import synthetic_email_for_fin
 from app.services.student_profile import build_student_profile
 from app.services.students_list import StudentListParams, query_students_page, query_students_summary
+from app.schemas.auth import TokenResponse, UserOut
+from sqlalchemy.exc import IntegrityError
 
 router = APIRouter(prefix="/api/admin/students", tags=["admin-students"])
 logger = logging.getLogger(__name__)
@@ -126,10 +136,154 @@ async def admin_get_student_profile(
     st = await db.get(Student, student_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Şagird tapılmadı")
-    from app.deps import ensure_course_access
+    if st.course_id is None:
+        if user.role != UserRole.ADMIN:
+            raise HTTPException(status_code=403, detail="Kurssuz şagird yalnız admin üçün")
+    else:
+        from app.deps import ensure_course_access
 
-    await ensure_course_access(st.course_id, user, db)
+        await ensure_course_access(st.course_id, user, db)
     return await build_student_profile(db, st)
+
+
+@router.post("", response_model=StudentOut)
+async def admin_create_student(
+    payload: AdminStudentCreate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    """Admin: kurssuz və ya kurs ilə şagird; istəyə bağlı e-poçt/şifrə ilə kabinet."""
+    if payload.course_id is not None:
+        course = await db.get(Course, payload.course_id)
+        if course is None:
+            raise HTTPException(status_code=404, detail="Kurs tapılmadı")
+        if not payload.student_number:
+            raise HTTPException(status_code=400, detail="Kurs ilə yaradarkən 6 rəqəmli kod lazımdır")
+        code = payload.student_number
+        # Prefer enrolling orphan with same code
+        orphan = await db.scalar(
+            select(Student).where(Student.course_id.is_(None), Student.student_number == code)
+        )
+        if orphan is not None:
+            orphan.course_id = payload.course_id
+            orphan.full_name = payload.full_name.strip()
+            entity = orphan
+        else:
+            entity = Student(
+                course_id=payload.course_id,
+                student_number=code,
+                full_name=payload.full_name.strip(),
+            )
+            db.add(entity)
+    else:
+        try:
+            code = await allocate_platform_student_number(db, payload.student_number)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        entity = Student(
+            course_id=None,
+            student_number=code,
+            full_name=payload.full_name.strip(),
+        )
+        db.add(entity)
+
+    create_login = bool(payload.password and (payload.email or payload.fin_code))
+    if create_login:
+        if payload.fin_code:
+            exists_fin = await db.scalar(select(User.id).where(User.fin_code == payload.fin_code))
+            if exists_fin:
+                raise HTTPException(status_code=400, detail="Bu FIN artıq qeydiyyatdadır")
+        email = str(payload.email) if payload.email else synthetic_email_for_fin(payload.fin_code or "")
+        exists = await db.scalar(select(User).where(User.email == email))
+        if exists:
+            raise HTTPException(status_code=400, detail="Bu e-poçt artıq qeydiyyatdadır")
+    else:
+        email = None
+
+    try:
+        await db.flush()
+        if create_login and email:
+            login_user = User(
+                email=email,
+                full_name=payload.full_name.strip(),
+                password_hash=hash_password(payload.password or ""),
+                role=UserRole.STUDENT,
+                linked_student_id=entity.id,
+                fin_code=payload.fin_code,
+            )
+            db.add(login_user)
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Şagird yaradılmadı — kod, FIN və ya e-poçt təkrarlanır") from exc
+    await db.refresh(entity)
+    return StudentOut.model_validate(entity)
+
+
+@router.post("/{student_id}/assign-course", response_model=StudentOut)
+async def admin_assign_course(
+    student_id: int,
+    payload: StudentAssignCourse,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    st = await db.get(Student, student_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="Şagird tapılmadı")
+    course = await db.get(Course, payload.course_id)
+    if course is None:
+        raise HTTPException(status_code=404, detail="Kurs tapılmadı")
+    conflict = await db.scalar(
+        select(Student.id).where(
+            Student.course_id == payload.course_id,
+            Student.student_number == st.student_number,
+            Student.id != st.id,
+        )
+    )
+    if conflict is not None:
+        raise HTTPException(status_code=400, detail="Bu kursda eyni kod artıq var")
+    st.course_id = payload.course_id
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Kursa yazıla bilmədi") from exc
+    await db.refresh(st)
+    return StudentOut.model_validate(st)
+
+
+@router.post("/{student_id}/login", response_model=UserOut)
+async def admin_create_student_login(
+    student_id: int,
+    payload: StudentLoginCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    st = await db.get(Student, student_id)
+    if st is None:
+        raise HTTPException(status_code=404, detail="Şagird tapılmadı")
+    taken = await db.scalar(select(User).where(User.linked_student_id == student_id))
+    if taken is not None:
+        raise HTTPException(status_code=400, detail="Bu şagirdin artıq kabinet hesabı var")
+    exists = await db.scalar(select(User).where(User.email == payload.email))
+    if exists:
+        raise HTTPException(status_code=400, detail="Bu e-poçt artıq qeydiyyatdadır")
+    display_name = (payload.full_name or st.full_name).strip()
+    login_user = User(
+        email=payload.email,
+        full_name=display_name,
+        password_hash=hash_password(payload.password),
+        role=UserRole.STUDENT,
+        linked_student_id=student_id,
+    )
+    db.add(login_user)
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Kabinet yaradılmadı") from exc
+    await db.refresh(login_user)
+    return UserOut.model_validate(login_user)
 
 
 @router.post("/{user_id}/impersonate", response_model=TokenResponse)

@@ -1,9 +1,11 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
+import { useForm } from "react-hook-form";
 import { Link, useSearchParams } from "react-router-dom";
 import { listCourses } from "../../api/courses";
 import type { StudentListRow } from "../../api/studentsAdmin";
 import {
+  createAdminStudent,
   getAdminStudentProfile,
   getAdminStudentsSummary,
   getCourseStudentsSummary,
@@ -139,10 +141,42 @@ export default function StudentsPage() {
     });
     if (!searchParams.get("course")) {
       const next = new URLSearchParams(searchParams);
-      next.set("course", String(p.student.course_id));
+      next.set("course", String(p.student.course_id ?? ""));
       setSearchParams(next, { replace: true });
     }
   }, [deepLinkQ.data, selected, listQ.data, searchParams, setSearchParams]);
+
+  const qc = useQueryClient();
+  const adminForm = useForm<{
+    full_name: string;
+    student_number: string;
+    fin_code: string;
+    email: string;
+    password: string;
+  }>({
+    defaultValues: { full_name: "", student_number: "", fin_code: "", email: "", password: "" },
+  });
+  const adminCreateMut = useMutation({
+    mutationFn: (v: {
+      full_name: string;
+      student_number: string;
+      fin_code: string;
+      email: string;
+      password: string;
+    }) =>
+      createAdminStudent({
+        full_name: v.full_name.trim(),
+        student_number: v.student_number.trim() || undefined,
+        fin_code: v.fin_code.trim().toUpperCase() || undefined,
+        email: v.email.trim() || undefined,
+        password: v.password || undefined,
+      }),
+    onSuccess: async () => {
+      adminForm.reset();
+      await qc.invalidateQueries({ queryKey: ["students-list"] });
+      await qc.invalidateQueries({ queryKey: ["students-summary"] });
+    },
+  });
 
   const onFilterChange = (next: Partial<StudentsFilterState>) => {
     setFilters((f) => {
@@ -161,11 +195,12 @@ export default function StudentsPage() {
 
   const exportCsv = () => {
     const rows = listQ.data?.items ?? [];
-    const header = ["Kod", "Ad", "Kurs", "Kabinet", "İmtahan", "Son faiz", "Son tarix"];
+    const header = ["Kod", "Ad", "FIN", "Kurs", "Kabinet", "İmtahan", "Son faiz", "Son tarix"];
     const lines = rows.map((r) =>
       [
         r.student_number,
         r.full_name,
+        r.fin_code ?? "",
         r.course_name,
         r.login_email ?? "",
         r.exam_count,
@@ -209,8 +244,59 @@ export default function StudentsPage() {
 
       <StudentsFilters courses={courses} isAdmin={isAdmin} filters={filters} onChange={onFilterChange} />
 
-      {addCourseId ? (
+      {addCourseId && filters.courseId !== "" ? (
         <StudentsAddPanel courseId={addCourseId} onSuccess={() => listQ.refetch()} />
+      ) : isAdmin && filters.courseId === "" ? (
+        <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">Kurssuz şagird yarat</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Kurs məcburi deyil. FIN və ya e-poçt + şifrə versəniz kabinet açılır.
+          </p>
+          <form
+            className="mt-3 flex flex-wrap items-end gap-2"
+            onSubmit={adminForm.handleSubmit((v) => adminCreateMut.mutate(v))}
+          >
+            <input
+              className="min-w-[160px] flex-1 rounded-lg border border-slate-200 px-2 py-2 text-sm"
+              placeholder="Ad Soyad"
+              {...adminForm.register("full_name", { required: true })}
+            />
+            <input
+              className="w-28 rounded-lg border border-slate-200 px-2 py-2 font-mono text-sm uppercase"
+              placeholder="FIN"
+              maxLength={7}
+              {...adminForm.register("fin_code")}
+            />
+            <input
+              className="w-28 rounded-lg border border-slate-200 px-2 py-2 font-mono text-sm"
+              placeholder="OMR kod"
+              maxLength={6}
+              {...adminForm.register("student_number")}
+            />
+            <input
+              type="email"
+              className="min-w-[140px] flex-1 rounded-lg border border-slate-200 px-2 py-2 text-sm"
+              placeholder="E-poçt (opsional)"
+              {...adminForm.register("email")}
+            />
+            <input
+              type="password"
+              className="w-36 rounded-lg border border-slate-200 px-2 py-2 text-sm"
+              placeholder="Şifrə"
+              {...adminForm.register("password")}
+            />
+            <button
+              type="submit"
+              disabled={adminCreateMut.isPending}
+              className="rounded-lg bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+            >
+              Yarat
+            </button>
+          </form>
+          {adminCreateMut.isError ? (
+            <p className="mt-2 text-sm text-red-600">Yaradılmadı — kod və ya e-poçt təkrarlanır.</p>
+          ) : null}
+        </section>
       ) : (
         <p className="text-sm text-amber-800">Yeni şagird əlavə etmək üçün kurs seçin.</p>
       )}
@@ -239,6 +325,7 @@ export default function StudentsPage() {
                 <tr>
                   <th className="px-4 py-3">Kod</th>
                   <th className="px-4 py-3">Ad</th>
+                  <th className="px-4 py-3">FIN</th>
                   {isAdmin && filters.courseId === "" ? <th className="px-4 py-3">Kurs</th> : null}
                   <th className="px-4 py-3">Kabinet</th>
                   <th className="px-4 py-3">İmtahan</th>
@@ -259,8 +346,13 @@ export default function StudentsPage() {
                     <tr key={r.id} className="hover:bg-slate-50/80">
                       <td className="whitespace-nowrap px-4 py-3 font-mono text-sm font-semibold">{r.student_number}</td>
                       <td className="px-4 py-3 font-medium text-slate-900">{r.full_name}</td>
+                      <td className="whitespace-nowrap px-4 py-3 font-mono text-sm text-slate-700">
+                        {r.fin_code || "—"}
+                      </td>
                       {isAdmin && filters.courseId === "" ? (
-                        <td className="px-4 py-3 text-sm text-slate-600">{r.course_name}</td>
+                        <td className="px-4 py-3 text-sm text-slate-600">
+                          {r.course_name || "Kurs təyin olunmayıb"}
+                        </td>
                       ) : null}
                       <td className="px-4 py-3">
                         {r.has_login ? (

@@ -55,8 +55,8 @@ async def build_student_profile(
     *,
     account_user: User | None = None,
 ) -> StudentProfileOut:
-    home_course = await db.get(Course, student.course_id)
-    course_name = (home_course.name if home_course else "") or "—"
+    home_course = await db.get(Course, student.course_id) if student.course_id is not None else None
+    course_name = (home_course.name if home_course else "") or "Kurs təyin olunmayıb"
 
     stmt = (
         select(ScanResult, ScanSession, Exam)
@@ -203,6 +203,7 @@ async def build_student_profile(
         full_name=student.full_name,
         course_id=student.course_id,
         course_name=course_name,
+        courses=[],  # filled after registrations assembled
     )
 
     if account_user is None:
@@ -213,6 +214,14 @@ async def build_student_profile(
             user_id=account_user.id,
             email=account_user.email,
             full_name=account_user.full_name,
+            fin_code=account_user.fin_code,
+            phone=account_user.phone,
+            preferred_region_id=account_user.preferred_region_id,
+            preferred_area_id=account_user.preferred_area_id,
+            has_avatar=bool(getattr(account_user, "avatar_object_key", None)),
+            bio=getattr(account_user, "bio", None),
+            school_name=getattr(account_user, "school_name", None),
+            grade_label=getattr(account_user, "grade_label", None),
             member_since=account_user.created_at,
         )
         reg_email = account_user.email
@@ -240,8 +249,23 @@ async def build_student_profile(
     reg_rows = (await db.execute(reg_stmt)).all()
     completed_exam_ids = {ex.exam_id for ex in exam_summaries}
     registrations = []
+    course_names_set: list[str] = []
+    seen_course_names: set[str] = set()
+    if home_course and home_course.name:
+        course_names_set.append(home_course.name)
+        seen_course_names.add(home_course.name)
     for order, ticket, exam, course in reg_rows:
         reg_exam_id = exam.id if exam else ticket.exam_id
+        venue_label = None
+        city = None
+        scheduled_at = None
+        if exam:
+            venue_label = exam.venue
+            city = exam.city
+            scheduled_at = exam.scheduled_at
+        qr = None
+        if order.status.value == "confirmed":
+            qr = f"IMT|{order.id}|{student.id}|{reg_exam_id or 0}|{student.student_number}"
         registrations.append(
             StudentRegistrationOut(
                 order_id=order.id,
@@ -253,8 +277,21 @@ async def build_student_profile(
                 quantity=order.quantity,
                 ordered_at=order.created_at,
                 has_result=bool(reg_exam_id and reg_exam_id in completed_exam_ids),
+                scheduled_at=scheduled_at,
+                venue_label=venue_label,
+                city=city,
+                admit_qr_payload=qr,
             )
         )
+        if course.name and course.name not in seen_course_names:
+            seen_course_names.add(course.name)
+            course_names_set.append(course.name)
+    for name in scope_names.values():
+        if name and name not in seen_course_names:
+            seen_course_names.add(name)
+            course_names_set.append(name)
+
+    summary.courses = course_names_set
 
     analytics: StudentAnalyticsOut = await build_student_analytics(
         db,

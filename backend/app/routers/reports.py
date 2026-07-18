@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.deps import ensure_exam_access, ensure_course_access, get_current_user
-from app.models.entities import AnswerKey, Exam, ResultStatus, ScanResult, ScanSession, Student, User
+from app.models.entities import AnswerKey, Exam, ResultStatus, ScanResult, ScanSession, Student, User, UserRole
 from app.schemas.reports import ReportExamDetailOut, ReportOverviewOut
 from app.services.report_analytics import build_exam_report_detail, build_reports_overview
 
@@ -157,7 +157,11 @@ async def student_history(
     student = await db.get(Student, student_id)
     if student is None:
         raise HTTPException(status_code=404, detail="Student not found")
-    await ensure_course_access(student.course_id, user, db)
+    if student.course_id is None:
+        if user.role != UserRole.ADMIN:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    else:
+        await ensure_course_access(student.course_id, user, db)
     stmt = (
         select(ScanResult, ScanSession)
         .join(ScanSession, ScanResult.session_id == ScanSession.id)

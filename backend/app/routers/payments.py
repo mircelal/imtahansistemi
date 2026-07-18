@@ -5,14 +5,14 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.database import get_db
 from app.deps import ensure_course_write, get_current_user, require_admin
-from app.models.entities import Exam, ExamTicket, PaymentIntent, TicketOrder, TicketOrderStatus, User
+from app.models.entities import Exam, ExamTicket, PaymentIntent, TicketOrder, TicketOrderStatus, User, UserRole
 from app.payments.registry import get_active_driver, get_driver, list_driver_names
 from app.payments.settings_store import (
     get_active_driver_name,
@@ -26,6 +26,7 @@ from app.schemas.payments import (
     PaymentSettingsOut,
     PaymentSettingsUpdate,
     PublicTicketCheckoutCreate,
+    StudentTicketCheckoutCreate,
     WalletTopupCreate,
 )
 from app.schemas.tickets import ExamTicketOut
@@ -283,12 +284,107 @@ async def put_payment_settings_admin(
     return await get_payment_settings_admin(user, db)
 
 
-@router.post("/api/student/tickets/{ticket_id}/checkout", include_in_schema=True)
-async def student_ticket_checkout_stub(
+@router.post("/api/student/tickets/{ticket_id}/checkout", response_model=CheckoutResponse)
+async def student_ticket_checkout(
     ticket_id: int,
-    _: User = Depends(get_current_user),
+    request: Request,
+    payload: StudentTicketCheckoutCreate = StudentTicketCheckoutCreate(),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    raise HTTPException(
-        status_code=501,
-        detail="Şagird bilet ödənişi növbəti iterasiyada — eyni PaymentIntent(purpose=ticket_order) istifadə olunacaq",
+    """Authenticated student checkout — PaymentIntent + deep-link friendly return URLs."""
+    if user.role != UserRole.STUDENT:
+        raise HTTPException(status_code=403, detail="Yalnız şagirdlər üçün")
+    if user.linked_student_id is None:
+        raise HTTPException(status_code=400, detail="Şagird profili bağlı deyil")
+
+    key = (idempotency_key or payload.idempotency_key or "").strip() or None
+    if key:
+        existing_order = await db.scalar(
+            select(TicketOrder).where(TicketOrder.idempotency_key == key)
+        )
+        if existing_order is not None:
+            intent = None
+            if existing_order.payment_intent_id:
+                intent = await db.get(PaymentIntent, existing_order.payment_intent_id)
+            if intent and intent.checkout_url:
+                return CheckoutResponse(
+                    intent=PaymentIntentOut.model_validate(intent),
+                    checkout_url=intent.checkout_url,
+                    driver=intent.driver,
+                )
+
+    ticket = await db.get(ExamTicket, ticket_id)
+    if ticket is None or not ticket.is_active:
+        raise HTTPException(status_code=404, detail="Bilet tapılmadı")
+    now = datetime.utcnow()
+    if ticket.starts_at and ticket.starts_at > now:
+        raise HTTPException(status_code=400, detail="Bilet hələ satışda deyil")
+    if ticket.ends_at and ticket.ends_at < now:
+        raise HTTPException(status_code=400, detail="Bilet satış müddəti bitib")
+    qty = payload.quantity
+    if ticket.quota is not None:
+        used = await confirmed_count_for_ticket(db, ticket_id)
+        if used + qty > ticket.quota:
+            raise HTTPException(status_code=400, detail="Kontingent kifayət etmir")
+    exam = await db.get(Exam, ticket.exam_id) if ticket.exam_id else None
+    if exam and exam.course_id is None and exam.seat_quota is not None:
+        try:
+            await ensure_platform_seat_quota(db, exam, qty)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    line_cents = amount_to_cents(float(ticket.price_amount) * qty)
+    if line_cents <= 0:
+        raise HTTPException(status_code=400, detail="Ödənişli bilet tələb olunur")
+
+    cfg = get_settings()
+    scheme = cfg.mobile_app_scheme or "imtahansistemi"
+    order = TicketOrder(
+        ticket_id=ticket_id,
+        buyer_name=user.full_name,
+        buyer_email=user.email,
+        buyer_phone=user.phone or (user.fin_code or None),
+        quantity=qty,
+        status=TicketOrderStatus.PENDING,
+        notes=payload.notes,
+        student_id=user.linked_student_id,
+        payment_method="online",
+        idempotency_key=key,
+        created_at=datetime.utcnow(),
     )
+    db.add(order)
+    await db.flush()
+
+    intent = PaymentIntent(
+        public_id=str(uuid4()),
+        purpose="ticket_order",
+        amount_cents=line_cents,
+        currency=ticket.currency or "AZN",
+        status="pending",
+        driver=await get_active_driver_name(db),
+        course_id=ticket.course_id,
+        ticket_order_id=order.id,
+        buyer_email=user.email,
+        meta={
+            "ticket_id": ticket_id,
+            "quantity": qty,
+            "user_id": user.id,
+            "student_id": user.linked_student_id,
+        },
+        created_at=datetime.utcnow(),
+    )
+    db.add(intent)
+    await db.flush()
+    order.payment_intent_id = intent.id
+
+    return_url = (
+        payload.return_url
+        or f"{scheme}://payments/return?intent={intent.public_id}&paid=1"
+    )
+    cancel_url = (
+        payload.cancel_url
+        or f"{scheme}://payments/return?intent={intent.public_id}&paid=0"
+    )
+    return await _start_checkout(db, intent, return_url=return_url, cancel_url=cancel_url)

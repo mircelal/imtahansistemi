@@ -27,6 +27,14 @@ class PublicTicketCheckoutCreate(BaseModel):
     cancel_url: str | None = None
 
 
+class StudentTicketCheckoutCreate(BaseModel):
+    quantity: int = Field(ge=1, default=1)
+    notes: str | None = None
+    return_url: str | None = None
+    cancel_url: str | None = None
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+
 class PaymentIntentOut(ORMModel):
     id: int
     public_id: str

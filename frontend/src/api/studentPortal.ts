@@ -4,6 +4,8 @@ export type StudentAccount = {
   user_id: number | null;
   email: string;
   full_name: string;
+  fin_code?: string | null;
+  phone?: string | null;
   member_since: string;
 };
 
@@ -11,8 +13,9 @@ export type StudentSummary = {
   id: number;
   student_number: string;
   full_name: string;
-  course_id: number;
+  course_id: number | null;
   course_name: string;
+  courses?: string[];
 };
 
 export type StudentStats = {

@@ -3,13 +3,14 @@ import type { StudentProfile } from "./studentPortal";
 
 export type StudentListRow = {
   id: number;
-  course_id: number;
+  course_id: number | null;
   course_name: string;
   student_number: string;
   full_name: string;
   created_at: string;
   login_user_id: number | null;
   login_email: string | null;
+  fin_code?: string | null;
   has_login: boolean;
   exam_count: number;
   last_percent: number | null;
@@ -72,6 +73,33 @@ export async function getAdminStudentsSummary(courseId?: number) {
 
 export async function getAdminStudentProfile(studentId: number) {
   const { data } = await api.get<StudentProfile>(`/api/admin/students/${studentId}/profile`);
+  return data;
+}
+
+export async function createAdminStudent(payload: {
+  full_name: string;
+  student_number?: string;
+  course_id?: number | null;
+  email?: string;
+  password?: string;
+  fin_code?: string;
+}) {
+  const { data } = await api.post(`/api/admin/students`, payload);
+  return data;
+}
+
+export async function assignStudentCourse(studentId: number, courseId: number) {
+  const { data } = await api.post(`/api/admin/students/${studentId}/assign-course`, {
+    course_id: courseId,
+  });
+  return data;
+}
+
+export async function createAdminStudentLogin(
+  studentId: number,
+  payload: { email: string; password: string; full_name?: string }
+) {
+  const { data } = await api.post(`/api/admin/students/${studentId}/login`, payload);
   return data;
 }
 

@@ -3,11 +3,14 @@ import { useState } from "react";
 import axios from "axios";
 import { useNavigate } from "react-router-dom";
 import { me } from "../../api/auth";
-import { createStudentLogin } from "../../api/courses";
+import { createStudentLogin, listCourses } from "../../api/courses";
 import type { StudentListRow } from "../../api/studentsAdmin";
 import {
+  assignStudentCourse,
+  createAdminStudentLogin,
   deleteStudent,
   deleteStudentLogin,
+  getAdminStudentProfile,
   getCourseStudentProfile,
   impersonateStudent,
   resetStudentPassword
@@ -45,53 +48,76 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
   const setToken = useAuthStore((s) => s.setToken);
   const setUser = useAuthStore((s) => s.setUser);
   const isAdmin = user?.role === "admin";
+  const hasCourse = row.course_id != null && row.course_id > 0;
   const [tab, setTab] = useState<Tab>("info");
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [resetPassword, setResetPassword] = useState("");
+  const [assignCourseId, setAssignCourseId] = useState("");
+
+  const coursesQ = useQuery({
+    queryKey: ["courses"],
+    queryFn: listCourses,
+    enabled: isAdmin && !hasCourse,
+  });
 
   const profileQ = useQuery({
     queryKey: ["student-profile", row.course_id, row.id],
-    queryFn: () => getCourseStudentProfile(row.course_id, row.id)
+    queryFn: () =>
+      hasCourse ? getCourseStudentProfile(row.course_id!, row.id) : getAdminStudentProfile(row.id),
   });
 
   const createLoginMut = useMutation({
     mutationFn: () =>
-      createStudentLogin(row.course_id, row.id, {
-        email: loginEmail.trim(),
-        password: loginPassword,
-        full_name: row.full_name
-      }),
+      hasCourse
+        ? createStudentLogin(row.course_id!, row.id, {
+            email: loginEmail.trim(),
+            password: loginPassword,
+            full_name: row.full_name,
+          })
+        : createAdminStudentLogin(row.id, {
+            email: loginEmail.trim(),
+            password: loginPassword,
+            full_name: row.full_name,
+          }),
     onSuccess: () => {
       setLoginEmail("");
       setLoginPassword("");
       onUpdated();
       profileQ.refetch();
-    }
+    },
   });
 
   const resetMut = useMutation({
-    mutationFn: () => resetStudentPassword(row.course_id, row.id, resetPassword),
+    mutationFn: () => resetStudentPassword(row.course_id!, row.id, resetPassword),
     onSuccess: () => {
       setResetPassword("");
       window.alert("Şifrə yeniləndi.");
-    }
+    },
   });
 
   const deleteLoginMut = useMutation({
-    mutationFn: () => deleteStudentLogin(row.course_id, row.id),
+    mutationFn: () => deleteStudentLogin(row.course_id!, row.id),
     onSuccess: () => {
       onUpdated();
       profileQ.refetch();
-    }
+    },
   });
 
   const deleteMut = useMutation({
-    mutationFn: () => deleteStudent(row.course_id, row.id),
+    mutationFn: () => deleteStudent(row.course_id!, row.id),
     onSuccess: () => {
       onUpdated();
       onClose();
-    }
+    },
+  });
+
+  const assignMut = useMutation({
+    mutationFn: () => assignStudentCourse(row.id, Number(assignCourseId)),
+    onSuccess: () => {
+      onUpdated();
+      onClose();
+    },
   });
 
   const impersonateMut = useMutation({
@@ -105,7 +131,7 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
       const u = await me();
       setUser(u);
       navigate("/");
-    }
+    },
   });
 
   const profile = profileQ.data;
@@ -166,6 +192,18 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                       <dt className="text-slate-500">Kurs</dt>
                       <dd>{profile.student.course_name}</dd>
                     </div>
+                    {(profile.student.courses?.length ?? 0) > 0 ? (
+                      <div className="flex justify-between border-b border-slate-100 py-2">
+                        <dt className="text-slate-500">Əlaqəli kurslar</dt>
+                        <dd className="text-right">{profile.student.courses!.join(", ")}</dd>
+                      </div>
+                    ) : null}
+                    <div className="flex justify-between border-b border-slate-100 py-2">
+                      <dt className="text-slate-500">FIN</dt>
+                      <dd className="font-mono font-semibold">
+                        {profile.account.fin_code || row.fin_code || "—"}
+                      </dd>
+                    </div>
                     <div className="flex justify-between border-b border-slate-100 py-2">
                       <dt className="text-slate-500">Kabinet e-poçtu</dt>
                       <dd>{row.has_login ? profile.account.email : "—"}</dd>
@@ -175,6 +213,36 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                       <dd>{formatDt(row.created_at)}</dd>
                     </div>
                   </dl>
+
+                  {isAdmin && !hasCourse ? (
+                    <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-4">
+                      <p className="mb-2 text-sm font-medium text-amber-950">Kursa yaz</p>
+                      <div className="flex flex-wrap gap-2">
+                        <select
+                          className="rounded-md border px-2 py-1.5 text-sm"
+                          value={assignCourseId}
+                          onChange={(e) => setAssignCourseId(e.target.value)}
+                        >
+                          <option value="">Kurs seçin…</option>
+                          {(coursesQ.data ?? []).map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.name}
+                            </option>
+                          ))}
+                        </select>
+                        <Button
+                          size="sm"
+                          disabled={assignMut.isPending || !assignCourseId}
+                          onClick={() => assignMut.mutate()}
+                        >
+                          Yaz
+                        </Button>
+                      </div>
+                      {assignMut.isError ? (
+                        <p className="mt-2 text-sm text-red-600">{errMsg(assignMut.error)}</p>
+                      ) : null}
+                    </div>
+                  ) : null}
 
                   {!row.has_login ? (
                     <div className="rounded-lg border border-emerald-200 bg-emerald-50/50 p-4">
@@ -220,7 +288,7 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                         <Button
                           size="sm"
                           variant="secondary"
-                          disabled={resetMut.isPending || resetPassword.length < 6}
+                          disabled={!hasCourse || resetMut.isPending || resetPassword.length < 6}
                           onClick={() => resetMut.mutate()}
                         >
                           Şifrə reset
@@ -243,7 +311,7 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                           size="sm"
                           variant="ghost"
                           className="text-red-600"
-                          disabled={deleteLoginMut.isPending}
+                          disabled={!hasCourse || deleteLoginMut.isPending}
                           onClick={() => {
                             if (window.confirm("Kabinet silinsin?")) deleteLoginMut.mutate();
                           }}
@@ -254,6 +322,7 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                     </div>
                   )}
 
+                  {hasCourse ? (
                   <Button
                     variant="ghost"
                     className="text-red-600"
@@ -264,6 +333,7 @@ export default function StudentDetailDrawer({ row, onClose, onUpdated }: Props) 
                   >
                     Qeydiyyatı sil
                   </Button>
+                  ) : null}
                   {deleteMut.isError ? <p className="text-sm text-red-600">{errMsg(deleteMut.error)}</p> : null}
                 </div>
               )}
